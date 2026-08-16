@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">Aethery</string>
+    <string name="vpn_channel_name">Aethery VPN</string>
+    <string name="vpn_notification">Aethery tuneli işləyir</string>
+
+    <!-- Quick Tile strings -->
+    <string name="vpn_tile_label">Aethery</string>
+    <string name="vpn_connected">Qoşulub</string>
+    <string name="vpn_disconnected">Bağlantı kəsilib</string>
+    <string name="vpn_connecting">Qoşulur…</string>
+    <string name="vpn_disconnect">Bağlantını kəs</string>
+
+    <!-- Upload/Download notification labels -->
+    <string name="vpn_upload">Yükləmə</string>
+    <string name="vpn_download">Endirmə</string>
+</resources>
