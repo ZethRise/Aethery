@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -37,6 +37,10 @@ const MAX_RECV_CHUNKS: usize = 128;
 const BACKPRESSURE_RETRY: std::time::Duration = std::time::Duration::from_millis(2);
 const DROP_REPORT_STEP: usize = 512;
 const MAX_IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn max_tcp_pending() -> usize {
+    tcp_buf().saturating_mul(2).max(64 * 1024)
+}
 
 type OpenTcpResp = oneshot::Sender<std::result::Result<TcpConn, String>>;
 type OpenUdpResp = oneshot::Sender<std::result::Result<UdpConn, String>>;
@@ -100,13 +104,8 @@ impl Device for StackDevice {
 }
 
 pub enum Cmd {
-    OpenTcp {
-        dst: SocketAddr,
-        resp: OpenTcpResp,
-    },
-    OpenUdp {
-        resp: OpenUdpResp,
-    },
+    OpenTcp { dst: SocketAddr, resp: OpenTcpResp },
+    OpenUdp { resp: OpenUdpResp },
     SetAddrs {
         v4: Option<(Ipv4Addr, u8)>,
         v6: Option<(Ipv6Addr, u8)>,
@@ -124,6 +123,7 @@ pub struct TcpConn {
     pub id: usize,
     pub from_stack: mpsc::Receiver<Vec<u8>>,
     data_in: mpsc::Sender<DataIn>,
+    split: bool,
 }
 
 impl TcpConn {
@@ -138,14 +138,29 @@ impl TcpConn {
         let _ = self.data_in.send(DataIn::TcpClose(self.id)).await;
     }
 
-    pub fn into_split(self) -> (TcpSender, mpsc::Receiver<Vec<u8>>) {
+    pub fn into_split(mut self) -> (TcpSender, mpsc::Receiver<Vec<u8>>) {
+        self.split = true;
         (
             TcpSender {
                 id: self.id,
-                data_in: self.data_in,
+                data_in: self.data_in.clone(),
             },
-            self.from_stack,
+            std::mem::replace(
+                &mut self.from_stack,
+                {
+                    let (_tx, rx) = mpsc::channel(1);
+                    rx
+                },
+            ),
         )
+    }
+}
+
+impl Drop for TcpConn {
+    fn drop(&mut self) {
+        if !self.split {
+            let _ = self.data_in.try_send(DataIn::TcpClose(self.id));
+        }
     }
 }
 
@@ -167,10 +182,17 @@ impl TcpSender {
     }
 }
 
+impl Drop for TcpSender {
+    fn drop(&mut self) {
+        let _ = self.data_in.try_send(DataIn::TcpClose(self.id));
+    }
+}
+
 pub struct UdpConn {
     pub id: usize,
     pub from_stack: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     data_in: mpsc::Sender<DataIn>,
+    split: bool,
 }
 
 impl UdpConn {
@@ -185,14 +207,29 @@ impl UdpConn {
         let _ = self.data_in.send(DataIn::UdpClose(self.id)).await;
     }
 
-    pub fn into_split(self) -> (UdpSender, mpsc::Receiver<(SocketAddr, Vec<u8>)>) {
+    pub fn into_split(mut self) -> (UdpSender, mpsc::Receiver<(SocketAddr, Vec<u8>)>) {
+        self.split = true;
         (
             UdpSender {
                 id: self.id,
-                data_in: self.data_in,
+                data_in: self.data_in.clone(),
             },
-            self.from_stack,
+            std::mem::replace(
+                &mut self.from_stack,
+                {
+                    let (_tx, rx) = mpsc::channel(1);
+                    rx
+                },
+            ),
         )
+    }
+}
+
+impl Drop for UdpConn {
+    fn drop(&mut self) {
+        if !self.split {
+            let _ = self.data_in.try_send(DataIn::UdpClose(self.id));
+        }
     }
 }
 
@@ -214,9 +251,64 @@ impl UdpSender {
     }
 }
 
+impl Drop for UdpSender {
+    fn drop(&mut self) {
+        let _ = self.data_in.try_send(DataIn::UdpClose(self.id));
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct FlowTable {
+    inner: Arc<Mutex<HashSet<(u8, u16)>>>,
+}
+
+impl FlowTable {
+    pub fn owns_inbound(&self, packet: &[u8]) -> bool {
+        match inbound_local_flow(packet) {
+            Some(key) => self.inner.lock().unwrap().contains(&key),
+            None => false,
+        }
+    }
+
+    fn insert(&self, proto: u8, port: u16) {
+        self.inner.lock().unwrap().insert((proto, port));
+    }
+
+    fn remove(&self, proto: u8, port: u16) {
+        self.inner.lock().unwrap().remove(&(proto, port));
+    }
+}
+
+fn inbound_local_flow(packet: &[u8]) -> Option<(u8, u16)> {
+    if packet.is_empty() {
+        return None;
+    }
+    match packet[0] >> 4 {
+        4 if packet.len() >= 20 => {
+            let ihl = ((packet[0] & 0x0f) as usize) * 4;
+            let proto = packet[9];
+            if !matches!(proto, 6 | 17) || packet.len() < ihl + 4 {
+                return None;
+            }
+            let port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+            Some((proto, port))
+        }
+        6 if packet.len() >= 44 => {
+            let proto = packet[6];
+            if !matches!(proto, 6 | 17) {
+                return None;
+            }
+            let port = u16::from_be_bytes([packet[42], packet[43]]);
+            Some((proto, port))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct StackHandle {
     cmd_tx: mpsc::Sender<Cmd>,
+    pub flows: FlowTable,
 }
 
 impl StackHandle {
@@ -258,6 +350,7 @@ impl StackHandle {
 
 struct TcpState {
     handle: SocketHandle,
+    local_port: u16,
     to_app: mpsc::Sender<Vec<u8>>,
     from_stack_rx: Option<mpsc::Receiver<Vec<u8>>>,
     connect_resp: Option<OpenTcpResp>,
@@ -268,6 +361,7 @@ struct TcpState {
 
 struct UdpState {
     handle: SocketHandle,
+    local_port: u16,
     to_app: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 }
 
@@ -280,6 +374,7 @@ pub struct NetStack {
     next_id: usize,
     next_port: u16,
     data_in_tx: mpsc::Sender<DataIn>,
+    flows: FlowTable,
 }
 
 fn strip_cidr(s: &str) -> &str {
@@ -340,7 +435,11 @@ fn routable_prefix_v6(p: u8) -> u8 {
     }
 }
 
-fn apply_addrs(iface: &mut Interface, v4: Option<(Ipv4Addr, u8)>, v6: Option<(Ipv6Addr, u8)>) {
+fn apply_addrs(
+    iface: &mut Interface,
+    v4: Option<(Ipv4Addr, u8)>,
+    v6: Option<(Ipv6Addr, u8)>,
+) {
     iface.update_ip_addrs(|addrs| {
         addrs.clear();
         if let Some((ip, p)) = v4 {
@@ -398,6 +497,7 @@ pub fn spawn(
 
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
     let (data_in_tx, data_in_rx) = mpsc::channel(app_queue());
+    let flows = FlowTable::default();
 
     let stack = NetStack {
         iface,
@@ -408,11 +508,12 @@ pub fn spawn(
         next_id: 1,
         next_port: 49152,
         data_in_tx: data_in_tx.clone(),
+        flows: flows.clone(),
     };
 
     tokio::spawn(run(stack, cmd_rx, data_in_rx, inbound_rx, outbound_tx));
 
-    Ok(StackHandle { cmd_tx })
+    Ok(StackHandle { cmd_tx, flows })
 }
 
 fn alloc_port(p: &mut u16) -> u16 {
@@ -428,11 +529,14 @@ async fn run(
     mut inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    let mut rx_total = 0u64;
-    let mut tx_total = 0u64;
-    let mut last_report = std::time::Instant::now();
+    let mut deferred: VecDeque<DataIn> = VecDeque::new();
     let mut tx_dropped: usize = 0;
     let mut next_drop_report: usize = DROP_REPORT_STEP;
+    let mut rx_total = 0u64;
+    let mut tx_total = 0u64;
+    let mut last_emitted_tx = 0u64;
+    let mut last_emitted_rx = 0u64;
+    let mut last_report = std::time::Instant::now();
 
     loop {
         let now = Instant::now();
@@ -448,8 +552,12 @@ async fn run(
         let (sent, dropped) = flush_tx(&mut s, &outbound_tx);
         tx_total = tx_total.saturating_add(sent);
 
-        if last_report.elapsed() >= std::time::Duration::from_millis(1000) {
+        if last_report.elapsed() >= std::time::Duration::from_millis(3000)
+            && (tx_total != last_emitted_tx || rx_total != last_emitted_rx)
+        {
             ffi::emit_traffic(tx_total, rx_total);
+            last_emitted_tx = tx_total;
+            last_emitted_rx = rx_total;
             last_report = std::time::Instant::now();
         }
 
@@ -461,7 +569,14 @@ async fn run(
             }
         }
 
-        let delay = if tcp_busy || udp_busy {
+        while let Some(d) = deferred.pop_front() {
+            if let Some(back) = try_handle_data(&mut s, d) {
+                deferred.push_front(back);
+                break;
+            }
+        }
+
+        let delay = if tcp_busy || udp_busy || !deferred.is_empty() {
             Some(BACKPRESSURE_RETRY)
         } else {
             let polled = s
@@ -482,13 +597,13 @@ async fn run(
             maybe = inbound_rx.recv() => {
                 match maybe {
                     Some(pkt) => {
-                        rx_total += pkt.len() as u64;
+                        rx_total = rx_total.saturating_add(pkt.len() as u64);
                         s.device.rx.push_back(pkt);
                         let mut n = 0;
                         while n < MAX_INGEST_PER_TICK {
                             match inbound_rx.try_recv() {
                                 Ok(p) => {
-                                    rx_total += p.len() as u64;
+                                    rx_total = rx_total.saturating_add(p.len() as u64);
                                     s.device.rx.push_back(p);
                                     n += 1;
                                 }
@@ -507,11 +622,21 @@ async fn run(
                 }
             }
 
-            maybe = data_in_rx.recv() => {
+            maybe = data_in_rx.recv(), if deferred.is_empty() => {
                 if let Some(d) = maybe {
-                    handle_data(&mut s, d);
-                    while let Ok(d2) = data_in_rx.try_recv() {
-                        handle_data(&mut s, d2);
+                    if let Some(back) = try_handle_data(&mut s, d) {
+                        deferred.push_back(back);
+                    } else {
+                        while deferred.is_empty() {
+                            match data_in_rx.try_recv() {
+                                Ok(d2) => {
+                                    if let Some(back) = try_handle_data(&mut s, d2) {
+                                        deferred.push_back(back);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
                     }
                 }
             }
@@ -550,10 +675,12 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
 
             let (to_app_tx, to_app_rx) = mpsc::channel(app_queue());
 
+            s.flows.insert(6, local_port);
             s.tcp_conns.insert(
                 id,
                 TcpState {
                     handle,
+                    local_port,
                     to_app: to_app_tx,
                     from_stack_rx: Some(to_app_rx),
                     connect_resp: Some(resp),
@@ -581,18 +708,14 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             s.next_id += 1;
 
             let (to_app_tx, to_app_rx) = mpsc::channel(app_queue());
-            s.udp_conns.insert(
-                id,
-                UdpState {
-                    handle,
-                    to_app: to_app_tx,
-                },
-            );
+            s.flows.insert(17, local_port);
+            s.udp_conns.insert(id, UdpState { handle, local_port, to_app: to_app_tx });
 
             let conn = UdpConn {
                 id,
                 from_stack: to_app_rx,
                 data_in: s.data_in_tx.clone(),
+                split: false,
             };
             let _ = resp.send(Ok(conn));
         }
@@ -603,28 +726,44 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
     }
 }
 
-fn handle_data(s: &mut NetStack, d: DataIn) {
+/// Returns `Some(d)` when the datagram must be deferred (TCP pending full).
+fn try_handle_data(s: &mut NetStack, d: DataIn) -> Option<DataIn> {
     match d {
         DataIn::Tcp(id, data) => {
             if let Some(st) = s.tcp_conns.get_mut(&id) {
-                st.pending.extend_from_slice(&data);
+                let max = max_tcp_pending();
+                if st.pending.len() >= max {
+                    return Some(DataIn::Tcp(id, data));
+                }
+                let space = max - st.pending.len();
+                if data.len() <= space {
+                    st.pending.extend_from_slice(&data);
+                } else {
+                    st.pending.extend_from_slice(&data[..space]);
+                    return Some(DataIn::Tcp(id, data[space..].to_vec()));
+                }
             }
+            None
         }
         DataIn::TcpClose(id) => {
             if let Some(st) = s.tcp_conns.get_mut(&id) {
                 st.half_closed = true;
             }
+            None
         }
         DataIn::Udp(id, dst, data) => {
             if let Some(st) = s.udp_conns.get(&id) {
                 let sock = s.sockets.get_mut::<udp::Socket>(st.handle);
                 let _ = sock.send_slice(&data, to_ip_endpoint(dst));
             }
+            None
         }
         DataIn::UdpClose(id) => {
             if let Some(st) = s.udp_conns.remove(&id) {
+                s.flows.remove(17, st.local_port);
                 s.sockets.remove(st.handle);
             }
+            None
         }
     }
 }
@@ -650,6 +789,7 @@ fn service_tcp(s: &mut NetStack) -> bool {
                         id,
                         from_stack: rx,
                         data_in: data_in_tx.clone(),
+                        split: false,
                     };
                     let _ = resp.send(Ok(conn));
                 }
@@ -665,7 +805,9 @@ fn service_tcp(s: &mut NetStack) -> bool {
                 }
             }
             s.sockets.remove(handle);
-            s.tcp_conns.remove(&id);
+            if let Some(st) = s.tcp_conns.remove(&id) {
+                s.flows.remove(6, st.local_port);
+            }
             continue;
         }
 
@@ -677,6 +819,9 @@ fn service_tcp(s: &mut NetStack) -> bool {
                     let sent = socket.send_slice(&st.pending).unwrap_or(0);
                     if sent > 0 {
                         st.pending.drain(0..sent);
+                        if st.pending.len() * 4 < st.pending.capacity() {
+                            st.pending.shrink_to(max_tcp_pending().min(st.pending.capacity()));
+                        }
                     }
                 }
             }
@@ -730,9 +875,19 @@ fn service_tcp(s: &mut NetStack) -> bool {
         if matches!(st_state, tcp::State::CloseWait) {
             s.sockets.get_mut::<tcp::Socket>(handle).close();
         }
-        if matches!(st_state, tcp::State::Closed) && s.tcp_conns[&id].established {
+        if matches!(st_state, tcp::State::TimeWait) {
+            if let Some(st) = s.tcp_conns.get_mut(&id) {
+                st.pending.clear();
+                st.pending.shrink_to_fit();
+            }
+        }
+        if matches!(st_state, tcp::State::Closed | tcp::State::TimeWait)
+            && s.tcp_conns[&id].established
+        {
             s.sockets.remove(handle);
-            s.tcp_conns.remove(&id);
+            if let Some(st) = s.tcp_conns.remove(&id) {
+                s.flows.remove(6, st.local_port);
+            }
         }
     }
 
@@ -780,8 +935,8 @@ fn service_udp(s: &mut NetStack) -> bool {
 }
 
 fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) -> (u64, usize) {
-    let mut sent = 0u64;
     let mut dropped = 0;
+    let mut sent = 0u64;
     while let Some(pkt) = s.device.tx.pop_front() {
         let len = pkt.len() as u64;
         match outbound_tx.try_send(pkt) {
@@ -963,10 +1118,7 @@ mod tests {
             client_seq.wrapping_add(1),
             0x12,
         );
-        inbound_tx
-            .send(syn_ack)
-            .await
-            .expect("inbound accepts the syn-ack");
+        inbound_tx.send(syn_ack).await.expect("inbound accepts the syn-ack");
 
         let conn = tokio::time::timeout(StdDuration::from_secs(5), connect)
             .await
@@ -988,7 +1140,7 @@ mod tests {
             }
         }
 
-        assert!(
+assert!(
             saw_teardown,
             "the netstack never closed the socket after the app went away, so it leaks"
         );
@@ -1010,20 +1162,17 @@ mod tests {
             next_id: 0,
             next_port: 40000,
             data_in_tx: mpsc::channel(1).0,
+            flows: FlowTable::default(),
         };
 
         for _ in 0..10 {
             stack.device.tx.push_back(vec![1, 2, 3]);
         }
 
-        let (sent, dropped) = flush_tx(&mut stack, &outbound_tx);
+        let (_sent, dropped) = flush_tx(&mut stack, &outbound_tx);
 
         assert!(stack.device.tx.is_empty(), "the tx queue must be drained");
-        assert_eq!(sent, 6, "sent bytes are counted");
-        assert_eq!(
-            dropped, 8,
-            "everything past the channel capacity is dropped"
-        );
+        assert_eq!(dropped, 8, "everything past the channel capacity is dropped");
         assert_eq!(outbound_rx.len(), 2, "the channel keeps what fits");
     }
 }

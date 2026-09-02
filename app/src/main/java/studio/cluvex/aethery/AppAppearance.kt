@@ -24,7 +24,7 @@ object AppAppearance {
     ) {
         DYNAMIC(
             "Dynamic",
-            "Follow the phone's current light or dark theme",
+            "Default. Follows the phone's light or dark theme",
             followsSystem = true,
             connected = 0xFF8FFFB5,
             connectedContainer = 0xFF176B3B,
@@ -103,8 +103,8 @@ object AppAppearance {
 
     fun current(context: Context): Theme {
         val name = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
-            .getString(PREFERENCE, Theme.FOREST.name)
-        return Theme.entries.firstOrNull { it.name == name } ?: Theme.FOREST
+            .getString(PREFERENCE, Theme.DYNAMIC.name)
+        return Theme.entries.firstOrNull { it.name == name } ?: Theme.DYNAMIC
     }
 
     fun save(context: Context, theme: Theme) {

@@ -63,12 +63,9 @@ class AetherTileService : TileService() {
             // Connect - need VPN permission first
             val connectionType = connectionType()
             if (connectionType == ConnectionType.PROXY) {
-                // Proxy mode doesn't need VPN permission
-                val config = configJson()
                 startForegroundService(
                     Intent(this, AetherVpnService::class.java)
                         .setAction(AetherVpnService.ACTION_CONNECT)
-                        .putExtra(AetherVpnService.EXTRA_CONFIG, config)
                         .putExtra(AetherVpnService.EXTRA_VPN_MODE, false)
                 )
                 tile.state = Tile.STATE_ACTIVE
@@ -80,12 +77,9 @@ class AetherTileService : TileService() {
                 // VPN mode - need permission
                 val permissionIntent = VpnService.prepare(this)
                 if (permissionIntent == null) {
-                    // Already have permission
-                    val config = configJson()
                     startForegroundService(
                         Intent(this, AetherVpnService::class.java)
                             .setAction(AetherVpnService.ACTION_CONNECT)
-                            .putExtra(AetherVpnService.EXTRA_CONFIG, config)
                             .putExtra(AetherVpnService.EXTRA_VPN_MODE, true)
                     )
                     tile.state = Tile.STATE_ACTIVE
@@ -94,14 +88,21 @@ class AetherTileService : TileService() {
                     }
                     tile.updateTile()
                 } else {
-                    // Need to ask for permission - can't start activity from here
-                    Log.w(LOG_TAG, "VPN permission required, cannot start from tile")
+                    val launch = Intent(this, MainActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        .putExtra(MainActivity.EXTRA_START_CONNECT, true)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        startActivityAndCollapse(android.app.PendingIntent.getActivity(
+                            this, 0, launch, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
+                        ))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        startActivityAndCollapse(launch)
+                    }
                 }
             }
         }
     }
-
-    private fun configJson(): String = CoreConfig.json(this)
 
     private fun connectionType(): ConnectionType {
         val prefs = getSharedPreferences(SETTINGS, MODE_PRIVATE)
@@ -196,7 +197,7 @@ class AetherTileService : TileService() {
 
         enum class ConnectionType(val label: String, val description: String) {
             VPN("VPN", "Routes device traffic through Android VPN"),
-            PROXY("Proxy", "Starts local SOCKS5 at 127.0.0.1:1819"),
+            PROXY("Proxy", "Starts local SOCKS5 and HTTP CONNECT on localhost"),
         }
 
         enum class Protocol(

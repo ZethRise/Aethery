@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -104,6 +105,10 @@ struct NativeStartOptions {
     access_token: Option<String>,
     access_email: Option<String>,
     gateway: bool,
+    h2_fallback: Option<bool>,
+    http_proxy: Option<String>,
+    proxy_user: Option<String>,
+    proxy_pass: Option<String>,
 }
 
 impl Default for NativeStartOptions {
@@ -138,6 +143,10 @@ impl Default for NativeStartOptions {
             access_token: None,
             access_email: None,
             gateway: false,
+            h2_fallback: None,
+            http_proxy: None,
+            proxy_user: None,
+            proxy_pass: None,
         }
     }
 }
@@ -191,6 +200,18 @@ impl TryFrom<NativeStartOptions> for StartOptions {
         options.access_token = value.access_token.filter(|value| !value.trim().is_empty());
         options.access_email = value.access_email.filter(|value| !value.trim().is_empty());
         options.gateway = value.gateway;
+        options.h2_fallback = value.h2_fallback;
+        options.http_proxy = match value
+            .http_proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(raw) => Some(parse_address("http_proxy", raw)?),
+            None => None,
+        };
+        options.proxy_user = value.proxy_user.filter(|value| !value.trim().is_empty());
+        options.proxy_pass = value.proxy_pass.filter(|value| !value.trim().is_empty());
         Ok(options)
     }
 }
@@ -277,6 +298,22 @@ unsafe fn options_from_json(json: *const c_char) -> Result<StartOptions, String>
         .and_then(StartOptions::try_from)
 }
 
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    #[cfg(target_os = "android")]
+    builder.worker_threads(2);
+    builder.build()
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
 fn stop_notify() -> &'static Notify {
     STOP_NOTIFY.get_or_init(Notify::new)
 }
@@ -346,10 +383,7 @@ unsafe fn aether_start_json_inner(json: *const c_char, tun_fd: Option<i32>) -> i
         emit_status("starting", None);
         record_log("Native tunnel started");
 
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
+        let runtime = match runtime() {
             Ok(runtime) => runtime,
             Err(error) => {
                 set_last_error(error);
@@ -373,8 +407,8 @@ unsafe fn aether_start_json_inner(json: *const c_char, tun_fd: Option<i32>) -> i
 
     match result {
         Ok(code) => code,
-        Err(_) => {
-            set_last_error("panic in Aether native core");
+        Err(payload) => {
+            set_last_error(format!("panic in Aether native core: {}", panic_message(payload)));
             -3
         }
     }
@@ -391,10 +425,7 @@ pub unsafe extern "C" fn aether_prepare_json(json: *const c_char) -> i32 {
                 return -1;
             }
         };
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
+        let runtime = match runtime() {
             Ok(runtime) => runtime,
             Err(error) => {
                 set_last_error(error);
@@ -469,10 +500,7 @@ pub unsafe extern "C" fn aether_zt_request_email_code(
                 return -1;
             }
         };
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
+        let runtime = match runtime() {
             Ok(runtime) => runtime,
             Err(error) => {
                 set_last_error(error);
@@ -506,10 +534,7 @@ pub unsafe extern "C" fn aether_zt_confirm_email_code(code: *const c_char) -> i3
                 return -1;
             }
         };
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
+        let runtime = match runtime() {
             Ok(runtime) => runtime,
             Err(error) => {
                 set_last_error(error);
@@ -534,20 +559,36 @@ pub unsafe extern "C" fn aether_zt_confirm_email_code(code: *const c_char) -> i3
     })
 }
 
-/// Returns the most recent native error. Copy it before another native call.
+thread_local! {
+    static ERROR_TLS: RefCell<CString> = RefCell::new(CString::new("").unwrap());
+    static RESULT_TLS: RefCell<CString> = RefCell::new(CString::new("").unwrap());
+    static LOG_TLS: RefCell<CString> = RefCell::new(CString::new("").unwrap());
+}
+
+fn export_cstring(slot: &'static std::thread::LocalKey<RefCell<CString>>, value: CString) -> *const c_char {
+    slot.with(|cell| {
+        *cell.borrow_mut() = value;
+        cell.borrow().as_ptr()
+    })
+}
+
+/// Returns the most recent native error. Valid until the next call on this thread.
 #[no_mangle]
 pub extern "C" fn aether_last_error() -> *const c_char {
-    LAST_ERROR.lock().unwrap().as_ptr()
+    let value = LAST_ERROR.lock().unwrap().clone();
+    export_cstring(&ERROR_TLS, value)
 }
 
 #[no_mangle]
 pub extern "C" fn aether_last_result() -> *const c_char {
-    LAST_RESULT.lock().unwrap().as_ptr()
+    let value = LAST_RESULT.lock().unwrap().clone();
+    export_cstring(&RESULT_TLS, value)
 }
 
 #[no_mangle]
 pub extern "C" fn aether_last_log() -> *const c_char {
-    LAST_LOG.lock().unwrap().as_ptr()
+    let value = LAST_LOG.lock().unwrap().clone();
+    export_cstring(&LOG_TLS, value)
 }
 
 #[no_mangle]
@@ -558,6 +599,11 @@ pub extern "C" fn aether_version() -> *const c_char {
 #[no_mangle]
 pub extern "C" fn aether_set_socket_protector(protector: Option<platform::SocketProtector>) {
     platform::set_socket_protector(protector);
+}
+
+#[no_mangle]
+pub extern "C" fn aether_replace_tun_fd(tun_fd: i32) {
+    crate::replace_android_tun_fd(tun_fd);
 }
 
 /// Requests shutdown of the active native tunnel. Returns 1 if running, else 0.
@@ -624,6 +670,27 @@ mod tests {
         assert_eq!(options.route_block.as_deref(), Some("ads.example"));
         assert_eq!(options.team.as_deref(), Some("acme"));
         assert!(options.gateway);
+        assert!(options.h2_fallback.is_none());
+    }
+
+    #[test]
+    fn parses_h2_fallback_flag() {
+        let native: NativeStartOptions = serde_json::from_str(
+            r#"{"config_path":"aether.toml","h2_fallback":false}"#,
+        )
+        .unwrap();
+        let options = StartOptions::try_from(native).unwrap();
+        assert_eq!(options.h2_fallback, Some(false));
+    }
+
+    #[test]
+    fn parses_http_proxy_listen() {
+        let native: NativeStartOptions = serde_json::from_str(
+            r#"{"config_path":"aether.toml","http_proxy":"127.0.0.1:1820"}"#,
+        )
+        .unwrap();
+        let options = StartOptions::try_from(native).unwrap();
+        assert_eq!(options.http_proxy, Some("127.0.0.1:1820".parse().unwrap()));
     }
 
     #[test]

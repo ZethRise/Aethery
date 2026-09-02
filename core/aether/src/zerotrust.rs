@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use rand::Rng;
+use rand::RngExt;
 
 use crate::error::{AetherError, Result};
 
@@ -173,9 +173,9 @@ pub fn generate_fcm_token(install_id: &str) -> String {
 }
 
 fn random_alphanumeric(len: usize) -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..len)
-        .map(|_| ALPHANUM[rng.gen_range(0..ALPHANUM.len())] as char)
+        .map(|_| ALPHANUM[rng.random_range(0..ALPHANUM.len())] as char)
         .collect()
 }
 
@@ -424,9 +424,7 @@ impl EmailSignIn {
     }
 
     pub async fn resend_code(&mut self) -> Result<()> {
-        if let Some(nonce) =
-            send_email_code(&self.client, &self.verify_url, &self.email, None).await?
-        {
+        if let Some(nonce) = send_email_code(&self.client, &self.verify_url, &self.email, None).await? {
             self.nonce = nonce;
         }
         Ok(())

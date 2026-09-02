@@ -19,10 +19,16 @@ object CoreConfig {
 
         val proxy = text("connection_type", "VPN") == "PROXY"
         val lan = prefs.getBoolean("lan_sharing", false)
+        val listenHost = if (proxy && lan) "0.0.0.0" else "127.0.0.1"
         return JSONObject().apply {
             put("config_path", File(context.filesDir, "aether.toml").absolutePath)
             put("protocol", protocol ?: text("default_protocol", "masque"))
-            put("listen", "${if (proxy && lan) "0.0.0.0" else "127.0.0.1"}:${prefs.getInt("default_socks_port", 1819)}")
+            put("listen", "$listenHost:${prefs.getInt("default_socks_port", 1819)}")
+            put("http_proxy", "$listenHost:${prefs.getInt("default_http_proxy_port", 1820)}")
+            if (proxy && lan) {
+                put("proxy_user", "aethery")
+                put("proxy_pass", lanProxyPassword(prefs))
+            }
             put("scan_mode", text("default_scan_mode", "balanced"))
             put("ip_scan", text("default_scan", "v4"))
             put("endpoint_cache_path", File(context.filesDir, "masque-gateway-cache.json").absolutePath)
@@ -37,6 +43,7 @@ object CoreConfig {
             put("log_level", text("log_level", "info"))
             put("perf_profile", text("perf_profile", "auto"))
             put("h2_fragmentation", text("h2_fragmentation", "on") == "on")
+            put("h2_fallback", prefs.getBoolean("h3_h2_fallback", true))
             putOpt("dns_servers", text("dns_servers").ifBlank { null })
             putOpt("route_block", text("route_block").ifBlank { null })
             putOpt("route_direct", text("route_direct").ifBlank { null })
@@ -47,5 +54,14 @@ object CoreConfig {
             putOpt("access_email", SecureStore.getSecret(context, "zero_trust_email").ifBlank { null })
             put("gateway", prefs.getBoolean("zero_trust_gateway", false))
         }.toString()
+    }
+
+    fun lanProxyPassword(prefs: android.content.SharedPreferences): String {
+        val existing = prefs.getString("lan_proxy_password", "")?.trim().orEmpty()
+        if (existing.isNotEmpty()) return existing
+        val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+        val generated = (1..12).map { alphabet.random() }.joinToString("")
+        prefs.edit().putString("lan_proxy_password", generated).apply()
+        return generated
     }
 }

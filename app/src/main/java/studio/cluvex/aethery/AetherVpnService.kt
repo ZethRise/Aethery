@@ -27,10 +27,15 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private val connected = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
+    private val reconnectRequested = AtomicBoolean(false)
+    private val killSwitchHeld = AtomicBoolean(false)
+    private val session = java.util.concurrent.atomic.AtomicInteger(0)
     // Native transport sockets need VpnService.protect only while a TUN exists.
     // Proxy mode has no VPN interface, so protecting there would always fail.
     private val vpnModeActive = AtomicBoolean(false)
     private var tun: ParcelFileDescriptor? = null
+    private var pendingAddresses: NativeCore.TunnelAddresses? = null
+    private var routesPromoted = false
     private var lastTrafficSampleMs = 0L
     private var currentTx = 0L
     private var currentRx = 0L
@@ -50,20 +55,28 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
     override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_CONNECT -> intent.getStringExtra(EXTRA_CONFIG)?.let { config ->
-                startTunnel(config, intent.getBooleanExtra(EXTRA_VPN_MODE, true))
+        if (intent == null) {
+            if (getSharedPreferences("settings", MODE_PRIVATE).getBoolean(TUNNEL_WANTED, false)) {
+                startTunnel(CoreConfig.json(this), storedVpnModeFromPrefs())
+            }
+            return Service.START_STICKY
+        }
+        when (intent.action) {
+            ACTION_CONNECT -> {
+                getSharedPreferences("settings", MODE_PRIVATE).edit().putBoolean(TUNNEL_WANTED, true).apply()
+                val vpnMode = intent.getBooleanExtra(EXTRA_VPN_MODE, storedVpnModeFromPrefs())
+                startTunnel(CoreConfig.json(this), vpnMode)
             }
             ACTION_DISCONNECT -> stopTunnel()
             ACTION_RECONNECT -> {
-                val config = storedConfig
-                if (config != null && connected.get()) {
-                    ConnectionLog.record("Quick reconnect requested")
-                    stopTunnel(notify = false)
-                    worker.execute {
-                        try { Thread.sleep(500) } catch (_: InterruptedException) {}
-                        startTunnel(config, storedVpnMode)
-                    }
+                ConnectionLog.record("Quick reconnect requested")
+                getSharedPreferences("settings", MODE_PRIVATE).edit().putBoolean(TUNNEL_WANTED, true).apply()
+                if (connected.get()) {
+                    reconnectRequested.set(true)
+                    stopRequested.set(true)
+                    NativeCore.stop()
+                } else {
+                    startTunnel(CoreConfig.json(this), storedVpnModeFromPrefs())
                 }
             }
             ACTION_NOTIFICATION_HEALTH -> {
@@ -73,7 +86,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                     .notify(NOTIFICATION_ID, notification(currentTx, currentRx))
             }
         }
-        return Service.START_REDELIVER_INTENT
+        return Service.START_STICKY
     }
 
     override fun onDestroy() {
@@ -99,6 +112,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                 "status" -> {
                     val status = event.getString("status")
                     val detail = if (event.isNull("detail")) null else event.getString("detail")
+                    if (status == STATUS_CONNECTED) promoteVpnRoutes()
                     sendStatus(status, detail)
                 }
                 "traffic" -> {
@@ -119,13 +133,31 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
     }
 
     private fun startTunnel(config: String, vpnMode: Boolean) {
+        if (killSwitchHeld.get()) {
+            tun?.close()
+            tun = null
+            killSwitchHeld.set(false)
+        }
         if (!connected.compareAndSet(false, true)) return
+        val gen = session.incrementAndGet()
         storedConfig = config
         storedVpnMode = vpnMode
         currentProtocol = config.substringAfter("\"protocol\":\"").substringBefore('\"').uppercase()
         currentVpnIp = ""
         currentPing = ""
+        currentTx = 0
+        currentRx = 0
+        prevTx = 0
+        prevRx = 0
+        accountedTx = 0
+        accountedRx = 0
+        prevSpeedSampleMs = 0
+        currentSpeedTx = 0
+        currentSpeedRx = 0
+        routesPromoted = false
+        pendingAddresses = null
         stopRequested.set(false)
+        reconnectRequested.set(false)
         vpnModeActive.set(vpnMode)
         startAsForeground()
         worker.execute {
@@ -135,34 +167,29 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                 NativeCore.attach(this)
                 val result = if (vpnMode) {
                     val addresses = NativeCore.prepare(config)
-                    ConnectionLog.record("Creating Android VPN interface")
+                    pendingAddresses = addresses
+                    ConnectionLog.record("Creating Android VPN interface (scan; default route after the tunnel is ready)")
                     if (addresses.organization.isNotBlank()) {
                         ConnectionLog.record("Zero Trust organization ${addresses.organization}")
                     }
-                    tun = Builder()
-                        .setSession("Aethery")
-                        .setMtu(1280)
-                        .applyTunnelAddresses(addresses)
-                        .applyDns(config, addresses)
-                        .applyGatewayProxy(config, addresses)
-                        .applyLanAccess(addresses)
-                        .applySplitTunneling()
+                    closeTun()
+                    tun = vpnBuilder(addresses, config, captureTraffic = false)
                         .establish() ?: error("Android could not establish the VPN interface")
                     ConnectionLog.record("Scanning gateways for VPN")
                     NativeCore.start(config, tun!!.fd)
                 } else {
-                    ConnectionLog.record("Starting local SOCKS5 proxy")
+                    ConnectionLog.record("Starting local SOCKS5 and HTTP CONNECT proxies")
                     NativeCore.startProxy(config)
                 }
-                
-                if (result != 0 && !stopRequested.get()) {
+
+                if (result != 0 && !stopRequested.get() && !reconnectRequested.get()) {
                     val detail = NativeCore.lastError().ifBlank { "Tunnel exited with code $result" }
                     ConnectionLog.record("Native tunnel exited: $detail")
                     sendStatus(STATUS_FAILED, detail)
-                } else if (stopRequested.get()) {
+                } else if (stopRequested.get() && !reconnectRequested.get()) {
                     ConnectionLog.record("Disconnect requested")
                     sendStatus(STATUS_DISCONNECTED)
-                } else {
+                } else if (!reconnectRequested.get()) {
                     ConnectionLog.record("Native tunnel stopped unexpectedly")
                     sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly")
                 }
@@ -173,17 +200,24 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
             } finally {
                 NativeCore.detach()
                 vpnModeActive.set(false)
-                val killSwitch = getSharedPreferences("settings", MODE_PRIVATE).getBoolean("kill_switch", false)
+                if (session.get() != gen) return@execute
                 connected.set(false)
-                if (killSwitch && !stopRequested.get()) {
-                    ConnectionLog.record("Kill switch active; blocking all traffic")
-                    sendStatus(STATUS_FAILED, "Kill switch active — tunnel dropped")
-                    rebuildKillSwitchVpn()
-                } else {
-                    tun?.close()
-                    tun = null
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                when {
+                    reconnectRequested.compareAndSet(true, false) -> {
+                        stopRequested.set(false)
+                        startTunnel(CoreConfig.json(this), storedVpnMode)
+                    }
+                    getSharedPreferences("settings", MODE_PRIVATE).getBoolean("kill_switch", false)
+                        && !stopRequested.get() -> {
+                        ConnectionLog.record("Kill switch active; blocking all traffic")
+                        sendStatus(STATUS_FAILED, "Kill switch active — tunnel dropped")
+                        rebuildKillSwitchVpn()
+                    }
+                    else -> {
+                        closeTun()
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
                 }
             }
         }
@@ -191,8 +225,57 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
 
     private fun stopTunnel(notify: Boolean = true) {
         stopRequested.set(true)
+        reconnectRequested.set(false)
+        getSharedPreferences("settings", MODE_PRIVATE).edit().putBoolean(TUNNEL_WANTED, false).apply()
         NativeCore.stop()
+        if (killSwitchHeld.compareAndSet(true, false)) {
+            closeTun()
+            connected.set(false)
+            sendStatus(STATUS_DISCONNECTED)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
         if (notify && !connected.get()) sendStatus(STATUS_DISCONNECTED)
+    }
+
+    private fun closeTun() {
+        tun?.close()
+        tun = null
+    }
+
+    private fun storedVpnModeFromPrefs(): Boolean =
+        getSharedPreferences("settings", MODE_PRIVATE).getString("connection_type", "VPN") != "PROXY"
+
+    private fun vpnBuilder(
+        addresses: NativeCore.TunnelAddresses,
+        config: String,
+        captureTraffic: Boolean,
+    ): Builder = Builder()
+        .setSession(if (captureTraffic) "Aethery" else "Aethery scan")
+        .setMtu(1280)
+        .applyTunnelAddresses(addresses, captureTraffic)
+        .applyDns(config, addresses)
+        .applyGatewayProxy(config, addresses)
+        .applyLanAccess(addresses)
+        .applySplitTunneling()
+
+    private fun promoteVpnRoutes() {
+        if (routesPromoted || !vpnModeActive.get()) return
+        val addresses = pendingAddresses ?: return
+        val config = storedConfig ?: return
+        try {
+            val promoted = vpnBuilder(addresses, config, captureTraffic = true)
+                .establish() ?: return
+            NativeCore.replaceTun(promoted.fd)
+            val old = tun
+            tun = promoted
+            old?.close()
+            routesPromoted = true
+            ConnectionLog.record("Default route installed; device traffic now uses the tunnel")
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "Failed to promote VPN routes: ${e.message}")
+        }
     }
 
     private fun rebuildKillSwitchVpn() {
@@ -208,12 +291,14 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                 .setBlocking(true)
                 .establish()
             tun = blockingTun
+            killSwitchHeld.set(true)
             oldTun?.close()
             ConnectionLog.record("Kill switch VPN active; all traffic blocked")
         } catch (e: Exception) {
             Log.e(LOG_TAG, "Kill switch rebuild failed: ${e.message}")
             oldTun?.close()
             tun = null
+            killSwitchHeld.set(false)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -233,7 +318,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
 
     private fun updateTrafficNotification(tx: Long, rx: Long) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastTrafficSampleMs < 900) return
+        if (now - lastTrafficSampleMs < 3_000) return
 
         val elapsed = now - prevSpeedSampleMs
         if (elapsed > 0 && prevSpeedSampleMs > 0) {
@@ -303,7 +388,13 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
             NotificationManager.IMPORTANCE_LOW,
         ))
         val notification = notification(0, 0)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
             startForeground(NOTIFICATION_ID, notification)
@@ -422,15 +513,18 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         return this
     }
 
-    private fun Builder.applyTunnelAddresses(addresses: NativeCore.TunnelAddresses): Builder {
+    private fun Builder.applyTunnelAddresses(
+        addresses: NativeCore.TunnelAddresses,
+        captureTraffic: Boolean,
+    ): Builder {
         val v4 = parseTunnelAddress(addresses.ipv4, 32)
             ?: error("Zero Trust identity has no usable IPv4 address")
         addAddress(v4.first, v4.second)
-        addRoute("0.0.0.0", 0)
+        if (captureTraffic) addRoute("0.0.0.0", 0)
         val v6 = parseTunnelAddress(addresses.ipv6, 128)
         if (v6 != null) {
             addAddress(v6.first, v6.second)
-            addRoute("::", 0)
+            if (captureTraffic) addRoute("::", 0)
         }
         return this
     }
@@ -565,6 +659,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         const val EXTRA_TRAFFIC_MONTH_RX = "traffic_month_rx"
         const val EXTRA_NOTIFICATION_IP = "notification_ip"
         const val EXTRA_NOTIFICATION_PING = "notification_ping"
+        private const val TUNNEL_WANTED = "tunnel_wanted"
         const val STATUS_CONNECTING = "connecting"
         const val STATUS_STARTING = "starting"
         const val STATUS_SCANNING = "scanning"

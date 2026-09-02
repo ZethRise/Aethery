@@ -62,7 +62,6 @@ class MainActivity : Activity() {
     private lateinit var connectionControl: ConnectionControl
     private lateinit var connectionTitle: TextView
     private lateinit var connectionDetail: TextView
-    private lateinit var connectionLatency: TextView
     private lateinit var latencyGraph: LatencyGraphView
     private lateinit var ipAddressLabel: TextView
     private lateinit var ipAddressValue: TextView
@@ -83,16 +82,6 @@ class MainActivity : Activity() {
     private var pendingConfig: String? = null
     private var visualState = ConnectionControl.State.DISCONNECTED
     private var receiverRegistered = false
-    private var autoPingRunning = false
-    private val autoPingHandler = Handler(Looper.getMainLooper())
-    private val autoPingRunnable = object : Runnable {
-        override fun run() {
-            if (isTunnelActive() && autoPingRunning) {
-                pingConnection()
-                autoPingHandler.postDelayed(this, 5000L)
-            }
-        }
-    }
     private var showingSettings = false
     private var showingLogs = false
     private var showingScanner = false
@@ -132,11 +121,15 @@ class MainActivity : Activity() {
     private val statusPoll = object : Runnable {
         override fun run() {
             renderStatus()
-            statusHandler.postDelayed(this, STATUS_POLL_MS)
+            if (isTunnelActive() || NativeCore.isRunning()) {
+                val delay = if (visualState == ConnectionControl.State.CONNECTING) 2_000L else STATUS_POLL_MS
+                statusHandler.postDelayed(this, delay)
+            }
         }
     }
     private lateinit var palette: AppAppearance.Palette
     private var lastNightMode = false
+    @Volatile private var userDisconnecting = false
     private val CANVAS get() = palette.canvas
     private val SURFACE get() = palette.surface
     private val SURFACE_VARIANT get() = palette.surfaceVariant
@@ -198,16 +191,10 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         connectionDetail = label(textSize = 14f, color = MUTED).apply { gravity = Gravity.CENTER }
-        connectionLatency = label("Latency unavailable", 13f, MUTED).apply {
-            gravity = Gravity.CENTER
-            contentDescription = "Ping connection"
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { pingConnection() }
-        }
         latencyGraph = LatencyGraphView(this).apply {
             isClickable = true
             isFocusable = true
+            contentDescription = "Tap to ping"
             setColors(primary, INK, MUTED)
             setOnClickListener { pingConnection() }
             highlightOnFocus(16, Color.TRANSPARENT, DIVIDER)
@@ -252,14 +239,6 @@ class MainActivity : Activity() {
             rightMargin = dp(24)
             topMargin = dp(17)
         })
-        mainRoot.addView(label("AETHER CORE", 12f, MUTED).apply {
-            letterSpacing = 0.12f
-            gravity = Gravity.CENTER
-        }, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.BOTTOM,
-        ).apply { bottomMargin = dp(24) })
         pageHost = FrameLayout(this).apply {
             setBackgroundColor(CANVAS)
             addView(mainRoot, FrameLayout.LayoutParams(
@@ -269,8 +248,13 @@ class MainActivity : Activity() {
         }
         setContentView(pageHost)
         configureSystemBars()
-        showOpeningOverlay()
+        if (savedInstanceState == null) showOpeningOverlay()
+        restoreTunnelUi()
         refreshPublicIp()
+        if (intent?.getBooleanExtra(EXTRA_START_CONNECT, false) == true) {
+            intent.removeExtra(EXTRA_START_CONNECT)
+            if (!NativeCore.isRunning() && !isTunnelActive()) toggleTunnel()
+        }
     }
 
     override fun onStart() {
@@ -283,10 +267,13 @@ class MainActivity : Activity() {
             registerReceiver(statusReceiver, filter)
         }
         receiverRegistered = true
+        connectionControl.resumeAnimation()
+        statusHandler.removeCallbacks(statusPoll)
         statusPoll.run()
     }
 
     override fun onStop() {
+        connectionControl.pauseAnimation()
         statusHandler.removeCallbacks(statusPoll)
         if (receiverRegistered) {
             unregisterReceiver(statusReceiver)
@@ -347,18 +334,22 @@ class MainActivity : Activity() {
             .setDuration(500)
             .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f))
             .withEndAction {
+                if (isDestroyed || overlay.parent == null) return@withEndAction
                 logo.animate()
                     .scaleX(1.05f)
                     .scaleY(1.05f)
                     .setDuration(700)
                     .setInterpolator(PathInterpolator(0.4f, 0f, 0.2f, 1f))
                     .withEndAction {
+                        if (isDestroyed || overlay.parent == null) return@withEndAction
                         overlay.animate()
                             .alpha(0f)
                             .setDuration(300)
                             .withEndAction {
-                                pageHost.removeView(overlay)
-                                connectionControl.requestFocus()
+                                if (!isDestroyed && overlay.parent != null) {
+                                    pageHost.removeView(overlay)
+                                    connectionControl.requestFocus()
+                                }
                             }
                             .start()
                     }
@@ -367,15 +358,10 @@ class MainActivity : Activity() {
             .start()
     }
 
-    private fun startAutoPing() {
-        autoPingRunning = true
-        autoPingHandler.removeCallbacks(autoPingRunnable)
-        autoPingHandler.postDelayed(autoPingRunnable, 5000L)
-    }
-
-    private fun stopAutoPing() {
-        autoPingRunning = false
-        autoPingHandler.removeCallbacks(autoPingRunnable)
+    private fun restoreTunnelUi() {
+        if (!NativeCore.isRunning()) return
+        if (NativeCore.isReady()) showConnected(restored = true)
+        else showConnecting("Tunnel is still running")
     }
 
     private fun pingConnection() {
@@ -394,20 +380,23 @@ class MainActivity : Activity() {
                     connection.instanceFollowRedirects = false
                     check(connection.responseCode in 200..399) { "HTTP ${connection.responseCode}" }
                     val ms = (System.nanoTime() - startedAt) / 1_000_000
-                    "${ms} ms" to ms.toFloat()
+                    ms.toFloat()
                 } finally {
                     connection.disconnect()
                 }
-            }.getOrElse { "Ping unavailable" to null }
+            }.getOrNull()
             runOnUiThread {
                 pingInFlight = false
                 if (request == latencyRequest && isTunnelActive()) {
-                    latencyGraph.setLabel(result.first)
-                    result.second?.let {
-                        latencyGraph.addPoint(it)
+                    if (result != null) {
+                        latencyGraph.addPoint(result)
                         if (visualState == ConnectionControl.State.DEGRADED) showConnected(restored = true)
-                    } ?: showDegraded()
-                    updateNotificationHealth(ping = result.first)
+                        updateNotificationHealth(ping = latencyGraph.currentLabel())
+                    } else {
+                        latencyGraph.setLabel("Ping unavailable")
+                        showDegraded()
+                        updateNotificationHealth(ping = "Ping unavailable")
+                    }
                 }
             }
         }.start()
@@ -1220,7 +1209,7 @@ class MainActivity : Activity() {
             background = roundedBackground(SURFACE, 28, SURFACE)
         }
         sheet.addView(label("Connection type", 22f, INK, TypefaceStyle.MEDIUM))
-        sheet.addView(label("Choose device-wide VPN or local SOCKS5 proxy", 14f, MUTED), LinearLayout.LayoutParams(
+        sheet.addView(label("Choose device-wide VPN or local SOCKS5 and HTTP CONNECT proxies", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(4); bottomMargin = dp(20) })
@@ -1431,12 +1420,16 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(24) })
-        val lanShareRow = createToggleRow(
+        lateinit var lanShareRow: LinearLayout
+        lanShareRow = createToggleRow(
             "Share on LAN",
-            "Let other devices on this Wi-Fi use the SOCKS5 proxy",
+            lanSharingSummary(),
             lanSharingEnabled(),
         ) {
             preferences().edit().putBoolean(LAN_SHARING, it).apply()
+            if (it) CoreConfig.lanProxyPassword(preferences())
+            val subtitle = (lanShareRow.getChildAt(0) as LinearLayout).getChildAt(1) as TextView
+            subtitle.text = lanSharingSummary()
         }
         content.addView(lanShareRow, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1463,39 +1456,20 @@ class MainActivity : Activity() {
             dp(52),
         ).apply { topMargin = dp(10) })
 
-        content.addView(label("CORE SOCKS PORT", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(24) })
-        val portField = EditText(this).apply {
-            setText(socksPort().toString())
-            setTextColor(INK)
-            setHintTextColor(MUTED)
-            textSize = 16f
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setSingleLine(true)
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(18), 0, dp(12), 0)
-            background = roundedBackground(SURFACE_VARIANT, 16, SURFACE_VARIANT)
-            contentDescription = "Core SOCKS port"
-        }
-        content.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(portField, LinearLayout.LayoutParams(0, dp(56), 1f))
-            addView(createSettingsButton("Apply", backgroundOverride = primary, textColorOverride = primaryContainer) {
-                applySocksPort(portField)
-            }, LinearLayout.LayoutParams(
-                dp(96),
-                dp(56),
-            ).apply { leftMargin = dp(10) })
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(8) })
-        content.addView(label("Used by Aether's local SOCKS listener; Android VPN/TUN routes do not use this port.", 12f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(6) })
+        addCorePortField(
+            content,
+            heading = "CORE SOCKS PORT",
+            currentPort = socksPort(),
+            hint = "Local SOCKS5 for apps that speak SOCKS. Takes effect on the next connection.",
+            fieldDescription = "Core SOCKS port",
+        ) { applyListenPort(it, DEFAULT_SOCKS_PORT, httpProxyPort(), "HTTP CONNECT") }
+        addCorePortField(
+            content,
+            heading = "CORE HTTP PORT",
+            currentPort = httpProxyPort(),
+            hint = "Local HTTP CONNECT for Psiphon and other HTTP-proxy clients. Takes effect on the next connection.",
+            fieldDescription = "Core HTTP CONNECT port",
+        ) { applyListenPort(it, DEFAULT_HTTP_PROXY_PORT, socksPort(), "SOCKS5") }
 
         content.addView(label("NATIVE SPLIT TUNNELING", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1629,9 +1603,17 @@ class MainActivity : Activity() {
         addControl("DNS resolvers · ${dnsSummary()} ›") { editDnsServers() }
         addControl("Destination routing · ${routingSummary()} ›") { editRoutingRules() }
         zeroTrustControlButton = addControl("Zero Trust · ${zeroTrustSummary()} ›") { openZeroTrustScreen() }
-        content.addView(label("ANTI-DPI", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(label("MASQUE", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(28) })
+        lateinit var h2FallbackButton: TextView
+        h2FallbackButton = addControl("HTTP/3 → HTTP/2 fallback · ${if (h3H2Fallback()) "On" else "Off"}") {
+            preferences().edit().putBoolean(H3_H2_FALLBACK, !h3H2Fallback()).apply()
+            updateTunnelControlButton(
+                h2FallbackButton,
+                "HTTP/3 → HTTP/2 fallback · ${if (h3H2Fallback()) "On" else "Off"}",
+            )
+        }
         addControl("TLS fragmentation · ${if (h2Fragmentation() == H2Fragmentation.ON) "On" else "Off"} ›") {
             chooseH2Fragmentation()
         }
@@ -2496,7 +2478,7 @@ class MainActivity : Activity() {
                 .thenBy { packageManager.getApplicationLabel(it).toString().lowercase() })
 
             sortedApps.forEach { app ->
-                appList.addView(createSplitTunnelAppOption(app, mode, selected, settings, appList), LinearLayout.LayoutParams(
+                appList.addView(createSplitTunnelAppOption(app, mode, selected, settings), LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     dp(72),
                 ).apply { bottomMargin = dp(8) })
@@ -2531,9 +2513,9 @@ class MainActivity : Activity() {
         mode: SplitTunnelSettings.Mode,
         selected: MutableSet<String>,
         settings: SplitTunnelSettings,
-        container: ViewGroup,
     ): LinearLayout {
         val packageName = app.packageName
+        val appLabel = packageManager.getApplicationLabel(app).toString()
         lateinit var row: LinearLayout
         fun updateSelection(checked: Boolean, animate: Boolean) {
             row.background = roundedBackground(
@@ -2556,30 +2538,27 @@ class MainActivity : Activity() {
             }
         }
         val checkbox = CheckBox(this).apply {
-            isChecked = packageName in selected
-            contentDescription = "Select ${packageManager.getApplicationLabel(app)}"
+            id = View.generateViewId()
+            isClickable = false
+            isFocusable = false
+            isChecked = selected.contains(packageName)
+            contentDescription = "Select $appLabel"
             setOnCheckedChangeListener { _, checked ->
-                if (checked) {
-                    selected += packageName
-                    if (container.indexOfChild(row) != 0) {
-                        container.removeView(row)
-                        container.addView(row, 0)
-                    }
-                } else {
-                    selected -= packageName
-                }
+                if (checked) selected += packageName else selected -= packageName
+                splitTunnelDraftPackages = selected
                 settings.save(mode, selected.toHashSet())
                 updateSelection(checked, animate = true)
             }
         }
         row = LinearLayout(this).apply {
+            id = View.generateViewId()
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(14), 0, dp(8), 0)
             isClickable = true
             isFocusable = true
-            tag = packageManager.getApplicationLabel(app).toString()
+            tag = appLabel
             contentDescription = packageName
-            setOnClickListener { checkbox.isChecked = !checkbox.isChecked }
+            setOnClickListener { checkbox.toggle() }
             addView(ImageView(this@MainActivity).apply {
                 setImageDrawable(app.loadIcon(packageManager))
                 scaleType = ImageView.ScaleType.CENTER_INSIDE
@@ -2588,7 +2567,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(14), 0, 0, 0)
             }
-            labels.addView(label(packageManager.getApplicationLabel(app).toString(), 16f, INK, TypefaceStyle.MEDIUM))
+            labels.addView(label(appLabel, 16f, INK, TypefaceStyle.MEDIUM))
             labels.addView(label(packageName, 11f, MUTED).apply { 
                 ellipsize = android.text.TextUtils.TruncateAt.END
                 setSingleLine(true)
@@ -2663,7 +2642,7 @@ class MainActivity : Activity() {
     }
 
     private fun loadUserApps(onLoaded: (List<ApplicationInfo>) -> Unit) {
-        cachedUserApps?.let(onLoaded) ?: Thread {
+        Thread {
             val apps = installedUserApps()
             cachedUserApps = apps
             runOnUiThread { onLoaded(apps) }
@@ -2725,37 +2704,50 @@ class MainActivity : Activity() {
     }
 
     private fun toggleTunnel() {
-        if (NativeCore.isRunning()) {
+        if (NativeCore.isRunning() || isTunnelActive() || userDisconnecting) {
+            userDisconnecting = true
             startService(Intent(this, AetherVpnService::class.java).setAction(AetherVpnService.ACTION_DISCONNECT))
             showDisconnected("Disconnecting")
             return
         }
 
-        val config = configJson()
+        userDisconnecting = false
         if (connectionType() == ConnectionType.PROXY) {
-            connect(config)
+            connect()
             return
         }
         val permissionIntent = VpnService.prepare(this)
-        if (permissionIntent == null) connect(config) else {
-            pendingConfig = config
+        if (permissionIntent == null) connect() else {
+            pendingConfig = configJson()
             startActivityForResult(permissionIntent, VPN_REQUEST)
         }
     }
 
-    private fun connect(config: String) {
+    private fun connect(config: String = configJson()) {
+        userDisconnecting = false
         showConnecting()
         startForegroundService(Intent(this, AetherVpnService::class.java)
             .setAction(AetherVpnService.ACTION_CONNECT)
-            .putExtra(AetherVpnService.EXTRA_CONFIG, config)
             .putExtra(AetherVpnService.EXTRA_VPN_MODE, connectionType() == ConnectionType.VPN))
     }
 
     private fun configJson(): String = CoreConfig.json(this, selectedProtocol.coreName)
 
     private fun renderStatus() {
-        if (!NativeCore.isRunning() && isTunnelActive()) {
-            NativeCore.lastError().takeIf(String::isNotBlank)?.let(::showFailure) ?: showDisconnected("Tunnel stopped unexpectedly")
+        if (userDisconnecting) {
+            if (!NativeCore.isRunning()) userDisconnecting = false
+            return
+        }
+        if (NativeCore.isRunning()) {
+            if (!isTunnelActive()) {
+                if (NativeCore.isReady()) showConnected(restored = true)
+                else showConnecting("Tunnel is still running")
+            }
+            return
+        }
+        if (isTunnelActive()) {
+            NativeCore.lastError().takeIf(String::isNotBlank)?.let(::showFailure)
+                ?: showDisconnected("Tunnel stopped unexpectedly")
         }
     }
 
@@ -2773,9 +2765,12 @@ class MainActivity : Activity() {
 
     private fun showConnectionProgress(title: String, detail: String) {
         latencyRequest++
-        connectionLatency.text = "Latency unavailable"
+        pingInFlight = false
+        latencyGraph.reset()
         visualState = ConnectionControl.State.CONNECTING
         connectionControl.state = visualState
+        statusHandler.removeCallbacks(statusPoll)
+        statusHandler.post(statusPoll)
         connectionTitle.setTextColor(primary)
         connectionTitle.text = title
         connectionDetail.text = detail
@@ -2788,13 +2783,11 @@ class MainActivity : Activity() {
         connectionTitle.setTextColor(connected)
         connectionTitle.text = "Connected"
         connectionDetail.text = if (restored) "${selectedProtocol.label} tunnel recovered" else "${selectedProtocol.label} tunnel is active"
-        latencyGraph.setLabel("Pinging\u2026")
-        setModeEnabled(false)
         if (!restored) {
-            pingConnection()
-            startAutoPing()
+            latencyGraph.setLabel("Tap to ping")
             refreshPublicIp()
         }
+        setModeEnabled(false)
     }
 
     private fun showDegraded() {
@@ -2809,7 +2802,8 @@ class MainActivity : Activity() {
 
     private fun showFailure(detail: String? = null) {
         latencyRequest++
-        connectionLatency.text = "Latency unavailable"
+        pingInFlight = false
+        latencyGraph.reset()
         visualState = ConnectionControl.State.FAILED
         connectionControl.state = visualState
         connectionTitle.setTextColor(ERROR)
@@ -2820,7 +2814,7 @@ class MainActivity : Activity() {
 
     private fun showDisconnected(detail: String = "Tap the circle to connect") {
         latencyRequest++
-        stopAutoPing()
+        pingInFlight = false
         latencyGraph.reset()
         visualState = ConnectionControl.State.DISCONNECTED
         connectionControl.state = visualState
@@ -3022,6 +3016,14 @@ class MainActivity : Activity() {
 
     private fun lanSharingEnabled(): Boolean = preferences().getBoolean(LAN_SHARING, false)
 
+    private fun lanSharingSummary(): String {
+        if (!lanSharingEnabled()) {
+            return "Let other devices on this Wi-Fi use the proxies (username aethery + a generated password)"
+        }
+        val password = CoreConfig.lanProxyPassword(preferences())
+        return "On · user aethery · password $password"
+    }
+
     private fun lanBypassEnabled(): Boolean {
         if (!preferences().contains(LAN_BYPASS) && lanSharingEnabled()) {
             preferences().edit().putBoolean(LAN_BYPASS, true).apply()
@@ -3050,7 +3052,7 @@ class MainActivity : Activity() {
             addView(createHeaderBackButton { closeThemeScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
             addView(label("Theme", 22f, INK, TypefaceStyle.MEDIUM))
         })
-        content.addView(label("Dynamic follows the phone's light or dark theme. The other palettes stay until you change them.", 14f, MUTED), LinearLayout.LayoutParams(
+        content.addView(label("Dynamic is the default and follows the phone's light or dark theme. The other palettes stay until you change them.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(20) })
@@ -3171,6 +3173,8 @@ class MainActivity : Activity() {
         ?.let { name -> PerfProfile.entries.firstOrNull { it.coreName == name } }
         ?: PerfProfile.AUTO
 
+    private fun h3H2Fallback(): Boolean = preferences().getBoolean(H3_H2_FALLBACK, true)
+
     private fun h2Fragmentation(): H2Fragmentation = preferences()
         .getString(H2_FRAGMENTATION, H2Fragmentation.ON.coreName)
         ?.let { name -> H2Fragmentation.entries.firstOrNull { it.coreName == name } }
@@ -3191,6 +3195,9 @@ class MainActivity : Activity() {
     private fun socksPort(): Int = getSharedPreferences(SETTINGS, MODE_PRIVATE)
         .getInt(DEFAULT_SOCKS_PORT, DEFAULT_SOCKS_PORT_VALUE)
 
+    private fun httpProxyPort(): Int = getSharedPreferences(SETTINGS, MODE_PRIVATE)
+        .getInt(DEFAULT_HTTP_PROXY_PORT, DEFAULT_HTTP_PROXY_PORT_VALUE)
+
     private fun splitTunnelSummary(): String {
         val settings = SplitTunnelSettings(this)
         val count = settings.packages().size
@@ -3201,13 +3208,60 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun applySocksPort(field: EditText) {
+    private fun addCorePortField(
+        content: LinearLayout,
+        heading: String,
+        currentPort: Int,
+        hint: String,
+        fieldDescription: String,
+        onApply: (EditText) -> Unit,
+    ) {
+        content.addView(label(heading, 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(24) })
+        val portField = EditText(this).apply {
+            setText(currentPort.toString())
+            setTextColor(INK)
+            setHintTextColor(MUTED)
+            textSize = 16f
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(18), 0, dp(12), 0)
+            background = roundedBackground(SURFACE_VARIANT, 16, SURFACE_VARIANT)
+            contentDescription = fieldDescription
+        }
+        content.addView(LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(portField, LinearLayout.LayoutParams(0, dp(56), 1f))
+            addView(createSettingsButton("Apply", backgroundOverride = primary, textColorOverride = primaryContainer) {
+                onApply(portField)
+            }, LinearLayout.LayoutParams(
+                dp(96),
+                dp(56),
+            ).apply { leftMargin = dp(10) })
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(8) })
+        content.addView(label(hint, 12f, MUTED), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(6) })
+    }
+
+    private fun applyListenPort(field: EditText, key: String, otherPort: Int, otherName: String) {
         val port = field.text.toString().toIntOrNull()
         if (port == null || port !in 1..65535) {
             field.error = "Enter a port from 1 to 65535"
             return
         }
-        getSharedPreferences(SETTINGS, MODE_PRIVATE).edit().putInt(DEFAULT_SOCKS_PORT, port).apply()
+        if (port == otherPort) {
+            field.error = "Use a different port from $otherName"
+            return
+        }
+        getSharedPreferences(SETTINGS, MODE_PRIVATE).edit().putInt(key, port).apply()
         field.error = null
         field.clearFocus()
     }
@@ -3225,7 +3279,7 @@ class MainActivity : Activity() {
 
     private enum class ConnectionType(val label: String, val description: String) {
         VPN("VPN", "Routes device traffic through Android VPN"),
-        PROXY("Proxy", "Starts local SOCKS5 at 127.0.0.1:${DEFAULT_SOCKS_PORT_VALUE}"),
+        PROXY("Proxy", "Starts local SOCKS5 and HTTP CONNECT on localhost"),
     }
 
     private enum class ScanTarget(
@@ -3255,7 +3309,7 @@ class MainActivity : Activity() {
         val coreName: String,
         val description: String,
     ) {
-        H3("HTTP/3", "h3", "QUIC first; falls back to HTTP/2 if UDP is blocked"),
+        H3("HTTP/3", "h3", "QUIC first; optional HTTP/2 fallback is in Tunnel controls"),
         H2("HTTP/2", "h2", "TCP with TLS fragmentation; use on restricted networks"),
     }
 
@@ -3315,11 +3369,12 @@ class MainActivity : Activity() {
 
     private enum class TypefaceStyle { REGULAR, MEDIUM }
 
-    private companion object {
-        const val VPN_REQUEST = 100
+    companion object {
+        const val EXTRA_START_CONNECT = "start_connect"
+        private const val VPN_REQUEST = 100
         const val NOTIFICATION_PERMISSION_REQUEST = 101
-        const val LOG_REFRESH_MS = 750L
-        const val STATUS_POLL_MS = 2_000L
+        const val LOG_REFRESH_MS = 1_500L
+        const val STATUS_POLL_MS = 5_000L
         const val PAGE_ANIMATION_MS = 220L
         const val LOG_CLOSE_ANIMATION_MS = 160L
         const val PING_URL = "https://www.google.com/generate_204"
@@ -3358,6 +3413,7 @@ class MainActivity : Activity() {
         const val LOG_LEVEL = "log_level"
         const val PERF_PROFILE = "perf_profile"
         const val H2_FRAGMENTATION = "h2_fragmentation"
+        const val H3_H2_FALLBACK = "h3_h2_fallback"
         const val DNS_SERVERS = "dns_servers"
         const val ROUTE_BLOCK = "route_block"
         const val ROUTE_DIRECT = "route_direct"
@@ -3369,6 +3425,8 @@ class MainActivity : Activity() {
         const val ZERO_TRUST_GATEWAY = "zero_trust_gateway"
         const val DEFAULT_SOCKS_PORT = "default_socks_port"
         const val DEFAULT_SOCKS_PORT_VALUE = 1819
+        const val DEFAULT_HTTP_PROXY_PORT = "default_http_proxy_port"
+        const val DEFAULT_HTTP_PROXY_PORT_VALUE = 1820
         const val FALLBACK_CANVAS = 0xFF101411.toInt()
         const val FALLBACK_SURFACE = 0xFF171C18.toInt()
         const val FALLBACK_SURFACE_VARIANT = 0xFF222A24.toInt()
@@ -3411,13 +3469,14 @@ private class ConnectionControl(
 
     var state: State = State.DISCONNECTED
         set(value) {
+            if (field == value) return
             field = value
             contentDescription = when (value) {
                 State.DISCONNECTED, State.FAILED -> "Connect"
                 State.CONNECTING -> "Connecting"
                 State.CONNECTED, State.DEGRADED -> "Disconnect"
             }
-            if (value == State.CONNECTING || value == State.CONNECTED || value == State.DEGRADED) startConnectingAnimation() else stopConnectingAnimation()
+            if (value == State.CONNECTING) startConnectingAnimation() else stopConnectingAnimation()
             animate().cancel()
             animate().scaleX(0.9f).scaleY(0.9f).setDuration(90).withEndAction {
                 animate().scaleX(1f).scaleY(1f).setDuration(180).start()
@@ -3437,7 +3496,6 @@ private class ConnectionControl(
         isFocusable = true
         isFocusableInTouchMode = false
         contentDescription = "Connect"
-        setLayerType(View.LAYER_TYPE_SOFTWARE, null)
     }
 
     override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: android.graphics.Rect?) {
@@ -3472,13 +3530,11 @@ private class ConnectionControl(
         }
 
         paint.style = Paint.Style.FILL
-        paint.color = palette.container
         val active = state == State.CONNECTED || state == State.DEGRADED
-        val shadowAlpha = if (active) 0x88 else 0x44
-        val shadowColor = (shadowAlpha shl 24) or (if (active) palette.accent and 0xFFFFFF else 0x000000)
-        paint.setShadowLayer(dp(if (active) 18 else 12).toFloat(), 0f, 0f, shadowColor)
+        paint.color = (if (active) 0x33000000 else 0x22000000) or (palette.accent and 0x00FFFFFF)
+        canvas.drawCircle(centerX, centerY, radius + dp(if (active) 10 else 6), paint)
+        paint.color = palette.container
         canvas.drawCircle(centerX, centerY, radius, paint)
-        paint.clearShadowLayer()
 
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = dp(if (isFocused) 4 else if (state == State.DISCONNECTED) 1 else 2).toFloat()
@@ -3514,8 +3570,8 @@ private class ConnectionControl(
             )
         } else if (state == State.CONNECTED || state == State.DEGRADED) {
             paint.style = Paint.Style.STROKE
-            paint.strokeWidth = dp(2 + (pulse * 2f).roundToInt()).toFloat()
-            canvas.drawCircle(centerX, centerY, radius + dp(5) + pulse * dp(5), paint)
+            paint.strokeWidth = dp(2).toFloat()
+            canvas.drawCircle(centerX, centerY, radius + dp(6), paint)
         }
 
 
@@ -3549,10 +3605,20 @@ private class ConnectionControl(
         super.onDetachedFromWindow()
     }
 
+    fun pauseAnimation() {
+        connectingAnimator?.pause()
+    }
+
+    fun resumeAnimation() {
+        if (state == State.CONNECTING) {
+            connectingAnimator?.resume() ?: startConnectingAnimation()
+        }
+    }
+
     private fun startConnectingAnimation() {
         if (connectingAnimator != null) return
         connectingAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = if (state == State.CONNECTED || state == State.DEGRADED) 1_600 else 1_050
+            duration = 1_050
             repeatCount = ValueAnimator.INFINITE
             addUpdateListener {
                 progress = it.animatedFraction
@@ -3624,11 +3690,21 @@ private class LatencyGraphView(context: Context) : View(context) {
     private var graphAnimator: ValueAnimator? = null
 
     fun addPoint(ms: Float) {
+        val previous = points.lastOrNull()
         points.add(ms)
         if (points.size > maxPoints) points.removeAt(0)
-        currentLabel = "${ms.toInt()} ms"
+        currentLabel = previous?.let { last ->
+            val delta = (ms - last).roundToInt()
+            when {
+                delta > 0 -> "${ms.toInt()} ms  +$delta"
+                delta < 0 -> "${ms.toInt()} ms  $delta"
+                else -> "${ms.toInt()} ms"
+            }
+        } ?: "${ms.toInt()} ms"
         animateGraph()
     }
+
+    fun currentLabel(): String = currentLabel
 
     fun setLabel(text: String) {
         currentLabel = text

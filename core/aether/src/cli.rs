@@ -34,6 +34,7 @@ Obfuscation:
 
 MASQUE transport:
   --h2, --http2            use HTTP/2 (TCP) instead of HTTP/3 (QUIC)
+  --no-h2-fallback         do not fall back from HTTP/3 to HTTP/2 if the QUIC scan fails
   --h2-peer <ip:port>      override the peer used for the HTTP/2 transport
   --ech <auto|base64>      enable Encrypted Client Hello
   --no-data-check          skip the end-to-end data-plane validation
@@ -127,6 +128,7 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<()> {
 
             "--bind" => set("AETHER_SOCKS", next_value!()),
             "--http-proxy" => set("AETHER_HTTP_PROXY", next_value!()),
+            "--upstream" => set("AETHER_UPSTREAM", next_value!()),
             "--quick-reconnect" => set("AETHER_QUICK_RECONNECT", "1"),
             "--no-quick-reconnect" => set("AETHER_QUICK_RECONNECT", "0"),
 
@@ -153,6 +155,7 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<()> {
             "--noize" => set("AETHER_NOIZE", next_value!()),
 
             "--h2" | "--http2" => set("AETHER_MASQUE_HTTP2", "1"),
+            "--no-h2-fallback" => set("AETHER_MASQUE_H2_FALLBACK", "0"),
             "--h2-peer" => set("AETHER_MASQUE_H2_PEER", next_value!()),
             "--ech" => set("AETHER_ECH", next_value!()),
             "--no-data-check" => {

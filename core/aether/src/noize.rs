@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use rand::RngExt;
 use rand::Rng;
-use rand::RngCore;
 use tokio::net::UdpSocket;
 
 #[derive(Debug, Clone)]
@@ -80,15 +80,15 @@ pub fn from_profile(name: &str) -> NoizeConfig {
 }
 
 fn junk_packet(cfg: &NoizeConfig) -> Vec<u8> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let (lo, hi) = if cfg.jmax > cfg.jmin && cfg.jmin > 0 {
         (cfg.jmin, cfg.jmax)
     } else {
         (40, 90)
     };
-    let size = rng.gen_range(lo..=hi);
+    let size = rng.random_range(lo..=hi);
     let mut buf = vec![0u8; size];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     buf
 }
 
@@ -116,27 +116,27 @@ fn parse_cps(spec: &str) -> Vec<u8> {
                 if let Ok(decoded) = hex::decode(&hexstr) {
                     out.extend_from_slice(&decoded);
                 }
-            }
+            },
             "t" => {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as u32)
                     .unwrap_or(0);
                 out.extend_from_slice(&ts.to_be_bytes());
-            }
+            },
             "n" => {
                 let nonce: u64 = rand::random();
                 out.extend_from_slice(&nonce.to_be_bytes());
-            }
+            },
             "r" => {
                 let len: usize = data.parse().unwrap_or(0).min(1024);
                 if len > 0 {
                     let mut r = vec![0u8; len];
-                    rand::thread_rng().fill_bytes(&mut r);
+                    rand::rng().fill_bytes(&mut r);
                     out.extend_from_slice(&r);
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
 
         i = end + 1;

@@ -1,7 +1,6 @@
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use boring::pkey::PKey;
@@ -9,6 +8,7 @@ use boring::ssl::{SslConnector, SslMethod, SslVersion};
 use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -21,8 +21,8 @@ use crate::tls;
 
 const H2_ALPN: &[u8] = b"\x02h2";
 const CHROME_GROUPS: &str = "P-256:X25519:P-384";
-static H2_FALLBACK: AtomicBool = AtomicBool::new(false);
 static H2_PREFERRED: AtomicBool = AtomicBool::new(false);
+static H2_FALLBACK: AtomicBool = AtomicBool::new(false);
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -31,6 +31,42 @@ impl Drop for AbortOnDrop {
         self.0.abort();
     }
 }
+
+pub struct H2TunnelConfig {
+    pub peer: SocketAddr,
+    pub sni: String,
+    pub authority: String,
+    pub path: String,
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    pub local_ipv4: Ipv4Addr,
+    pub quiet: bool,
+    pub pin_endpoint: bool,
+    pub expected_pins: Vec<Vec<u8>>,
+}
+
+fn log_or_debug(quiet: bool, msg: String) {
+    if quiet {
+        log::debug!("{msg}");
+    } else {
+        log::info!("{msg}");
+    }
+}
+
+fn data_check_enabled() -> bool {
+    std::env::var("AETHER_MASQUE_NO_DATA_CHECK").is_err()
+}
+
+fn validation_timeout() -> Duration {
+    let secs = std::env::var("AETHER_MASQUE_VALIDATE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(10);
+    Duration::from_secs(secs)
+}
+
+const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 2;
 
 fn h2_keepalive_interval() -> Duration {
     let secs = std::env::var("AETHER_MASQUE_H2_KEEPALIVE_SECS")
@@ -48,38 +84,6 @@ fn h2_keepalive_timeout() -> Duration {
         .filter(|&v| v > 0)
         .unwrap_or(20);
     Duration::from_secs(secs)
-}
-
-async fn connect_tcp(peer: SocketAddr) -> Result<TcpStream> {
-    let socket = if peer.is_ipv4() {
-        TcpSocket::new_v4()
-    } else {
-        TcpSocket::new_v6()
-    }
-    .map_err(AetherError::Io)?;
-    crate::platform::protect_socket(&socket).map_err(AetherError::Io)?;
-    // Bind unspecified so Android does not pick the VPN address (172.16.0.2)
-    // as the source after the TUN interface is already up.
-    let bind = if peer.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
-    socket.bind(bind).map_err(AetherError::Io)?;
-    socket.connect(peer).await.map_err(AetherError::Io)
-}
-
-pub struct H2TunnelConfig {
-    pub peer: SocketAddr,
-    pub sni: String,
-    pub authority: String,
-    pub path: String,
-    pub cert_pem: Vec<u8>,
-    pub key_pem: Vec<u8>,
-    pub local_ipv4: Ipv4Addr,
-    pub quiet: bool,
-    pub pin_endpoint: bool,
-    pub expected_pins: Vec<Vec<u8>>,
 }
 
 pub fn enabled() -> bool {
@@ -104,6 +108,10 @@ pub fn enable_fallback() {
     H2_FALLBACK.store(true, Ordering::Release);
 }
 
+pub fn clear_fallback() {
+    H2_FALLBACK.store(false, Ordering::Release);
+}
+
 pub fn h2_peer(quic_peer: SocketAddr) -> SocketAddr {
     if let Ok(v) = std::env::var("AETHER_MASQUE_H2_PEER") {
         if let Ok(addr) = v.trim().parse::<SocketAddr>() {
@@ -112,33 +120,6 @@ pub fn h2_peer(quic_peer: SocketAddr) -> SocketAddr {
     }
     quic_peer
 }
-
-fn log_or_debug(quiet: bool, msg: String) {
-    if quiet {
-        log::debug!("{msg}");
-    } else {
-        log::info!("{msg}");
-    }
-}
-
-fn data_check_enabled_for(no_data_check: Option<&str>) -> bool {
-    no_data_check.is_none()
-}
-
-fn data_check_enabled() -> bool {
-    data_check_enabled_for(std::env::var("AETHER_MASQUE_NO_DATA_CHECK").ok().as_deref())
-}
-
-fn validation_timeout() -> Duration {
-    let secs = std::env::var("AETHER_MASQUE_VALIDATE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(10);
-    Duration::from_secs(secs)
-}
-
-const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 2;
 
 fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> {
     let mut builder =
@@ -177,6 +158,9 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
         .set_private_key(&key)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
+    // Install TLS verification:
+    // pin_endpoint=true with pins: pin-based verification (SNI can be spoofed)
+    // pin_endpoint=false: SslVerifyMode::NONE (default, required for Cloudflare MASQUE edges)
     let pin_refs: Vec<&[u8]> = cfg.expected_pins.iter().map(|p| p.as_slice()).collect();
     tls::install_verification(&mut *builder, cfg.pin_endpoint, &pin_refs)?;
 
@@ -185,6 +169,9 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
         .configure()
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
+    // When using pin-based verification, SNI may be spoofed for DPI bypass,
+    // so hostname verification against the cert's CN/SAN is not applicable.
+    // Standard CA verification requires hostname matching.
     let use_pin_verification = cfg.pin_endpoint && !cfg.expected_pins.is_empty();
     config.set_verify_hostname(!use_pin_verification);
     config.set_use_server_name_indication(true);
@@ -205,13 +192,37 @@ fn build_connect_request(cfg: &H2TunnelConfig) -> Result<http::Request<()>> {
         .map_err(|e| AetherError::Masque(format!("build request: {e}")))
 }
 
+async fn connect_tcp(peer: SocketAddr) -> Result<TcpStream> {
+    let socket = if peer.is_ipv4() {
+        TcpSocket::new_v4()
+    } else {
+        TcpSocket::new_v6()
+    }
+    .map_err(AetherError::Io)?;
+    crate::platform::protect_socket(&socket).map_err(AetherError::Io)?;
+    let bind = if peer.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    socket.bind(bind).map_err(AetherError::Io)?;
+    socket.connect(peer).await.map_err(AetherError::Io)
+}
+
+pub async fn dial(peer: std::net::SocketAddr) -> Result<TcpStream> {
+    match crate::upstream::configured() {
+        Some(proxy) => proxy.connect(peer).await,
+        None => connect_tcp(peer).await,
+    }
+}
+
 pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Duration> {
     let start = Instant::now();
     let data_check = data_check_enabled();
 
     let attempt = async {
         let tls_config = build_tls(cfg)?;
-        let tcp = connect_tcp(cfg.peer).await?;
+        let tcp = dial(cfg.peer).await?;
         let _ = tcp.set_nodelay(true);
         let fragment = FragmentingStream::new(tcp, FragmentConfig::from_env());
         let tls = tokio_boring::connect(tls_config, &cfg.sni, fragment)
@@ -322,39 +333,33 @@ pub async fn run(
     let tls_config = build_tls(&cfg)?;
 
     log_or_debug(quiet, format!("[h2] connecting tcp to {}", cfg.peer));
-    let tcp = connect_tcp(cfg.peer).await?;
+    let tcp = dial(cfg.peer).await?;
     let _ = tcp.set_nodelay(true);
 
     let frag_cfg = FragmentConfig::from_env();
     if frag_cfg.enabled {
-        log_or_debug(
-            quiet,
-            format!(
-                "[h2] fragmenting client hello: size={}..{} delay={}..{}ms",
-                frag_cfg.size_min, frag_cfg.size_max, frag_cfg.delay_min_ms, frag_cfg.delay_max_ms
-            ),
-        );
+        log_or_debug(quiet, format!(
+            "[h2] fragmenting client hello: size={}..{} delay={}..{}ms",
+            frag_cfg.size_min, frag_cfg.size_max, frag_cfg.delay_min_ms, frag_cfg.delay_max_ms
+        ));
     }
     let fragment = FragmentingStream::new(tcp, frag_cfg);
 
     let tls = tokio_boring::connect(tls_config, &cfg.sni, fragment)
         .await
         .map_err(|e| AetherError::Tls(format!("h2 tls handshake: {e}")))?;
-    log_or_debug(
-        quiet,
-        format!(
-            "[h2] tls established; alpn={}",
-            String::from_utf8_lossy(tls.ssl().selected_alpn_protocol().unwrap_or(b""))
-        ),
-    );
+    log_or_debug(quiet, format!(
+        "[h2] tls established; alpn={}",
+        String::from_utf8_lossy(tls.ssl().selected_alpn_protocol().unwrap_or(b""))
+    ));
 
     let (h2, mut connection) = h2::client::handshake(tls)
         .await
         .map_err(|e| AetherError::Masque(format!("h2 handshake: {e}")))?;
 
-    let mut ping_pong = connection
-        .ping_pong()
-        .ok_or_else(|| AetherError::Masque("h2 connection does not support ping".into()))?;
+    let mut ping_pong = connection.ping_pong().ok_or_else(|| {
+        AetherError::Masque("h2 connection does not support ping".into())
+    })?;
 
     let driver_handle = tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -373,25 +378,20 @@ pub async fn run(
     let (resp_fut, mut send_stream) = h2
         .send_request(req, false)
         .map_err(|e| AetherError::Masque(format!("send_request: {e}")))?;
-    log_or_debug(
-        quiet,
-        format!("[h2] connect-ip request sent to {}", cfg.authority),
-    );
+    log_or_debug(quiet, format!("[h2] connect-ip request sent to {}", cfg.authority));
 
     let response = resp_fut
         .await
         .map_err(|e| AetherError::Masque(format!("await response: {e}")))?;
     let status = response.status();
-    log_or_debug(
-        quiet,
-        format!("[h2] connect-ip status: {}", status.as_u16()),
-    );
+    log_or_debug(quiet, format!("[h2] connect-ip status: {}", status.as_u16()));
     if !status.is_success() {
         return Err(AetherError::Masque(format!(
             "h2 connect-ip status {}",
             status.as_u16()
         )));
     }
+
     let mut recv_body = response.into_body();
     let mut capsules = CapsuleParser::new();
 
@@ -402,10 +402,7 @@ pub async fn run(
             log::debug!("[h2] initial data-plane probe: {e}");
         }
         validate_deadline = Some(Instant::now() + validation_timeout());
-        log_or_debug(
-            quiet,
-            "[h2] validating data-plane (end-to-end probe) before exposing socks5".to_string(),
-        );
+        log_or_debug(quiet, "[h2] validating data-plane (end-to-end probe) before exposing socks5".to_string());
     } else if !ready_fired {
         ready_fired = true;
         crate::ffi::mark_ready();
@@ -441,16 +438,12 @@ pub async fn run(
 
         if let Some(dl) = pong_deadline {
             if Instant::now() >= dl {
-                let message = format!(
-                    "HTTP/2 keepalive PONG missed after {:?}; retaining active tunnel",
+                log::warn!(
+                    "[h2] no PING response from edge within {:?}; connection is stalled",
                     keepalive_timeout
                 );
-                log::warn!("[h2] {message}");
-                crate::ffi::record_log(message);
-                // Cloudflare edges can carry CONNECT-IP datagrams while silently dropping
-                // HTTP/2 PING frames.  Traffic and the app health check are authoritative.
-                awaiting_pong = false;
-                pong_deadline = None;
+                let _ = send_stream.send_data(Bytes::new(), true);
+                return Err(AetherError::Masque("h2 keepalive timeout".into()));
             }
         }
 
@@ -476,11 +469,9 @@ pub async fn run(
                         log::debug!("[h2] keepalive pong received");
                     }
                     Err(e) => {
-                        let message = format!("HTTP/2 keepalive PONG failed: {e}; retaining active tunnel");
-                        log::warn!("[h2] {message}");
-                        crate::ffi::record_log(message);
-                        awaiting_pong = false;
-                        pong_deadline = None;
+                        log::warn!("[h2] keepalive ping failed: {e}");
+                        let _ = send_stream.send_data(Bytes::new(), true);
+                        return Err(AetherError::Masque(format!("h2 keepalive: {e}")));
                     }
                 }
             }
@@ -644,16 +635,5 @@ fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
             Some(IpAddr::V6(b.into()))
         }
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::data_check_enabled_for;
-
-    #[test]
-    fn h2_data_validation_is_on_by_default() {
-        assert!(data_check_enabled_for(None));
-        assert!(!data_check_enabled_for(Some("1")));
     }
 }

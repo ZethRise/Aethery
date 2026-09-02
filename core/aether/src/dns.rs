@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
+
 use tokio::time::timeout_at;
 
 use crate::error::{AetherError, Result};
@@ -21,10 +21,7 @@ pub async fn fetch_ech_config() -> Result<Vec<u8>> {
             };
             match query_ech(addr, host).await {
                 Ok(ech) if !ech.is_empty() => {
-                    log::info!(
-                        "fetched ECHConfigList ({} bytes) for {host} via {server}",
-                        ech.len()
-                    );
+                    log::info!("fetched ECHConfigList ({} bytes) for {host} via {server}", ech.len());
                     return Ok(ech);
                 }
                 Ok(_) => {}
@@ -36,14 +33,7 @@ pub async fn fetch_ech_config() -> Result<Vec<u8>> {
 }
 
 async fn query_ech(server: SocketAddr, host: &str) -> Result<Vec<u8>> {
-    let bind = if server.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let sock = UdpSocket::bind(bind).await?;
-    crate::platform::protect_socket(&sock).map_err(AetherError::Io)?;
-    sock.connect(server).await?;
+    let (sock, _) = crate::upstream::bind_via_upstream(server).await?;
 
     let (query, id) = build_query(host, RR_HTTPS);
     sock.send(&query).await?;
@@ -240,67 +230,37 @@ mod tests {
     #[test]
     fn accepts_a_reply_that_matches_the_query() {
         let msg = reply(0x1234, "cloudflare-ech.com", RR_HTTPS, true, 1);
-        assert!(response_matches(
-            &msg,
-            0x1234,
-            "cloudflare-ech.com",
-            RR_HTTPS
-        ));
+        assert!(response_matches(&msg, 0x1234, "cloudflare-ech.com", RR_HTTPS));
     }
 
     #[test]
     fn rejects_a_spoofed_reply_with_the_wrong_transaction_id() {
         let msg = reply(0x9999, "cloudflare-ech.com", RR_HTTPS, true, 1);
-        assert!(!response_matches(
-            &msg,
-            0x1234,
-            "cloudflare-ech.com",
-            RR_HTTPS
-        ));
+        assert!(!response_matches(&msg, 0x1234, "cloudflare-ech.com", RR_HTTPS));
     }
 
     #[test]
     fn rejects_a_reply_for_a_different_name() {
         let msg = reply(0x1234, "attacker.example", RR_HTTPS, true, 1);
-        assert!(!response_matches(
-            &msg,
-            0x1234,
-            "cloudflare-ech.com",
-            RR_HTTPS
-        ));
+        assert!(!response_matches(&msg, 0x1234, "cloudflare-ech.com", RR_HTTPS));
     }
 
     #[test]
     fn rejects_a_reply_for_a_different_record_type() {
         let msg = reply(0x1234, "cloudflare-ech.com", 1, true, 1);
-        assert!(!response_matches(
-            &msg,
-            0x1234,
-            "cloudflare-ech.com",
-            RR_HTTPS
-        ));
+        assert!(!response_matches(&msg, 0x1234, "cloudflare-ech.com", RR_HTTPS));
     }
 
     #[test]
     fn rejects_a_message_that_is_not_a_response() {
         let msg = reply(0x1234, "cloudflare-ech.com", RR_HTTPS, false, 1);
-        assert!(!response_matches(
-            &msg,
-            0x1234,
-            "cloudflare-ech.com",
-            RR_HTTPS
-        ));
+        assert!(!response_matches(&msg, 0x1234, "cloudflare-ech.com", RR_HTTPS));
     }
 
     #[test]
     fn rejects_a_reply_with_an_unexpected_question_count() {
         let msg = reply(0x1234, "cloudflare-ech.com", RR_HTTPS, true, 2);
-        assert!(!response_matches(
-            &msg,
-            0x1234,
-            "cloudflare-ech.com",
-            RR_HTTPS
-        ));
+        assert!(!response_matches(&msg, 0x1234, "cloudflare-ech.com", RR_HTTPS));
     }
 
     #[test]
@@ -319,11 +279,6 @@ mod tests {
     #[test]
     fn name_comparison_is_case_insensitive() {
         let msg = reply(0x1234, "CloudFlare-ECH.com", RR_HTTPS, true, 1);
-        assert!(response_matches(
-            &msg,
-            0x1234,
-            "cloudflare-ech.com",
-            RR_HTTPS
-        ));
+        assert!(response_matches(&msg, 0x1234, "cloudflare-ech.com", RR_HTTPS));
     }
 }

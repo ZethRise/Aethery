@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use octets::{Octets, OctetsMut};
 use quiche::h3;
-use rand::Rng;
+use rand::RngExt;
 
 use crate::consts;
 use crate::error::{AetherError, Result};
@@ -151,12 +151,19 @@ pub struct CapsuleParser {
     buf: Vec<u8>,
 }
 
+const MAX_CAPSULE_BUF: usize = 256 * 1024;
+
 impl CapsuleParser {
     pub fn new() -> Self {
         Self { buf: Vec::new() }
     }
 
     pub fn push(&mut self, data: &[u8]) {
+        if self.buf.len().saturating_add(data.len()) > MAX_CAPSULE_BUF {
+            log::warn!("capsule parser buffer exceeded {MAX_CAPSULE_BUF} bytes; resetting");
+            self.buf.clear();
+            return;
+        }
         self.buf.extend_from_slice(data);
     }
 
@@ -184,7 +191,7 @@ impl CapsuleParser {
             CAPSULE_ADDRESS_REQUEST => Capsule::AddressRequest,
             CAPSULE_ROUTE_ADVERTISEMENT => {
                 Capsule::RouteAdvertisement(parse_route_advertisement(&value)?)
-            }
+            },
             CAPSULE_DATAGRAM => Capsule::Datagram(value),
             other => Capsule::Unknown {
                 kind: other,
@@ -291,7 +298,7 @@ pub fn build_dns_probe_packet(src: Ipv4Addr) -> Vec<u8> {
     let csum = ipv4_header_checksum(&pkt[0..20]);
     pkt[10..12].copy_from_slice(&csum.to_be_bytes());
 
-    let sport: u16 = rand::thread_rng().gen_range(20000..60000);
+    let sport: u16 = rand::rng().random_range(20000..60000);
     pkt.extend_from_slice(&sport.to_be_bytes());
     pkt.extend_from_slice(&53u16.to_be_bytes());
     pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
@@ -386,9 +393,7 @@ mod tests {
     fn the_h3_path_still_carries_the_context_id() {
         let packet = ip_packet();
         let h3 = encode_ip_datagram(8, &packet).expect("h3 encoding");
-        let decoded = decode_ip_datagram(&h3, 8)
-            .expect("h3 decoding")
-            .expect("payload");
+        let decoded = decode_ip_datagram(&h3, 8).expect("h3 decoding").expect("payload");
         assert_eq!(decoded, packet);
     }
 }

@@ -37,6 +37,7 @@ object NativeCore {
 
     fun start(config: String, tunFd: Int): Int = nativeStart(config, tunFd)
     fun startProxy(config: String): Int = nativeStartProxy(config)
+    fun replaceTun(tunFd: Int) = nativeReplaceTun(tunFd)
     fun stop(): Int = nativeStop()
     fun isRunning(): Boolean = nativeIsRunning()
     fun isReady(): Boolean = nativeIsReady()
@@ -55,6 +56,7 @@ object NativeCore {
     @JvmStatic private external fun nativeConfirmEmailCode(code: String): Int
     @JvmStatic private external fun nativeStart(config: String, tunFd: Int): Int
     @JvmStatic private external fun nativeStartProxy(config: String): Int
+    @JvmStatic private external fun nativeReplaceTun(tunFd: Int)
     @JvmStatic private external fun nativeStop(): Int
     @JvmStatic private external fun nativeIsRunning(): Boolean
     @JvmStatic private external fun nativeIsReady(): Boolean

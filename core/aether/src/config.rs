@@ -54,9 +54,7 @@ impl From<&Identity> for PersistedIdentity {
 fn decode_fixed<const N: usize>(field: &str, value: &str) -> Result<[u8; N]> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(value)
-        .map_err(|e| {
-            AetherError::Other(format!("config field {field} is not valid base64: {e}"))
-        })?;
+        .map_err(|e| AetherError::Other(format!("config field {field} is not valid base64: {e}")))?;
 
     if decoded.len() != N {
         return Err(AetherError::Other(format!(
@@ -97,6 +95,7 @@ impl TryFrom<PersistedIdentity> for Identity {
             organization: p.organization,
             gateway_proxy: p.gateway_proxy,
             assigned_endpoint: p.assigned_endpoint,
+            refused: false,
         })
     }
 }
@@ -266,6 +265,7 @@ mod tests {
             organization: "example-team".to_string(),
             gateway_proxy: "172.16.0.1:2480".to_string(),
             assigned_endpoint: "162.159.197.2".to_string(),
+            refused: false,
         }
     }
 
@@ -276,9 +276,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         save(path_str, &sample()).expect("save should succeed");
-        let loaded = load(path_str)
-            .expect("load should succeed")
-            .expect("identity");
+        let loaded = load(path_str).expect("load should succeed").expect("identity");
 
         assert_eq!(loaded.device_id, "device-1");
         assert_eq!(loaded.access_token, "token-1");

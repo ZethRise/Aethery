@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[derive(Debug, Clone, Copy)]
@@ -59,7 +59,7 @@ impl FragmentConfig {
         if lo >= hi {
             hi
         } else {
-            rand::thread_rng().gen_range(lo..=hi)
+            rand::rng().random_range(lo..=hi)
         }
     }
 
@@ -70,17 +70,14 @@ impl FragmentConfig {
         let ms = if self.delay_max_ms <= self.delay_min_ms {
             self.delay_min_ms
         } else {
-            rand::thread_rng().gen_range(self.delay_min_ms..=self.delay_max_ms)
+            rand::rng().random_range(self.delay_min_ms..=self.delay_max_ms)
         };
         Duration::from_millis(ms)
     }
 }
 
 fn is_truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 fn parse_range(spec: &str, default: (u64, u64)) -> (u64, u64) {
@@ -104,6 +101,7 @@ fn parse_range(spec: &str, default: (u64, u64)) -> (u64, u64) {
         }
     }
 }
+
 
 pub struct FragmentingStream<S> {
     inner: S,

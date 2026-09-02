@@ -15,7 +15,8 @@ class SplitTunnelSettings(context: Context) {
         ?.let { runCatching { Mode.valueOf(it) }.getOrNull() }
         ?: Mode.ALL
 
-    fun packages(): Set<String> = preferences.getStringSet(PACKAGES, emptySet()).orEmpty()
+    fun packages(): Set<String> =
+        preferences.getStringSet(PACKAGES, emptySet()).orEmpty().toHashSet()
 
     fun save(mode: Mode, packages: Set<String>) {
         preferences.edit()

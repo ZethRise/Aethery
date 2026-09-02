@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use quiche::h3;
 use quiche::h3::NameValue;
-use rand::RngCore;
+use rand::Rng;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
@@ -21,22 +21,16 @@ fn net_queue() -> usize {
 }
 
 async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
-    use socket2::{Domain, Socket, Type};
-    let domain = if bind_addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
+    use socket2::{Socket, Domain, Type};
+    let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let sock = Socket::new(domain, Type::DGRAM, None).map_err(AetherError::Io)?;
     sock.set_nonblocking(true).map_err(AetherError::Io)?;
-
+    
     let buf_size = crate::sysprofile::udp_socket_buf_bytes();
     let _ = sock.set_recv_buffer_size(buf_size);
     let _ = sock.set_send_buffer_size(buf_size);
-
+    
     sock.bind(&bind_addr.into()).map_err(AetherError::Io)?;
-    // VPN/TUN mode routes 0.0.0.0/0 into the tunnel. Protect this socket so
-    // MASQUE/QUIC handshakes leave on the real network instead of looping.
     crate::platform::protect_socket(&sock).map_err(AetherError::Io)?;
     UdpSocket::from_std(sock.into()).map_err(AetherError::Io)
 }
@@ -63,7 +57,6 @@ pub struct TunnelConfig {
     pub key_pem: Vec<u8>,
     pub ech_config_list: Option<Vec<u8>>,
     pub noize: NoizeConfig,
-    pub tls_curve_preset: crate::TlsCurvePreset,
     pub local_ipv4: Ipv4Addr,
     pub quiet: bool,
 }
@@ -77,12 +70,8 @@ fn validation_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-fn data_check_enabled_for(value: Option<&str>) -> bool {
-    matches!(value, Some("1") | Some("true") | Some("yes") | Some("on"))
-}
-
 fn data_check_enabled() -> bool {
-    data_check_enabled_for(std::env::var("AETHER_MASQUE_DATA_CHECK").ok().as_deref())
+    std::env::var("AETHER_MASQUE_NO_DATA_CHECK").is_err()
 }
 
 const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 2;
@@ -142,7 +131,7 @@ fn bind_addr_for(peer: &SocketAddr) -> SocketAddr {
 
 fn random_scid() -> [u8; 16] {
     let mut scid = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut scid);
+    rand::rng().fill_bytes(&mut scid);
     scid
 }
 
@@ -165,21 +154,18 @@ impl Drop for ReaderGuard {
     }
 }
 
-fn spawn_reader(
-    sock: Arc<UdpSocket>,
-    local: SocketAddr,
-    tx: mpsc::Sender<NetPacket>,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPacket>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
             match sock.recv_from(&mut buf).await {
-                Ok((n, from)) => {
+                Ok((n, observed)) => {
+                    let from = crate::upstream::real_source(local, observed);
                     log::trace!("recv {n} bytes from {from}");
                     if tx.send((local, from, buf[..n].to_vec())).await.is_err() {
                         break;
                     }
-                }
+                },
                 Err(e) => {
                     log::debug!("recv error: {e}");
                     break;
@@ -201,10 +187,13 @@ pub async fn run(
     let probe_packet = masque::build_dns_probe_packet(cfg.local_ipv4);
     let mut ready_tx = ready_tx;
     let mut ready_fired = false;
+    let mut connect_ip_ok = false;
     let mut validate_deadline: Option<Instant> = None;
     let mut validate_successes: u32 = 0;
+    let mut last_peer_rx = Instant::now();
 
     let init_sock = bind_udp_fast(bind_addr_for(&peer)).await?;
+    crate::upstream::attach_detour(&init_sock, peer).await?;
     let local = init_sock.local_addr()?;
     let init_sock = Arc::new(init_sock);
 
@@ -218,9 +207,8 @@ pub async fn run(
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &cfg.cert_pem,
         key_pem: &cfg.key_pem,
-        curve_preset: cfg.tls_curve_preset,
-        pin_endpoint: false,
-        expected_pins: &[],
+        pin_endpoint: true,
+        expected_pins: consts::MASQUE_PINS,
     })?;
 
     let mut current_ech = cfg.ech_config_list.clone();
@@ -277,9 +265,16 @@ pub async fn run(
 
         tokio::select! {
             biased;
-
+            
             _ = keepalive_interval.tick() => {
                 if conn.is_established() {
+                    if last_peer_rx.elapsed() > Duration::from_secs(45) {
+                        log::warn!("[-] masque keepalive timed out; no packets from {peer} for 45s");
+                        let _ = conn.close(true, 0x00, b"keepalive-timeout");
+                        return Err(AetherError::Masque(
+                            "keepalive timeout (no packets from the edge)".into(),
+                        ));
+                    }
                     if let Err(e) = conn.send_ack_eliciting() {
                         log::debug!("keepalive ping failed: {e}");
                     }
@@ -300,6 +295,7 @@ pub async fn run(
             }
 
             Some((to_local, from, mut data)) = net_rx.recv() => {
+                last_peer_rx = Instant::now();
                 let mut hdr_buf = data.clone();
                 if let Ok(hdr) = quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN) {
                     log::trace!("recv {} bytes type={:?} version=0x{:x} from {}", data.len(), hdr.ty, hdr.version, from);
@@ -356,13 +352,10 @@ pub async fn run(
 
         if conn.is_established() && h3_conn.is_none() {
             established_ever = true;
-            log_or_debug(
-                quiet,
-                format!(
-                    "quic handshake established; alpn={}",
-                    String::from_utf8_lossy(conn.application_proto())
-                ),
-            );
+            log_or_debug(quiet, format!(
+                "quic handshake established; alpn={}",
+                String::from_utf8_lossy(conn.application_proto())
+            ));
             let mut h3c = h3::Connection::with_transport(&mut conn, &h3_config)?;
             let headers = masque::connect_ip_request(&cfg.authority, &cfg.path);
             let sid = h3c.send_request(&mut conn, &headers, false)?;
@@ -372,33 +365,40 @@ pub async fn run(
 
             if data_check {
                 validate_deadline = Some(Instant::now() + validation_timeout());
-                log_or_debug(
-                    quiet,
-                    "[*] validating masque data-plane before exposing socks5".to_string(),
-                );
+                log_or_debug(quiet, "[*] validating masque data-plane before exposing socks5".to_string());
             }
         }
 
-        let mut connect_ip_ok = false;
         if let (Some(h3c), Some(sid)) = (h3_conn.as_mut(), req_stream) {
-            connect_ip_ok = poll_h3(&mut conn, h3c, sid, &mut capsules, &addr_tx, quiet)?;
-        }
-        if connect_ip_ok && !data_check && !ready_fired {
-            ready_fired = true;
-            crate::ffi::mark_ready();
-            if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(());
+            if let Some(status) = poll_h3(&mut conn, h3c, sid, &mut capsules, &addr_tx, quiet)? {
+                if !(200..300).contains(&status) {
+                    return Err(AetherError::Masque(format!(
+                        "connect-ip rejected with status {status}"
+                    )));
+                }
+                connect_ip_ok = true;
+                if !data_check && !ready_fired {
+                    ready_fired = true;
+                    crate::ffi::mark_ready();
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    log_or_debug(quiet, "[+] connect-ip 2xx; exposing local front".to_string());
+                }
             }
         }
 
-        let got_data = drain_datagrams(&mut conn, req_stream, &internals.inbound_tx, &mut out_buf);
+        let got_data =
+            drain_datagrams(&mut conn, req_stream, &internals.inbound_tx, &mut out_buf);
+        if got_data {
+            last_peer_rx = Instant::now();
+        }
 
-        if got_data && !ready_fired {
+        if got_data && connect_ip_ok && !ready_fired {
             validate_successes += 1;
             log::debug!(
                 "[*] masque data-plane round-trip {}/{} confirmed",
-                validate_successes,
-                DATA_PROBE_REQUIRED_SUCCESSES
+                validate_successes, DATA_PROBE_REQUIRED_SUCCESSES
             );
             if validate_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
                 ready_fired = true;
@@ -407,11 +407,7 @@ pub async fn run(
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(());
                 }
-                log_or_debug(
-                    quiet,
-                    "[+] masque tunnel validated (end-to-end data confirmed); exposing socks5"
-                        .to_string(),
-                );
+                log_or_debug(quiet, "[+] masque tunnel validated (end-to-end data confirmed); exposing socks5".to_string());
             }
         }
 
@@ -444,26 +440,20 @@ pub async fn run(
 
             log_or_debug(quiet, format!("connection closed: {:?}", conn.stats()));
             if let Some(e) = conn.peer_error() {
-                log_or_debug(
-                    quiet,
-                    format!(
-                        "peer closed: code=0x{:x} app={} reason={}",
-                        e.error_code,
-                        e.is_app,
-                        String::from_utf8_lossy(&e.reason)
-                    ),
-                );
+                log_or_debug(quiet, format!(
+                    "peer closed: code=0x{:x} app={} reason={}",
+                    e.error_code,
+                    e.is_app,
+                    String::from_utf8_lossy(&e.reason)
+                ));
             }
             if let Some(e) = conn.local_error() {
-                log_or_debug(
-                    quiet,
-                    format!(
-                        "local closed: code=0x{:x} app={} reason={}",
-                        e.error_code,
-                        e.is_app,
-                        String::from_utf8_lossy(&e.reason)
-                    ),
-                );
+                log_or_debug(quiet, format!(
+                    "local closed: code=0x{:x} app={} reason={}",
+                    e.error_code,
+                    e.is_app,
+                    String::from_utf8_lossy(&e.reason)
+                ));
             }
             return Ok(());
         }
@@ -492,29 +482,19 @@ fn poll_h3(
     capsules: &mut CapsuleParser,
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
     quiet: bool,
-) -> Result<bool> {
+) -> Result<Option<u16>> {
     let mut body = vec![0u8; 65535];
-    let mut connect_ip_ok = false;
+    let mut status = None;
 
     loop {
         match h3c.poll(conn) {
-            Ok((stream_id, h3::Event::Headers { list, .. })) => {
-                if stream_id != req_stream {
-                    continue;
-                }
+            Ok((_stream_id, h3::Event::Headers { list, .. })) => {
                 for h in &list {
                     if h.name() == b":status" {
-                        log_or_debug(
-                            quiet,
-                            format!("connect-ip status: {}", String::from_utf8_lossy(h.value())),
-                        );
-                        if h.value() == b"200" {
-                            connect_ip_ok = true;
-                        } else {
-                            return Err(AetherError::Other(format!(
-                                "connect-ip status {}",
-                                String::from_utf8_lossy(h.value())
-                            )));
+                        let raw = String::from_utf8_lossy(h.value());
+                        log_or_debug(quiet, format!("connect-ip status: {raw}"));
+                        if let Ok(code) = raw.trim().parse::<u16>() {
+                            status = Some(code);
                         }
                     }
                 }
@@ -542,7 +522,7 @@ fn poll_h3(
         }
     }
 
-    Ok(connect_ip_ok)
+    Ok(status)
 }
 
 fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<AssignedAddr>>) {
@@ -576,7 +556,9 @@ fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<As
 
 fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
     match version {
-        4 if bytes.len() == 4 => Some(IpAddr::V4([bytes[0], bytes[1], bytes[2], bytes[3]].into())),
+        4 if bytes.len() == 4 => {
+            Some(IpAddr::V4([bytes[0], bytes[1], bytes[2], bytes[3]].into()))
+        }
         6 if bytes.len() == 16 => {
             let mut b = [0u8; 16];
             b.copy_from_slice(bytes);
@@ -634,9 +616,11 @@ async fn flush(
         match conn.send(&mut out) {
             Ok((write, send_info)) => {
                 if let Some(sock) = sockets.get(&send_info.from) {
-                    sock.send_to(&out[..write], send_info.to).await?;
-                } else if let Some((_, sock)) = sockets.iter().next() {
-                    sock.send_to(&out[..write], send_info.to).await?;
+                    let to = crate::upstream::relay_target(send_info.from, send_info.to);
+                    sock.send_to(&out[..write], to).await?;
+                } else if let Some((local, sock)) = sockets.iter().next() {
+                    let to = crate::upstream::relay_target(*local, send_info.to);
+                    sock.send_to(&out[..write], to).await?;
                 }
             }
             Err(quiche::Error::Done) => break,
@@ -659,6 +643,7 @@ async fn do_migrate(
     }
 
     let new_sock = bind_udp_fast(bind_addr_for(&peer)).await?;
+    crate::upstream::attach_detour(&new_sock, peer).await?;
     let new_local = new_sock.local_addr()?;
     let new_sock = Arc::new(new_sock);
 
@@ -694,27 +679,22 @@ pub struct VerifyParams {
     pub key_pem: Vec<u8>,
     pub ech_config_list: Option<Vec<u8>>,
     pub noize: NoizeConfig,
-    pub tls_curve_preset: crate::TlsCurvePreset,
     pub timeout: Duration,
     pub local_ipv4: Ipv4Addr,
 }
 
 pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
-    let bind: SocketAddr = if p.peer.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
+    let bind: SocketAddr = if p.peer.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
     let sock = bind_udp_fast(bind).await?;
-    sock.connect(p.peer).await?;
+    crate::upstream::attach_detour(&sock, p.peer).await?;
     let local = sock.local_addr()?;
+    sock.connect(crate::upstream::relay_target(local, p.peer)).await?;
 
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &p.cert_pem,
         key_pem: &p.key_pem,
-        curve_preset: p.tls_curve_preset,
-        pin_endpoint: false,
-        expected_pins: &[],
+        pin_endpoint: true,
+        expected_pins: consts::MASQUE_PINS,
     })?;
 
     let scid_bytes = random_scid();
@@ -859,9 +839,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         flush_connected(&mut conn, &sock).await?;
 
         if conn.is_closed() {
-            return Err(AetherError::Other(
-                "closed before data-plane confirmation".into(),
-            ));
+            return Err(AetherError::Other("closed before data-plane confirmation".into()));
         }
     }
 }
@@ -882,15 +860,4 @@ async fn flush_connected(conn: &mut quiche::Connection, sock: &UdpSocket) -> Res
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::data_check_enabled_for;
-
-    #[test]
-    fn h3_data_validation_is_opt_in() {
-        assert!(!data_check_enabled_for(None));
-        assert!(data_check_enabled_for(Some("true")));
-    }
 }

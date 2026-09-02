@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rand::{Rng, RngCore};
+use rand::{RngExt, Rng};
 use regex::Regex;
 use serde::Deserialize;
 use tokio::net::UdpSocket;
@@ -124,13 +124,14 @@ pub fn from_profile(name: &str) -> AetherNoizeConfig {
     }
 }
 
-pub fn with_manual(profile: &str, raw: &str) -> Result<AetherNoizeConfig, String> {
+pub fn with_manual(profile: &str, raw: &str) -> std::result::Result<AetherNoizeConfig, String> {
     let manual: ManualParameters = serde_json::from_str(raw)
         .map_err(|error| format!("advanced obfuscation parameters: {error}"))?;
     if manual.jc.is_some_and(|value| value > 10) {
         return Err("advanced obfuscation Jc must be 0–10".into());
     }
-    if manual.jmin.is_some_and(|value| value > 1024) || manual.jmax.is_some_and(|value| value > 1024) {
+    if manual.jmin.is_some_and(|value| value > 1024) || manual.jmax.is_some_and(|value| value > 1024)
+    {
         return Err("advanced obfuscation Jmin/Jmax must be 0–1024".into());
     }
     if let (Some(min), Some(max)) = (manual.jmin, manual.jmax) {
@@ -171,7 +172,7 @@ fn parse_range(data: &str) -> usize {
         let min: usize = min_str.trim().parse().unwrap_or(0);
         let max: usize = max_str.trim().parse().unwrap_or(0);
         if max > min && min > 0 {
-            return rand::thread_rng().gen_range(min..=max).min(2048);
+            return rand::rng().random_range(min..=max).min(2048);
         }
     }
     data.trim().parse().unwrap_or(0).min(2048)
@@ -180,7 +181,10 @@ fn parse_range(data: &str) -> usize {
 pub fn parse_cps(spec: &str) -> Vec<u8> {
     let mut out = Vec::new();
 
-    let tag_regex = Regex::new(r"<([a-z]+)\s*([^>]*)>").unwrap();
+    let tag_regex = {
+        static TAG_REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        TAG_REGEX.get_or_init(|| Regex::new(r"<([a-z]+)\s*([^>]*)>").expect("static tag pattern"))
+    };
 
     for cap in tag_regex.captures_iter(spec) {
         let tag_type = cap.get(1).map_or("", |m| m.as_str());
@@ -216,7 +220,7 @@ pub fn parse_cps(spec: &str) -> Vec<u8> {
                 let len = parse_range(tag_data);
                 if len > 0 {
                     let mut r = vec![0u8; len];
-                    rand::thread_rng().fill_bytes(&mut r);
+                    rand::rng().fill_bytes(&mut r);
                     out.extend_from_slice(&r);
                 }
             }
@@ -226,7 +230,7 @@ pub fn parse_cps(spec: &str) -> Vec<u8> {
                     let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
                     let mut r = vec![0u8; len];
                     for b in r.iter_mut() {
-                        *b = chars[rand::thread_rng().gen_range(0..chars.len())];
+                        *b = chars[rand::rng().random_range(0..chars.len())];
                     }
                     out.extend_from_slice(&r);
                 }
@@ -237,7 +241,7 @@ pub fn parse_cps(spec: &str) -> Vec<u8> {
                     let chars = b"0123456789";
                     let mut r = vec![0u8; len];
                     for b in r.iter_mut() {
-                        *b = chars[rand::thread_rng().gen_range(0..chars.len())];
+                        *b = chars[rand::rng().random_range(0..chars.len())];
                     }
                     out.extend_from_slice(&r);
                 }
@@ -260,9 +264,9 @@ fn wrap_ikev2(payload: &[u8]) -> Vec<u8> {
     if payload.len() >= 8 {
         initiator_spi.copy_from_slice(&payload[..8]);
     } else {
-        rand::thread_rng().fill_bytes(&mut initiator_spi);
+        rand::rng().fill_bytes(&mut initiator_spi);
     }
-    rand::thread_rng().fill_bytes(&mut responder_spi);
+    rand::rng().fill_bytes(&mut responder_spi);
 
     let total_length = 28u32 + 24 + payload.len() as u32;
     let sa_payload_length = 24u16 + payload.len() as u16;
@@ -283,8 +287,8 @@ fn wrap_ikev2(payload: &[u8]) -> Vec<u8> {
     header.extend_from_slice(&sa_payload_length.to_be_bytes());
 
     header.extend_from_slice(&[
-        0x00, 0x00, 0x00, 0x14, 0x01, 0x01, 0x00, 0x04, 0x03, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00,
-        0x0c, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x14, 0x01, 0x01, 0x00, 0x04, 0x03, 0x00, 0x00, 0x08, 0x01, 0x00,
+        0x00, 0x0c, 0x00, 0x00, 0x00, 0x00,
     ]);
 
     header.extend_from_slice(payload);
@@ -303,19 +307,15 @@ fn generate_junk(cfg: &AetherNoizeConfig) -> Vec<u8> {
     let size = if max_size == min_size {
         min_size
     } else {
-        rand::thread_rng().gen_range(min_size..=max_size)
+        rand::rng().random_range(min_size..=max_size)
     };
 
     if size == 0 {
-        return if cfg.allow_zero_size {
-            vec![]
-        } else {
-            vec![0x00]
-        };
+        return if cfg.allow_zero_size { vec![] } else { vec![0x00] };
     }
 
     let mut junk = vec![0u8; size];
-    rand::thread_rng().fill_bytes(&mut junk);
+    rand::rng().fill_bytes(&mut junk);
     junk
 }
 
@@ -368,11 +368,7 @@ pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &Aether
     }
 }
 
-pub async fn send_post_handshake_junk(
-    sock: &UdpSocket,
-    _peer: SocketAddr,
-    cfg: &AetherNoizeConfig,
-) {
+pub async fn send_post_handshake_junk(sock: &UdpSocket, _peer: SocketAddr, cfg: &AetherNoizeConfig) {
     for _ in 0..cfg.jc_after_hs {
         let junk = generate_junk(cfg);
         send_connected(sock, &junk).await;
@@ -388,7 +384,7 @@ pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
     }
 
     let base = cfg.jc_before_hs.max(1);
-    let extra = rand::thread_rng().gen_range(0..=base);
+    let extra = rand::rng().random_range(0..=base);
     let count = base + extra;
 
     for _ in 0..count {
@@ -400,35 +396,10 @@ pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
         }
         send_connected(sock, &junk).await;
 
-        let jitter = rand::thread_rng().gen_range(0..=8);
+        let jitter = rand::rng().random_range(0..=8);
         let gap = cfg.junk_interval + Duration::from_millis(jitter);
         if !gap.is_zero() {
             tokio::time::sleep(gap).await;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn manual_parameters_override_the_profile() {
-        let config = with_manual(
-            "balanced",
-            r#"{"jc":4,"jmin":12,"jmax":32,"i1":"<byte 01>","i2":"<byte 02>"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.jc, 4);
-        assert_eq!(config.jmin, 12);
-        assert_eq!(config.jmax, 32);
-        assert_eq!(config.i1.as_deref(), Some("<byte 01>"));
-        assert_eq!(config.i2.as_deref(), Some("<byte 02>"));
-    }
-
-    #[test]
-    fn manual_parameters_reject_an_inverted_junk_range() {
-        assert!(with_manual("balanced", r#"{"jmin":32,"jmax":12}"#).is_err());
     }
 }

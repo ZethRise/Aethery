@@ -26,12 +26,10 @@ extern "C" {
 }
 
 const CHROME_GROUPS: &str = "P-256:X25519:P-384";
-const COMPATIBILITY_GROUPS: &str = "X25519:P-256:P-384";
 
 pub struct TlsParams<'a> {
     pub cert_pem: &'a [u8],
     pub key_pem: &'a [u8],
-    pub curve_preset: crate::TlsCurvePreset,
     pub pin_endpoint: bool,
     /// SHA-256 SPKI hashes of expected server certificates for pin-based verification.
     /// When non-empty and `pin_endpoint` is true, the server cert's SPKI hash is checked
@@ -125,8 +123,8 @@ fn announce_once(message: String) {
 }
 
 pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
-    let mut builder =
-        SslContextBuilder::new(SslMethod::tls()).map_err(|e| AetherError::Tls(e.to_string()))?;
+    let mut builder = SslContextBuilder::new(SslMethod::tls())
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
 
     builder
         .set_min_proto_version(Some(SslVersion::TLS1_3))
@@ -136,16 +134,8 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
     builder.set_grease_enabled(true);
-    let default_groups = match params.curve_preset {
-        crate::TlsCurvePreset::Chrome => CHROME_GROUPS,
-        crate::TlsCurvePreset::Compatibility => COMPATIBILITY_GROUPS,
-    };
     let groups = std::env::var("AETHER_TLS_GROUPS").ok();
-    let groups = groups
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(default_groups);
+    let groups = groups.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(CHROME_GROUPS);
     builder
         .set_curves_list(groups)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
@@ -158,8 +148,8 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
     let cert = X509::from_pem(params.cert_pem).map_err(|e| AetherError::Tls(e.to_string()))?;
-    let key =
-        PKey::private_key_from_pem(params.key_pem).map_err(|e| AetherError::Tls(e.to_string()))?;
+    let key = PKey::private_key_from_pem(params.key_pem)
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
     builder
         .set_certificate(&cert)
         .map_err(|e| AetherError::Tls(e.to_string()))?;

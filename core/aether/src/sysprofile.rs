@@ -135,13 +135,19 @@ fn detect_tier(cpus: usize, mem_mb: Option<u64>) -> Tier {
     let mem_low = mem_mb.map(|m| m <= 384).unwrap_or(false);
     let mem_medium = mem_mb.map(|m| m <= 1536).unwrap_or(false);
 
-    if cpus <= 2 || mem_low {
+    let tier = if cpus <= 2 || mem_low {
         Tier::Low
     } else if cpus <= 4 || mem_medium {
         Tier::Medium
     } else {
         Tier::High
+    };
+    // Phones advertise many cores; Auto stays Medium unless the user picks High.
+    #[cfg(target_os = "android")]
+    if matches!(tier, Tier::High) {
+        return Tier::Medium;
     }
+    tier
 }
 
 fn build_tuning() -> Tuning {
@@ -149,23 +155,12 @@ fn build_tuning() -> Tuning {
     let mem_mb = total_mem_mb();
     let tier = detect_tier(cpus, mem_mb);
 
-    let (
-        scan_concurrency_cap,
-        udp_socket_buf,
-        netstack_tcp_buf,
-        netstack_udp_buf,
-        channel_capacity,
-    ) = match tier {
-        Tier::Low => (4usize, 256 * 1024, 128 * 1024, 32 * 1024, 128usize),
-        Tier::Medium => (10usize, 2 * 1024 * 1024, 256 * 1024, 64 * 1024, 512usize),
-        Tier::High => (
-            usize::MAX,
-            7 * 1024 * 1024,
-            512 * 1024,
-            128 * 1024,
-            1024usize,
-        ),
-    };
+    let (scan_concurrency_cap, udp_socket_buf, netstack_tcp_buf, netstack_udp_buf, channel_capacity) =
+        match tier {
+            Tier::Low => (4usize, 256 * 1024, 128 * 1024, 32 * 1024, 128usize),
+            Tier::Medium => (10usize, 2 * 1024 * 1024, 256 * 1024, 64 * 1024, 512usize),
+            Tier::High => (usize::MAX, 7 * 1024 * 1024, 512 * 1024, 128 * 1024, 1024usize),
+        };
 
     Tuning {
         tier,

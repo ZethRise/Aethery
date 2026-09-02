@@ -2,7 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use boring::ssl::{SslConnector, SslMethod, SslVersion};
-use rand::Rng;
+use rand::RngExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -135,7 +135,7 @@ pub struct ApiResponse {
 }
 
 pub fn random_edge_address() -> SocketAddr {
-    let host = rand::thread_rng().gen_range(1..=254u8);
+    let host = rand::rng().random_range(1..=254u8);
     let ip = Ipv4Addr::new(EDGE_PREFIX[0], EDGE_PREFIX[1], EDGE_PREFIX[2], host);
     SocketAddr::new(IpAddr::V4(ip), 443)
 }
@@ -151,10 +151,7 @@ async fn candidates(host: &str) -> Vec<SocketAddr> {
     }
 
     if let Ok(resolved) = tokio::net::lookup_host((host, 443)).await {
-        for address in resolved
-            .filter(|entry| entry.is_ipv4())
-            .take(RESOLVED_SAMPLES)
-        {
+        for address in resolved.filter(|entry| entry.is_ipv4()).take(RESOLVED_SAMPLES) {
             if !list.contains(&address) {
                 list.push(address);
             }
@@ -227,11 +224,7 @@ fn dechunk(body: &str) -> String {
             Some(offset) => cursor + offset,
             None => break,
         };
-        let token = body[cursor..line_end]
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let token = body[cursor..line_end].split(';').next().unwrap_or("").trim();
         let size = match usize::from_str_radix(token, 16) {
             Ok(0) | Err(_) => break,
             Ok(value) => value,
@@ -253,10 +246,16 @@ async fn exchange(
     address: SocketAddr,
     fingerprint: Fingerprint,
 ) -> Result<ApiResponse> {
-    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
-        .await
-        .map_err(|_| AetherError::Api(format!("connect to {address} timed out")))?
-        .map_err(|e| AetherError::Api(format!("connect to {address}: {e}")))?;
+    let tcp = match crate::upstream::configured() {
+        Some(proxy) => tokio::time::timeout(CONNECT_TIMEOUT, proxy.connect(address))
+            .await
+            .map_err(|_| AetherError::Api(format!("connect to {address} timed out")))?
+            .map_err(|e| AetherError::Api(format!("connect to {address} through the proxy: {e}")))?,
+        None => tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
+            .await
+            .map_err(|_| AetherError::Api(format!("connect to {address} timed out")))?
+            .map_err(|e| AetherError::Api(format!("connect to {address}: {e}")))?,
+    };
     tcp.set_nodelay(true).ok();
 
     let config = fingerprint.configure()?;
@@ -349,7 +348,8 @@ pub async fn fetch(request: &ApiRequest) -> Result<ApiResponse> {
         return Ok(response);
     }
 
-    Err(failure.unwrap_or_else(|| AetherError::Api("every camouflaged route failed".into())))
+    Err(failure
+        .unwrap_or_else(|| AetherError::Api("every camouflaged route failed".into())))
 }
 
 #[cfg(test)]

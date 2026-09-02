@@ -223,6 +223,18 @@ impl RuleSet {
         self.block.is_empty() && self.direct.is_empty()
     }
 
+    pub fn has_domain_rules(&self) -> bool {
+        self.block.iter().chain(self.direct.iter()).any(|rule| {
+            matches!(
+                rule,
+                Matcher::DomainSuffix(_)
+                    | Matcher::DomainFull(_)
+                    | Matcher::DomainKeyword(_)
+                    | Matcher::DomainRegex(_)
+            )
+        })
+    }
+
     pub fn decide(&self, host: Host<'_>, port: u16) -> Action {
         if self.block.iter().any(|rule| rule.matches(host, port)) {
             return Action::Block;
@@ -318,20 +330,14 @@ mod tests {
             set.decide(Host::Domain("notads.example"), 443),
             Action::Proxy
         );
-        assert_eq!(
-            set.decide(Host::Domain("ads.example.org"), 443),
-            Action::Proxy
-        );
+        assert_eq!(set.decide(Host::Domain("ads.example.org"), 443), Action::Proxy);
     }
 
     #[test]
     fn a_full_rule_matches_only_the_exact_name() {
         let set = rules("full:example.com", "");
         assert_eq!(set.decide(Host::Domain("example.com"), 443), Action::Block);
-        assert_eq!(
-            set.decide(Host::Domain("www.example.com"), 443),
-            Action::Proxy
-        );
+        assert_eq!(set.decide(Host::Domain("www.example.com"), 443), Action::Proxy);
     }
 
     #[test]
@@ -347,14 +353,8 @@ mod tests {
     #[test]
     fn a_regex_rule_is_honoured() {
         let set = rules(r"regexp:^ad[0-9]+\.", "");
-        assert_eq!(
-            set.decide(Host::Domain("ad42.example.com"), 443),
-            Action::Block
-        );
-        assert_eq!(
-            set.decide(Host::Domain("ads.example.com"), 443),
-            Action::Proxy
-        );
+        assert_eq!(set.decide(Host::Domain("ad42.example.com"), 443), Action::Block);
+        assert_eq!(set.decide(Host::Domain("ads.example.com"), 443), Action::Proxy);
     }
 
     #[test]
@@ -387,23 +387,14 @@ mod tests {
     fn a_port_rule_can_carve_out_a_range() {
         let set = rules("port:25", "port:3000-3010");
         assert_eq!(set.decide(Host::Domain("mail.example"), 25), Action::Block);
-        assert_eq!(
-            set.decide(Host::Domain("dev.example"), 3005),
-            Action::Direct
-        );
+        assert_eq!(set.decide(Host::Domain("dev.example"), 3005), Action::Direct);
         assert_eq!(set.decide(Host::Domain("dev.example"), 3011), Action::Proxy);
     }
 
     #[test]
     fn the_private_keyword_covers_lan_and_loopback_and_cgnat() {
         let set = rules("", "private");
-        for address in [
-            "10.1.1.1",
-            "192.168.1.5",
-            "172.16.9.9",
-            "127.0.0.1",
-            "100.96.0.2",
-        ] {
+        for address in ["10.1.1.1", "192.168.1.5", "172.16.9.9", "127.0.0.1", "100.96.0.2"] {
             assert_eq!(
                 set.decide(Host::Ip(address.parse().unwrap()), 80),
                 Action::Direct,
@@ -426,6 +417,16 @@ mod tests {
     }
 
     #[test]
+    fn domain_rules_are_reported_so_a_tunnel_can_recover_the_name() {
+        assert!(!rules("", "").has_domain_rules());
+        assert!(!rules("10.0.0.0/8, port:25", "private").has_domain_rules());
+        assert!(rules("ads.example", "").has_domain_rules());
+        assert!(rules("", "keyword:internal").has_domain_rules());
+        assert!(rules("", r"regexp:^ad[0-9]+\.").has_domain_rules());
+        assert!(rules("full:example.com", "").has_domain_rules());
+    }
+
+    #[test]
     fn block_wins_over_direct_when_both_match() {
         let set = rules("example.com", "example.com");
         assert_eq!(set.decide(Host::Domain("example.com"), 443), Action::Block);
@@ -443,17 +444,13 @@ mod tests {
     #[test]
     fn a_leading_wildcard_is_tolerated() {
         let set = rules("*.example.com", "");
-        assert_eq!(
-            set.decide(Host::Domain("a.example.com"), 443),
-            Action::Block
-        );
+        assert_eq!(set.decide(Host::Domain("a.example.com"), 443), Action::Block);
         assert_eq!(set.decide(Host::Domain("example.com"), 443), Action::Block);
     }
 
     #[test]
     fn a_rules_file_is_split_into_its_two_sections() {
-        let text =
-            "# routing\n[block]\nads.example\nkeyword:tracker\n\n[direct]\nprivate\n10.0.0.0/8\n";
+        let text = "# routing\n[block]\nads.example\nkeyword:tracker\n\n[direct]\nprivate\n10.0.0.0/8\n";
         let (block, direct) = split_sections(text);
         assert!(block.contains("ads.example"));
         assert!(block.contains("keyword:tracker"));

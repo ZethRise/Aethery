@@ -1,5 +1,6 @@
 #include <jni.h>
 
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -10,6 +11,7 @@ int aether_zt_confirm_email_code(const char* code);
 const char* aether_last_result();
 int aether_start_json(const char* json);
 int aether_start_json_with_tun(const char* json, int tun_fd);
+void aether_replace_tun_fd(int tun_fd);
 int aether_stop();
 int aether_is_running();
 int aether_is_ready();
@@ -35,6 +37,22 @@ std::string copy_jstring(JNIEnv* env, jstring value) {
     return result;
 }
 
+jstring utf8_to_jstring(JNIEnv* env, const char* utf8) {
+    if (utf8 == nullptr) return env->NewStringUTF("");
+    const jsize length = static_cast<jsize>(std::strlen(utf8));
+    jbyteArray bytes = env->NewByteArray(length);
+    if (bytes == nullptr) return env->NewStringUTF("");
+    env->SetByteArrayRegion(bytes, 0, length, reinterpret_cast<const jbyte*>(utf8));
+    jclass string_class = env->FindClass("java/lang/String");
+    jmethodID ctor = env->GetMethodID(string_class, "<init>", "([BLjava/lang/String;)V");
+    jstring charset = env->NewStringUTF("UTF-8");
+    jstring result = static_cast<jstring>(env->NewObject(string_class, ctor, bytes, charset));
+    env->DeleteLocalRef(bytes);
+    env->DeleteLocalRef(charset);
+    env->DeleteLocalRef(string_class);
+    return result == nullptr ? env->NewStringUTF("") : result;
+}
+
 void on_event(const char* json) {
     JNIEnv* env = nullptr;
     bool attached = false;
@@ -44,13 +62,20 @@ void on_event(const char* json) {
         attached = true;
     }
 
+    jobject service = nullptr;
+    jmethodID on_event_method = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_service_mutex);
         if (g_service != nullptr && g_on_event != nullptr) {
-            jstring jjson = env->NewStringUTF(json);
-            env->CallVoidMethod(g_service, g_on_event, jjson);
-            env->DeleteLocalRef(jjson);
+            service = env->NewLocalRef(g_service);
+            on_event_method = g_on_event;
         }
+    }
+    if (service != nullptr) {
+        jstring jjson = utf8_to_jstring(env, json);
+        env->CallVoidMethod(service, on_event_method, jjson);
+        env->DeleteLocalRef(jjson);
+        env->DeleteLocalRef(service);
     }
 
     if (env->ExceptionCheck()) {
@@ -69,9 +94,20 @@ int protect_socket(int fd) {
         attached = true;
     }
 
-    std::lock_guard<std::mutex> lock(g_service_mutex);
-    const auto protected_socket = g_service != nullptr && g_protect_socket != nullptr &&
-        env->CallBooleanMethod(g_service, g_protect_socket, fd);
+    jobject service = nullptr;
+    jmethodID protect_method = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_service_mutex);
+        if (g_service != nullptr && g_protect_socket != nullptr) {
+            service = env->NewLocalRef(g_service);
+            protect_method = g_protect_socket;
+        }
+    }
+    jboolean protected_socket = JNI_FALSE;
+    if (service != nullptr) {
+        protected_socket = env->CallBooleanMethod(service, protect_method, fd);
+        env->DeleteLocalRef(service);
+    }
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
         if (attached) g_vm->DetachCurrentThread();
@@ -82,7 +118,7 @@ int protect_socket(int fd) {
 }
 
 jstring last_string(JNIEnv* env, const char* value) {
-    return env->NewStringUTF(value == nullptr ? "" : value);
+    return utf8_to_jstring(env, value);
 }
 }  // namespace
 
@@ -128,6 +164,11 @@ Java_studio_cluvex_aethery_NativeCore_nativeStartProxy(JNIEnv* env, jobject, jst
     return aether_start_json(config_text.c_str());
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_studio_cluvex_aethery_NativeCore_nativeReplaceTun(JNIEnv*, jobject, jint tun_fd) {
+    aether_replace_tun_fd(tun_fd);
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_studio_cluvex_aethery_NativeCore_nativeStop(JNIEnv*, jobject) {
     return aether_stop();
@@ -163,6 +204,12 @@ Java_studio_cluvex_aethery_NativeCore_nativeAttach(JNIEnv* env, jobject, jobject
     g_protect_socket = env->GetMethodID(type, "protectSocket", "(I)Z");
     g_on_event = env->GetMethodID(type, "onEvent", "(Ljava/lang/String;)V");
     env->DeleteLocalRef(type);
+    if (env->ExceptionCheck() || g_protect_socket == nullptr || g_on_event == nullptr) {
+        env->ExceptionClear();
+        g_protect_socket = nullptr;
+        g_on_event = nullptr;
+        return;
+    }
     aether_set_socket_protector(protect_socket);
     aether_set_event_callback(on_event);
 }

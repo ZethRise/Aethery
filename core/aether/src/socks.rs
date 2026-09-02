@@ -1,5 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
+
+use base64::Engine;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -70,6 +72,10 @@ fn route_action(host: Host<'_>, port: u16) -> Action {
     ROUTES.read().unwrap().decide(host, port)
 }
 
+fn routes_have_domain_rules() -> bool {
+    ROUTES.read().unwrap().has_domain_rules()
+}
+
 fn host_of(target: &Target) -> Host<'_> {
     match target {
         Target::Domain(name) => Host::Domain(name.as_str()),
@@ -124,33 +130,119 @@ pub(crate) fn proxy_connect_succeeded(head: &[u8]) -> Option<bool> {
     Some((200..300).contains(&status))
 }
 
-pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
-    let listener = TcpListener::bind(listen).await?;
-    log::info!("socks5 listening on {listen}");
-    let bind_ip = listen.ip();
+pub(crate) fn warn_if_world_reachable(kind: &str, listen: SocketAddr) {
+    if listen.ip().is_loopback() {
+        return;
+    }
+    log::warn!(
+        "[!] the {kind} listener is bound to {listen}, which is reachable from outside this machine. \
+         It accepts every client without authentication, so anyone who can reach {listen} can send \
+         traffic through your tunnel. Bind it to 127.0.0.1 unless you intend to share it."
+    );
+}
 
-    loop {
-        let (sock, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                if let Some(delay) = accept_backoff(&error) {
-                    log::warn!(
-                        "socks5 accept failed: {error}; the listener stays open and retries"
-                    );
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-                log::error!("socks5 listener cannot continue: {error}");
-                return Err(error.into());
+pub fn extra_listen_addrs(listen: SocketAddr) -> Vec<SocketAddr> {
+    let mut addrs = vec![listen];
+    match listen.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => {
+            addrs.push(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), listen.port()));
+        }
+        IpAddr::V6(ip) if ip.is_loopback() => {
+            addrs.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port()));
+        }
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            addrs.push(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen.port()));
+        }
+        _ => {}
+    }
+    addrs
+}
+
+async fn bind_listeners(kind: &str, listen: SocketAddr) -> Result<Vec<TcpListener>> {
+    let mut listeners = Vec::new();
+    let mut errors = Vec::new();
+    for addr in extra_listen_addrs(listen) {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                log::info!("[+] {kind} listening on {addr}");
+                warn_if_world_reachable(kind, addr);
+                crate::ffi::record_log(format!("{kind} listening on {addr}"));
+                listeners.push(listener);
             }
-        };
+            Err(error) => {
+                log::warn!("[-] {kind} could not bind {addr}: {error}");
+                crate::ffi::record_log(format!("{kind} could not bind {addr}: {error}"));
+                errors.push(format!("{addr} ({error})"));
+            }
+        }
+    }
+    if listeners.is_empty() {
+        return Err(AetherError::Other(format!(
+            "{kind} failed to bind {listen}: {}",
+            errors.join("; ")
+        )));
+    }
+    Ok(listeners)
+}
 
-        let stack = stack.clone();
+fn spawn_acceptors(
+    listeners: Vec<TcpListener>,
+) -> mpsc::Receiver<std::io::Result<(tokio::net::TcpStream, SocketAddr)>> {
+    let (tx, rx) = mpsc::channel(32);
+    for listener in listeners {
+        let tx = tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(sock, stack, bind_ip).await {
-                log::debug!("socks client {peer} ended: {e}");
+            loop {
+                let result = listener.accept().await;
+                let retry = result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| accept_backoff(error));
+                if tx.send(result).await.is_err() {
+                    break;
+                }
+                if let Some(delay) = retry {
+                    tokio::time::sleep(delay).await;
+                }
             }
         });
+    }
+    rx
+}
+
+pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
+    let listeners = bind_listeners("SOCKS5", listen).await?;
+    let bind_ip = listen.ip();
+    let mut incoming = spawn_acceptors(listeners);
+    let mut clients = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accept = incoming.recv() => {
+                let (sock, peer) = match accept {
+                    Some(Ok(accepted)) => accepted,
+                    Some(Err(error)) => {
+                        if accept_backoff(&error).is_some() {
+                            log::warn!(
+                                "socks5 accept failed: {error}; the listener stays open and retries"
+                            );
+                            continue;
+                        }
+                        log::error!("socks5 listener cannot continue: {error}");
+                        return Err(error.into());
+                    }
+                    None => {
+                        return Err(AetherError::Other("socks5 listeners closed".into()));
+                    }
+                };
+                let stack = stack.clone();
+                clients.spawn(async move {
+                    if let Err(e) = handle_client(sock, stack, bind_ip).await {
+                        log::debug!("socks client {peer} ended: {e}");
+                    }
+                });
+            }
+            Some(_) = clients.join_next(), if !clients.is_empty() => {}
+        }
     }
 }
 
@@ -179,6 +271,7 @@ pub fn accept_backoff(error: &std::io::Error) -> Option<std::time::Duration> {
 }
 
 async fn handle_client(mut sock: TcpStream, stack: StackHandle, bind_ip: IpAddr) -> Result<()> {
+    let bind_ip = sock.local_addr().map(|addr| addr.ip()).unwrap_or(bind_ip);
     handshake(&mut sock).await?;
 
     let mut head = [0u8; 4];
@@ -193,13 +286,29 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle, bind_ip: IpAddr)
 
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
-        CMD_UDP_ASSOCIATE => handle_udp_associate(sock, stack, bind_ip, target, port).await,
+        CMD_UDP_ASSOCIATE => {
+            handle_udp_associate(sock, stack, bind_ip, target, port).await
+        }
         _ => {
             reply(&mut sock, REP_NOT_SUPPORTED).await?;
             Err(AetherError::Other("unsupported socks command".into()))
         }
     }
 }
+
+fn proxy_credentials() -> Option<(String, String)> {
+    let user = std::env::var("AETHER_PROXY_USER").ok()?.trim().to_string();
+    let pass = std::env::var("AETHER_PROXY_PASS").ok()?.trim().to_string();
+    if user.is_empty() || pass.is_empty() {
+        None
+    } else {
+        Some((user, pass))
+    }
+}
+
+const METHOD_NO_AUTH: u8 = 0x00;
+const METHOD_USER_PASS: u8 = 0x02;
+const METHOD_UNACCEPTABLE: u8 = 0xFF;
 
 async fn handshake(sock: &mut TcpStream) -> Result<()> {
     let mut prefix = [0u8; 2];
@@ -210,8 +319,42 @@ async fn handshake(sock: &mut TcpStream) -> Result<()> {
     let nmethods = prefix[1] as usize;
     let mut methods = vec![0u8; nmethods];
     sock.read_exact(&mut methods).await?;
-    sock.write_all(&[VER, 0x00]).await?;
+    if let Some((user, pass)) = proxy_credentials() {
+        if !methods.contains(&METHOD_USER_PASS) {
+            sock.write_all(&[VER, METHOD_UNACCEPTABLE]).await?;
+            return Err(AetherError::Other("socks client did not offer username/password".into()));
+        }
+        sock.write_all(&[VER, METHOD_USER_PASS]).await?;
+        socks_userpass(sock, &user, &pass).await?;
+        return Ok(());
+    }
+    if !methods.contains(&METHOD_NO_AUTH) {
+        sock.write_all(&[VER, METHOD_UNACCEPTABLE]).await?;
+        return Err(AetherError::Other("socks client did not offer no-auth".into()));
+    }
+    sock.write_all(&[VER, METHOD_NO_AUTH]).await?;
     Ok(())
+}
+
+async fn socks_userpass(sock: &mut TcpStream, user: &str, pass: &str) -> Result<()> {
+    let mut header = [0u8; 2];
+    sock.read_exact(&mut header).await?;
+    if header[0] != 0x01 {
+        return Err(AetherError::Other("bad socks auth version".into()));
+    }
+    let mut name = vec![0u8; header[1] as usize];
+    sock.read_exact(&mut name).await?;
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen).await?;
+    let mut secret = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut secret).await?;
+    let ok = name == user.as_bytes() && secret == pass.as_bytes();
+    sock.write_all(&[0x01, if ok { 0x00 } else { 0x01 }]).await?;
+    if ok {
+        Ok(())
+    } else {
+        Err(AetherError::Other("socks authentication failed".into()))
+    }
 }
 
 async fn read_target(sock: &mut TcpStream, atyp: u8) -> Result<(Target, u16)> {
@@ -323,7 +466,8 @@ async fn dns_exchange(
     let mut last = AetherError::Other("dns timeout".into());
 
     for server in resolver_addresses() {
-        let (query, id) = build_dns_query(name, QTYPE_A);
+      for qtype in [QTYPE_A, QTYPE_AAAA] {
+        let (query, id) = build_dns_query(name, qtype);
         if let Err(error) = sender.send_to(server, query).await {
             last = error;
             continue;
@@ -341,20 +485,23 @@ async fn dns_exchange(
                 }
             };
 
-            if !dns_response_matches(&resp.1, id, name, QTYPE_A) {
+            if !dns_response_matches(&resp.1, id, name, qtype) {
                 continue;
             }
-            if let Some(ip) = parse_dns_a(&resp.1) {
+            if let Some(ip) = parse_dns_address(&resp.1) {
                 return Ok(ip);
             }
-            return Err(AetherError::Other(format!("no A record for {name}")));
+            last = AetherError::Other(format!("no address record for {name} from {server}"));
+            break;
         }
+      }
     }
 
     Err(last)
 }
 
 const QTYPE_A: u16 = 1;
+const QTYPE_AAAA: u16 = 28;
 
 fn build_dns_query(name: &str, qtype: u16) -> (Vec<u8>, u16) {
     let mut q = Vec::with_capacity(32 + name.len());
@@ -364,6 +511,9 @@ fn build_dns_query(name: &str, qtype: u16) -> (Vec<u8>, u16) {
     q.extend_from_slice(&[0x00, 0x01]);
     q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            continue;
+        }
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
     }
@@ -426,7 +576,7 @@ pub(crate) fn dns_response_matches(
     u16::from_be_bytes([resp[pos], resp[pos + 1]]) == expected_qtype
 }
 
-fn parse_dns_a(resp: &[u8]) -> Option<IpAddr> {
+fn parse_dns_address(resp: &[u8]) -> Option<IpAddr> {
     if resp.len() < 12 {
         return None;
     }
@@ -450,13 +600,18 @@ fn parse_dns_a(resp: &[u8]) -> Option<IpAddr> {
         if pos + rdlen > resp.len() {
             return None;
         }
-        if rtype == 1 && rdlen == 4 {
+        if rtype == QTYPE_A && rdlen == 4 {
             return Some(IpAddr::V4(Ipv4Addr::new(
                 resp[pos],
                 resp[pos + 1],
                 resp[pos + 2],
                 resp[pos + 3],
             )));
+        }
+        if rtype == QTYPE_AAAA && rdlen == 16 {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&resp[pos..pos + 16]);
+            return Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
         }
         pos += rdlen;
     }
@@ -476,21 +631,94 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
+fn decide_route(
+    set: &RuleSet,
+    target: &Target,
+    sniffed: Option<&str>,
+    port: u16,
+) -> Action {
+    match sniffed {
+        Some(name) => match set.decide(Host::Domain(name), port) {
+            Action::Proxy => set.decide(host_of(target), port),
+            decided => decided,
+        },
+        None => set.decide(host_of(target), port),
+    }
+}
+
+fn sniff_enabled() -> bool {
+    !matches!(
+        std::env::var("AETHER_ROUTE_SNIFF").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
+fn sniff_window() -> Duration {
+    let ms = std::env::var("AETHER_ROUTE_SNIFF_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(400);
+    Duration::from_millis(ms)
+}
+
+async fn read_sniff_head(sock: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut head = vec![0u8; crate::sniff::PEEK_BUDGET];
+    match tokio::time::timeout(sniff_window(), sock.read(&mut head)).await {
+        Ok(Ok(0)) => None,
+        Ok(Ok(read)) => {
+            head.truncate(read);
+            Some(head)
+        }
+        Ok(Err(_)) => None,
+        Err(_) => Some(Vec::new()),
+    }
+}
+
 async fn handle_connect(
     mut sock: TcpStream,
     stack: StackHandle,
     target: Target,
     port: u16,
 ) -> Result<()> {
-    match route_action(host_of(&target), port) {
+    let mut head = Vec::new();
+    let mut replied = false;
+    let mut named: Option<String> = None;
+
+    if matches!(target, Target::Ip(_)) && sniff_enabled() && routes_have_domain_rules() {
+        reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
+        replied = true;
+
+        head = match read_sniff_head(&mut sock).await {
+            Some(bytes) => bytes,
+            None => return Ok(()),
+        };
+
+        if head.is_empty() {
+            log::trace!("[route] {target}:{port} sent nothing to read a name from");
+        } else {
+            named = crate::sniff::hostname(&head);
+            if let Some(name) = &named {
+                log::debug!("[route] {target}:{port} announced itself as {name}");
+            }
+        }
+    }
+
+    let action = {
+        let set = ROUTES.read().unwrap();
+        decide_route(&set, &target, named.as_deref(), port)
+    };
+    match action {
         Action::Block => {
             log::debug!("[route] block tcp {target}:{port}");
-            let _ = reply(&mut sock, REP_NOT_ALLOWED).await;
+            if !replied {
+                let _ = reply(&mut sock, REP_NOT_ALLOWED).await;
+            }
             return Ok(());
         }
         Action::Direct => {
             log::debug!("[route] direct tcp {target}:{port}");
-            return handle_direct(sock, target, port).await;
+            return handle_direct(sock, target, port, head, replied).await;
         }
         Action::Proxy => {}
     }
@@ -551,9 +779,16 @@ async fn handle_connect(
         }
     };
 
-    reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
+    if !replied {
+        reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
+    }
 
     let (sender, mut from_stack, leftover) = conn;
+
+    if !head.is_empty() && sender.send(head).await.is_err() {
+        return Ok(());
+    }
+
     let (mut rd, mut wr) = sock.into_split();
 
     if !leftover.is_empty() && wr.write_all(&leftover).await.is_err() {
@@ -609,36 +844,61 @@ fn expected_udp_source(control_peer: SocketAddr, requested: &Target) -> IpAddr {
     }
 }
 
-fn udp_source_allowed(expected_ip: IpAddr, latched: Option<SocketAddr>, from: SocketAddr) -> bool {
+fn udp_source_allowed(
+    expected_ip: IpAddr,
+    latched: Option<SocketAddr>,
+    from: SocketAddr,
+) -> bool {
     match latched {
         Some(known) => known == from,
         None => normalize_ip(from.ip()) == normalize_ip(expected_ip),
     }
 }
 
-async fn handle_direct(mut sock: TcpStream, target: Target, port: u16) -> Result<()> {
+async fn handle_direct(
+    mut sock: TcpStream,
+    target: Target,
+    port: u16,
+    head: Vec<u8>,
+    replied: bool,
+) -> Result<()> {
     let address = match &target {
         Target::Domain(name) => format!("{name}:{port}"),
         Target::Ip(ip) => SocketAddr::new(*ip, port).to_string(),
     };
 
-    let upstream =
-        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&address)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => {
-                log::debug!("[route] direct connect to {address} failed: {error}");
+    let mut upstream = match tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect(&address),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            log::debug!("[route] direct connect to {address} failed: {error}");
+            if !replied {
                 let _ = reply(&mut sock, REP_GENERAL).await;
-                return Ok(());
             }
-            Err(_) => {
-                log::debug!("[route] direct connect to {address} timed out");
+            return Ok(());
+        }
+        Err(_) => {
+            log::debug!("[route] direct connect to {address} timed out");
+            if !replied {
                 let _ = reply(&mut sock, REP_GENERAL).await;
-                return Ok(());
             }
-        };
+            return Ok(());
+        }
+    };
 
     let _ = upstream.set_nodelay(true);
-    reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
+
+    if !head.is_empty() && upstream.write_all(&head).await.is_err() {
+        return Ok(());
+    }
+
+    if !replied {
+        reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
+    }
 
     let (mut client_rd, mut client_wr) = sock.into_split();
     let (mut remote_rd, mut remote_wr) = upstream.into_split();
@@ -670,9 +930,7 @@ async fn open_through_gateway(
 ) -> Result<GatewayChannel> {
     let conn = tokio::time::timeout(GATEWAY_PROBE_TIMEOUT, stack.open_tcp(proxy))
         .await
-        .map_err(|_| {
-            AetherError::Other(format!("gateway {proxy} did not accept a connection"))
-        })??;
+        .map_err(|_| AetherError::Other(format!("gateway {proxy} did not accept a connection")))??;
     let (sender, mut from_stack) = conn.into_split();
 
     sender.send(build_proxy_connect(authority, port)).await?;
@@ -715,6 +973,7 @@ async fn open_through_gateway(
         }
     }
 }
+
 
 async fn handle_udp_associate(
     mut sock: TcpStream,
@@ -1188,31 +1447,38 @@ mod tests {
 const HTTP_HEAD_LIMIT: usize = 16 * 1024;
 
 pub async fn serve_http(listen: SocketAddr, stack: StackHandle) -> Result<()> {
-    let listener = TcpListener::bind(listen).await?;
-    log::info!("http proxy listening on {listen}");
+    let listeners = bind_listeners("HTTP CONNECT", listen).await?;
+    let mut incoming = spawn_acceptors(listeners);
+    let mut clients = tokio::task::JoinSet::new();
 
     loop {
-        let (sock, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                if let Some(delay) = accept_backoff(&error) {
-                    log::warn!(
-                        "http proxy accept failed: {error}; the listener stays open and retries"
-                    );
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-                log::error!("http proxy listener cannot continue: {error}");
-                return Err(error.into());
+        tokio::select! {
+            accept = incoming.recv() => {
+                let (sock, peer) = match accept {
+                    Some(Ok(accepted)) => accepted,
+                    Some(Err(error)) => {
+                        if accept_backoff(&error).is_some() {
+                            log::warn!(
+                                "http proxy accept failed: {error}; the listener stays open and retries"
+                            );
+                            continue;
+                        }
+                        log::error!("http proxy listener cannot continue: {error}");
+                        return Err(error.into());
+                    }
+                    None => {
+                        return Err(AetherError::Other("http proxy listeners closed".into()));
+                    }
+                };
+                let stack = stack.clone();
+                clients.spawn(async move {
+                    if let Err(e) = handle_http_client(sock, stack).await {
+                        log::debug!("http proxy client {peer} ended: {e}");
+                    }
+                });
             }
-        };
-
-        let stack = stack.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_http_client(sock, stack).await {
-                log::debug!("http proxy client {peer} ended: {e}");
-            }
-        });
+            Some(_) = clients.join_next(), if !clients.is_empty() => {}
+        }
     }
 }
 
@@ -1286,25 +1552,52 @@ pub fn parse_request_line(line: &str) -> Option<HttpRequestLine> {
     })
 }
 
+fn http_proxy_authorized(head: &str, user: &str, pass: &str) -> bool {
+    let expected = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    head.lines().any(|line| {
+        let value = line
+            .split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("proxy-authorization"))
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or("");
+        let (scheme, token) = value.split_once(' ').unwrap_or(("", ""));
+        scheme.eq_ignore_ascii_case("basic") && token == expected
+    })
+}
+
 async fn read_head(sock: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut head = Vec::with_capacity(1024);
-    let mut byte = [0u8; 1];
+    let mut buf = vec![0u8; HTTP_HEAD_LIMIT + 4];
+    let mut seen = 0usize;
 
     loop {
-        let read = sock.read(&mut byte).await?;
-        if read == 0 {
+        let window = (seen + 1024).min(buf.len());
+        let available = sock.peek(&mut buf[..window]).await?;
+        if available == 0 {
             return Err(AetherError::Other(
                 "the http client closed before sending a request".into(),
             ));
         }
-        head.push(byte[0]);
 
-        if head.len() >= 4 && head[head.len() - 4..] == *b"\r\n\r\n" {
+        let search_from = seen.saturating_sub(3);
+        if let Some(pos) = buf[..available]
+            .windows(4)
+            .skip(search_from)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            let end = search_from + pos + 4;
+            let mut head = vec![0u8; end];
+            sock.read_exact(&mut head).await?;
             return Ok(head);
         }
-        if head.len() > HTTP_HEAD_LIMIT {
+
+        if available > HTTP_HEAD_LIMIT {
             return Err(AetherError::Other("http request head too large".into()));
         }
+
+        if available == seen {
+            sock.readable().await?;
+        }
+        seen = available;
     }
 }
 
@@ -1348,6 +1641,15 @@ async fn handle_http_client(mut sock: TcpStream, stack: StackHandle) -> Result<(
             )));
         }
     };
+
+    if let Some((user, pass)) = proxy_credentials() {
+        if !http_proxy_authorized(&text, &user, &pass) {
+            let _ = sock
+                .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Aethery\"\r\nConnection: close\r\n\r\n")
+                .await;
+            return Err(AetherError::Other("http proxy authentication required".into()));
+        }
+    }
 
     let target = match request.authority.parse::<IpAddr>() {
         Ok(ip) => Target::Ip(ip),
@@ -1476,7 +1778,69 @@ async fn relay_http_direct(
 
 #[cfg(test)]
 mod http_proxy_tests {
-    use super::{parse_authority, parse_request_line};
+    use super::{extra_listen_addrs, parse_authority, parse_request_line, read_head};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn head_over_socket(chunks: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let owned: Vec<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
+        let writer = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.expect("connect");
+            for chunk in owned {
+                client.write_all(&chunk).await.expect("write");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            client.flush().await.expect("flush");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let (mut server, _) = listener.accept().await.expect("accept");
+        let head = read_head(&mut server).await.expect("head");
+
+        let mut leftover = vec![0u8; 64];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.read(&mut leftover),
+        )
+        .await
+        .map(|r| r.unwrap_or(0))
+        .unwrap_or(0);
+        leftover.truncate(n);
+
+        writer.abort();
+        (head, leftover)
+    }
+
+    #[tokio::test]
+    async fn a_head_arriving_in_one_piece_is_read_exactly() {
+        let (head, leftover) = head_over_socket(&[b"CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n"]).await;
+        assert_eq!(head, b"CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n");
+        assert!(leftover.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_head_split_across_writes_is_still_assembled() {
+        let (head, _) = head_over_socket(&[
+            b"CONNECT a:443 HT",
+            b"TP/1.1\r\nHos",
+            b"t: a\r\n",
+            b"\r\n",
+        ])
+        .await;
+        assert_eq!(head, b"CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn bytes_after_the_head_are_left_on_the_socket() {
+        let (head, leftover) =
+            head_over_socket(&[b"CONNECT a:443 HTTP/1.1\r\n\r\n\x16\x03\x01pipelined"]).await;
+        assert_eq!(head, b"CONNECT a:443 HTTP/1.1\r\n\r\n");
+        assert_eq!(leftover, b"\x16\x03\x01pipelined");
+    }
 
     #[test]
     fn a_connect_request_carries_the_host_and_port() {
@@ -1544,5 +1908,127 @@ mod http_proxy_tests {
     fn a_malformed_line_is_rejected() {
         assert!(parse_request_line("").is_none());
         assert!(parse_request_line("CONNECT").is_none());
+    }
+
+    #[test]
+    fn a_loopback_ipv4_listen_also_covers_ipv6_localhost() {
+        let addrs = extra_listen_addrs(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1820));
+        assert_eq!(
+            addrs,
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1820),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1820),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod sniff_route_tests {
+    use super::*;
+
+    fn ip(value: &str) -> Target {
+        Target::Ip(value.parse().unwrap())
+    }
+
+    #[test]
+    fn a_domain_rule_reaches_traffic_that_arrived_as_an_address() {
+        let set = RuleSet::parse("ads.example", "");
+        assert_eq!(
+            decide_route(&set, &ip("93.184.216.34"), None, 443),
+            Action::Proxy
+        );
+        assert_eq!(
+            decide_route(&set, &ip("93.184.216.34"), Some("ads.example"), 443),
+            Action::Block
+        );
+        assert_eq!(
+            decide_route(&set, &ip("93.184.216.34"), Some("tracker.ads.example"), 443),
+            Action::Block
+        );
+    }
+
+    #[test]
+    fn a_sniffed_name_can_send_traffic_direct() {
+        let set = RuleSet::parse("", "internal.example");
+        assert_eq!(
+            decide_route(&set, &ip("10.1.2.3"), Some("internal.example"), 443),
+            Action::Direct
+        );
+    }
+
+    #[test]
+    fn an_address_rule_still_applies_when_the_name_says_nothing() {
+        let set = RuleSet::parse("10.0.0.0/8", "");
+        assert_eq!(
+            decide_route(&set, &ip("10.1.2.3"), Some("unlisted.example"), 443),
+            Action::Block
+        );
+    }
+
+    #[test]
+    fn a_name_that_matches_nothing_leaves_the_address_decision_alone() {
+        let set = RuleSet::parse("ads.example", "private");
+        assert_eq!(
+            decide_route(&set, &ip("192.168.1.5"), Some("unlisted.example"), 443),
+            Action::Direct
+        );
+    }
+
+    #[test]
+    fn a_domain_target_is_decided_on_its_own_name() {
+        let set = RuleSet::parse("ads.example", "");
+        let target = Target::Domain("ads.example".to_string());
+        assert_eq!(decide_route(&set, &target, None, 443), Action::Block);
+    }
+
+    #[tokio::test]
+    async fn a_server_speaks_first_protocol_survives_the_sniff_window() {
+        std::env::set_var("AETHER_ROUTE_SNIFF_MS", "50");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let quiet = tokio::spawn(async move {
+            let _client = tokio::net::TcpStream::connect(address).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+
+        let (mut server, _) = listener.accept().await.unwrap();
+        let head = read_sniff_head(&mut server).await;
+        std::env::remove_var("AETHER_ROUTE_SNIFF_MS");
+
+        assert_eq!(
+            head,
+            Some(Vec::new()),
+            "a client that waits for a greeting must not be treated as gone"
+        );
+        quiet.abort();
+    }
+
+    #[tokio::test]
+    async fn a_client_that_hangs_up_is_reported_as_gone() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let client = tokio::net::TcpStream::connect(address).await.unwrap();
+            drop(client);
+        });
+
+        let (mut server, _) = listener.accept().await.unwrap();
+        assert_eq!(read_sniff_head(&mut server).await, None);
+    }
+
+    #[test]
+    fn sniffing_is_on_unless_it_is_turned_off() {
+        std::env::remove_var("AETHER_ROUTE_SNIFF");
+        assert!(sniff_enabled());
+        std::env::set_var("AETHER_ROUTE_SNIFF", "0");
+        assert!(!sniff_enabled());
+        std::env::set_var("AETHER_ROUTE_SNIFF", "off");
+        assert!(!sniff_enabled());
+        std::env::set_var("AETHER_ROUTE_SNIFF", "1");
+        assert!(sniff_enabled());
+        std::env::remove_var("AETHER_ROUTE_SNIFF");
     }
 }
