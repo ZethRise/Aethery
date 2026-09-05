@@ -13,4 +13,24 @@
     <!-- Upload/Download notification labels -->
     <string name="vpn_upload">Upload</string>
     <string name="vpn_download">Download</string>
+
+    <string name="widget_connect">Connect</string>
+    <string name="widget_method">Connection method</string>
+    <string name="widget_method_masque">MASQUE</string>
+    <string name="widget_speed_idle">↓ 0 B/s   ↑ 0 B/s</string>
+    <string name="widget_ip_idle">VPN IP  —</string>
+    <string name="widget_masque_heading">MASQUE</string>
+    <string name="widget_h3">HTTP/3</string>
+    <string name="widget_h2">HTTP/2</string>
+    <string name="widget_fallback">HTTP/3 to HTTP/2 fallback</string>
+    <string name="widget_fallback_on">Fallback on</string>
+    <string name="widget_fallback_off">Fallback off</string>
+    <string name="widget_connect_label">Aethery</string>
+    <string name="widget_method_label">Aethery method</string>
+    <string name="widget_console_label">Aethery console</string>
+    <string name="widget_connect_description">1×1 connect control</string>
+    <string name="widget_method_description">2×2 connect control and method</string>
+    <string name="widget_console_description">3×4 connect control, method, speed, and HTTP/3 / HTTP/2</string>
+    <string name="widget_pin_unsupported">Long-press the home screen, choose Widgets, then Aethery</string>
+    <string name="widget_pinned">Choose a home screen to place the widget</string>
 </resources>

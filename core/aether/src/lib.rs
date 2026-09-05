@@ -64,6 +64,36 @@ fn parse_local_v4(s: &str) -> Ipv4Addr {
 
 const TUNNEL_MTU: usize = 1280;
 const INNER_MTU: usize = 1200;
+
+/// MASQUE over HTTP/2 carries its capsules on a TCP stream, where nothing has
+/// to fit inside a single UDP datagram. The 1280 that keeps a QUIC datagram
+/// whole only buys the netstack more segments to cut on that path, so it gets
+/// an ordinary ethernet MTU instead.
+const H2_TUNNEL_MTU: usize = 1500;
+
+/// The inner MTU for the MASQUE tunnel. `AETHER_MASQUE_MTU` overrides it, for a
+/// path where the edge turns out not to carry full-size packets.
+fn masque_tunnel_mtu() -> usize {
+    if let Some(mtu) = std::env::var("AETHER_MASQUE_MTU")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|mtu| (576..=1500).contains(mtu))
+    {
+        return mtu;
+    }
+
+    // Android's VpnService MTU is 1280. Advertising 1500 on HTTP/2 makes the
+    // edge send frames the TUN cannot write, and the bridge used to exit.
+    if android_tun_fd().is_some() {
+        return TUNNEL_MTU;
+    }
+
+    if masque_h2::enabled() {
+        H2_TUNNEL_MTU
+    } else {
+        TUNNEL_MTU
+    }
+}
 const DEFAULT_CONFIG: &str = "aether.toml";
 
 pub async fn run() -> Result<()> {
@@ -101,14 +131,28 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
 
     let base_config = std::env::var("AETHER_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
 
-    let protocol = if std::env::var("AETHER_PEER").is_ok() || std::env::var("AETHER_WG_PEER").is_ok() {
-        match std::env::var("AETHER_PROTOCOL") {
-            Ok(v) => Protocol::parse(&v),
-            Err(_) => Protocol::Masque,
+    // A malformed address is worth reporting before an account is provisioned.
+    let pinned_wiw = wiw_endpoints_from_env()?;
+
+    let protocol = match std::env::var("AETHER_PROTOCOL") {
+        Ok(v) => Protocol::parse(&v),
+        // Naming a warp-in-warp hop only makes sense for warp-in-warp.
+        Err(_) if !pinned_wiw.is_empty() => Protocol::WarpInWarp,
+        Err(_)
+            if std::env::var("AETHER_PEER").is_ok()
+                || std::env::var("AETHER_WG_PEER").is_ok() =>
+        {
+            Protocol::Masque
         }
-    } else {
-        select_protocol(&base_config).await
+        Err(_) => select_protocol(&base_config).await,
     };
+
+    if protocol != Protocol::WarpInWarp && !pinned_wiw.is_empty() {
+        log::warn!(
+            "[-] the warp-in-warp endpoints you set are ignored on {}; they only apply to --gool",
+            protocol.label()
+        );
+    }
 
     match protocol {
         Protocol::Masque => {
@@ -151,50 +195,260 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
     }
 }
 
+/// The port Cloudflare's WireGuard edges usually answer on. It is only ever
+/// shown as an example: an endpoint has to carry its own port, because which
+/// port gets through is exactly what differs between one network and the next.
+const WG_EXAMPLE_PORT: u16 = 2408;
+
+/// The two hops of a warp-in-warp tunnel, as far as they were chosen by hand. A
+/// hop left as `None` is one the scan still has to find.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WiwEndpoints {
+    outer: Option<SocketAddr>,
+    inner: Option<SocketAddr>,
+}
+
+impl WiwEndpoints {
+    fn is_empty(&self) -> bool {
+        self.outer.is_none() && self.inner.is_none()
+    }
+
+    /// The hops have to leave through different edges: sending the inner tunnel
+    /// back out of the address it already arrived on gains nothing, and
+    /// `run_warp_in_warp` refuses it.
+    fn checked(self) -> Result<Self> {
+        match (self.outer, self.inner) {
+            (Some(outer), Some(inner)) if outer.ip() == inner.ip() => {
+                Err(AetherError::Other(format!(
+                    "warp-in-warp needs two separate edges, but both hops point at {}",
+                    outer.ip()
+                )))
+            }
+            _ => Ok(self),
+        }
+    }
+}
+
+/// Reads one endpoint. The port has to be written out: which port answers is
+/// the part that differs from network to network, so filling one in on
+/// somebody's behalf would only send them at an address nobody offered.
+fn parse_endpoint(raw: &str) -> Result<SocketAddr> {
+    let text = raw.trim();
+
+    if let Ok(peer) = text.parse::<SocketAddr>() {
+        return Ok(peer);
+    }
+
+    // An address with the port left off is the likely slip, so name what is
+    // missing rather than calling the whole thing unreadable.
+    let portless = text.parse::<IpAddr>().ok().or_else(|| {
+        text.strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .and_then(|inner| inner.parse::<IpAddr>().ok())
+    });
+
+    if let Some(address) = portless {
+        return Err(AetherError::Other(format!(
+            "{text} carries no port, and the port is required; write it out, as in {}",
+            SocketAddr::new(address, WG_EXAMPLE_PORT)
+        )));
+    }
+
+    Err(AetherError::Other(format!(
+        "'{text}' is not an endpoint; write an address and a port together, \
+         such as 162.159.192.1:{WG_EXAMPLE_PORT}"
+    )))
+}
+
+/// Reads the one or two endpoints of a warp-in-warp pair, separated by commas,
+/// semicolons or spaces.
+fn parse_endpoint_list(raw: &str) -> Result<Vec<SocketAddr>> {
+    let mut peers = Vec::new();
+
+    for part in raw.split([',', ';', ' ']) {
+        if part.trim().is_empty() {
+            continue;
+        }
+        peers.push(parse_endpoint(part)?);
+    }
+
+    match peers.len() {
+        0 => Err(AetherError::Other(
+            "no endpoint was given; expected one or two addresses".to_string(),
+        )),
+        1 | 2 => Ok(peers),
+        found => Err(AetherError::Other(format!(
+            "warp-in-warp has two hops, but {found} addresses were given"
+        ))),
+    }
+}
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// True when the endpoints were deliberately left to the scan, so there is
+/// nothing left to ask about.
+fn wiw_scan_requested(lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    match lookup("AETHER_WIW_PEERS") {
+        Some(value) => matches!(
+            value.to_lowercase().as_str(),
+            "auto" | "scan" | "none" | "off" | "0"
+        ),
+        None => false,
+    }
+}
+
+/// The hops named through the warp-in-warp settings. `AETHER_WIW_PEERS` carries
+/// the pair, and the per-hop settings win over it.
+fn wiw_endpoints_of(lookup: &dyn Fn(&str) -> Option<String>) -> Result<WiwEndpoints> {
+    let mut chosen = WiwEndpoints::default();
+
+    if let Some(list) = lookup("AETHER_WIW_PEERS") {
+        if !wiw_scan_requested(lookup) {
+            let peers = parse_endpoint_list(&list)?;
+            chosen.outer = peers.first().copied();
+            chosen.inner = peers.get(1).copied();
+        }
+    }
+
+    if let Some(value) = lookup("AETHER_WIW_OUTER_PEER") {
+        chosen.outer = Some(parse_endpoint(&value)?);
+    }
+
+    if let Some(value) = lookup("AETHER_WIW_INNER_PEER") {
+        chosen.inner = Some(parse_endpoint(&value)?);
+    }
+
+    chosen.checked()
+}
+
+fn wiw_endpoints_from_env() -> Result<WiwEndpoints> {
+    wiw_endpoints_of(&env_value)
+}
+
+/// `--peer` and `--wg-peer` are older than the warp-in-warp settings and the
+/// guides already pair them with `--gool`, so they still name the outer hop.
+fn wiw_endpoints_with_fallback(lookup: &dyn Fn(&str) -> Option<String>) -> Result<WiwEndpoints> {
+    let mut chosen = wiw_endpoints_of(lookup)?;
+
+    if chosen.outer.is_some() {
+        return Ok(chosen);
+    }
+
+    let forced = lookup("AETHER_WG_PEER").or_else(|| lookup("AETHER_PEER"));
+    let Some(forced) = forced else {
+        return Ok(chosen);
+    };
+
+    let peers = parse_endpoint_list(&forced)?;
+    chosen.outer = peers.first().copied();
+    if chosen.inner.is_none() {
+        chosen.inner = peers.get(1).copied();
+    }
+
+    chosen.checked()
+}
+
 async fn run_gool(
     primary: account::Identity,
     secondary: account::Identity,
     listen: SocketAddr,
 ) -> Result<()> {
-    let mut last_peer: Option<SocketAddr> = None;
-    let mut last_inner: Option<SocketAddr> = None;
+    // Scanning is what happens unless somebody named an endpoint themselves.
+    let pinned = wiw_endpoints_with_fallback(&env_value)?;
+
+    match (pinned.outer, pinned.inner) {
+        (Some(outer), Some(inner)) => log::info!(
+            "[+] warp-in-warp endpoints given by hand: {outer} (outer) and {inner} (inner); the scan is skipped"
+        ),
+        (Some(outer), None) => log::info!(
+            "[+] outer warp-in-warp endpoint given by hand: {outer}; scanning for the inner one"
+        ),
+        (None, Some(inner)) => log::info!(
+            "[+] inner warp-in-warp endpoint given by hand: {inner}; scanning for the outer one"
+        ),
+        (None, None) => {}
+    }
+
+    let mut outer_peer = pinned.outer;
+    let mut inner_peer = pinned.inner;
     let mut consecutive_fails: u32 = 0;
     const MAX_CONSECUTIVE_FAILS: u32 = 2;
 
     loop {
-        let peer = if consecutive_fails < MAX_CONSECUTIVE_FAILS {
-            if let Some(p) = last_peer {
-                Some(p)
-            } else {
-                None
+        if consecutive_fails >= MAX_CONSECUTIVE_FAILS {
+            // A hop that was given by hand is kept: it was asked for on purpose,
+            // and replacing it behind the user's back is not ours to do.
+            let mut rescanning = false;
+
+            if pinned.outer.is_none() {
+                if let Some(peer) = outer_peer.take() {
+                    log::warn!(
+                        "[-] outer endpoint {peer} failed {consecutive_fails} times in a row; blacklisting and rescanning"
+                    );
+                    rescanning = true;
+                }
             }
-        } else {
-            if let Some(p) = last_peer {
+
+            if pinned.inner.is_none() {
+                if let Some(peer) = inner_peer.take() {
+                    log::warn!(
+                        "[-] inner endpoint {peer} failed {consecutive_fails} times in a row; blacklisting and rescanning"
+                    );
+                    rescanning = true;
+                }
+            }
+
+            if !rescanning {
                 log::warn!(
-                    "[-] outer endpoint {p} failed {consecutive_fails} times in a row; blacklisting and rescanning"
+                    "[-] the endpoints you chose failed {consecutive_fails} times in a row; still retrying them, drop --wiw-outer/--wiw-inner to let the scan pick instead"
                 );
             }
-            None
-        };
 
-        let pair = match peer {
-            Some(p) => Some((p, last_inner)),
-            None => {
-                let mode_str = select_scan_mode_str().await;
+            consecutive_fails = 0;
+        }
+
+        let (peer, inner_peer_now) = match (outer_peer, inner_peer) {
+            (Some(outer), Some(inner)) => (outer, inner),
+            (known_outer, known_inner) => {
+                let wanted =
+                    usize::from(known_outer.is_none()) + usize::from(known_inner.is_none());
+                let avoid: HashSet<IpAddr> = known_outer
+                    .into_iter()
+                    .chain(known_inner)
+                    .map(|peer| peer.ip())
+                    .collect();
+
+                let mode_str = select_scan_mode_str(WIW_MANUAL_TIP).await;
                 let ip = select_ip_version().await;
-                match select_wg_peers(&primary, &mode_str, ip, 2).await {
-                    Ok(found) => {
-                        consecutive_fails = 0;
-                        match found.first().copied() {
-                            Some(outer) => Some((outer, found.get(1).copied())),
-                            None => {
-                                log::warn!("[-] WireGuard scan returned no endpoints; rescanning shortly");
-                                None
-                            }
-                        }
-                    }
+
+                let found = match select_wg_peers(&primary, &mode_str, ip, wanted, &avoid).await {
+                    Ok(found) => found,
                     Err(e) => {
-                        log::warn!("[-] no usable outer WARP endpoint found: {e}; rescanning shortly");
+                        log::warn!(
+                            "[-] no usable WARP endpoint found: {e}; rescanning shortly"
+                        );
+                        tokio::time::sleep(wg_reconnect_delay()).await;
+                        continue;
+                    }
+                };
+
+                let mut found = found.into_iter();
+                let outer = known_outer.or_else(|| found.next());
+                let inner = known_inner.or_else(|| found.next());
+
+                match (outer, inner) {
+                    (Some(outer), Some(inner)) => (outer, inner),
+                    _ => {
+                        log::warn!(
+                            "[-] the scan only turned up one edge, so warp-in-warp would use it twice; rescanning"
+                        );
+                        outer_peer = pinned.outer;
+                        inner_peer = pinned.inner;
                         tokio::time::sleep(wg_reconnect_delay()).await;
                         continue;
                     }
@@ -202,29 +456,19 @@ async fn run_gool(
             }
         };
 
-        let (peer, inner_peer) = match pair {
-            Some(pair) => pair,
-            None => continue,
-        };
+        log::info!("[+] using cloudflare edge {peer} (outer) and {inner_peer_now} (inner)");
+        outer_peer = Some(peer);
+        inner_peer = Some(inner_peer_now);
 
-        let inner_peer = match inner_peer {
-            Some(inner) => inner,
-            None => {
-                log::warn!(
-                    "[-] the scan only turned up {peer}, so warp-in-warp would use one edge twice; rescanning"
-                );
-                last_peer = None;
-                last_inner = None;
-                tokio::time::sleep(wg_reconnect_delay()).await;
-                continue;
-            }
-        };
-
-        log::info!("[+] using cloudflare edge {peer} (outer) and {inner_peer} (inner)");
-        last_peer = Some(peer);
-        last_inner = Some(inner_peer);
-
-        match run_warp_in_warp(primary.clone(), secondary.clone(), peer, inner_peer, listen).await {
+        match run_warp_in_warp(
+            primary.clone(),
+            secondary.clone(),
+            peer,
+            inner_peer_now,
+            listen,
+        )
+        .await
+        {
             Ok(()) => log::warn!("[-] gool tunnel closed; reconnecting"),
             Err(e) => log::warn!("[-] gool tunnel ended: {e}; reconnecting"),
         }
@@ -573,7 +817,7 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
 
     log::info!("[+] selected protocol: {}", protocol.label());
     
-    let mode_str = select_scan_mode_str().await;
+    let mode_str = select_scan_mode_str("").await;
     let ip = select_ip_version().await;
 
     match protocol {
@@ -598,17 +842,21 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
             Ok(SocketAddr::new(best.ip, best.port))
         }
         Protocol::WireGuard | Protocol::WarpInWarp => {
-            let peers = select_wg_peers(identity, &mode_str, ip, 1).await?;
+            let peers = select_wg_peers(identity, &mode_str, ip, 1, &HashSet::new()).await?;
             Ok(peers[0])
         }
     }
 }
 
+/// Hunts for `want` endpoints, leaving out the addresses in `avoid`. Warp-in-warp
+/// passes the hop it already has there, so the scan cannot hand back the same
+/// edge for both ends of the tunnel.
 async fn select_wg_peers(
     identity: &account::Identity,
     mode_str: &str,
     ip: prober::IpScan,
     want: usize,
+    avoid: &HashSet<IpAddr>,
 ) -> Result<Vec<SocketAddr>> {
     log::info!(
         "[*] hunting for {want} working WireGuard endpoint(s) (handshake + data-plane verification)"
@@ -617,6 +865,19 @@ async fn select_wg_peers(
 
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;
+
+    let ports = wireguard::WG_PORTS.to_vec();
+    let excluded: HashSet<SocketAddr> = avoid
+        .iter()
+        .flat_map(|address| ports.iter().map(move |port| SocketAddr::new(*address, *port)))
+        .collect();
+
+    if !avoid.is_empty() {
+        log::info!(
+            "[*] the scan leaves out {} address(es) already taken by the other hop",
+            avoid.len()
+        );
+    }
 
     let probe = wg_prober::WgProbe {
         private_key: std::sync::Arc::new(private_key),
@@ -627,13 +888,26 @@ async fn select_wg_peers(
             .parse()
             .map_err(|_| AetherError::Other("invalid ipv4".into()))?,
         aethernoize: aethernoize_config(),
-        ports: wireguard::WG_PORTS.to_vec(),
+        ports,
         ip,
-        excluded: HashSet::new(),
+        excluded,
     };
 
     let found = wg_prober::hunt_wg_endpoints(&probe, mode, want).await?;
-    for pr in &found {
+
+    // The exclusion above already keeps these out of the sweep; this is the
+    // belt to its braces, since handing a hop its own address back is fatal.
+    let picked: Vec<wg_prober::WgProbeResult> = found
+        .into_iter()
+        .filter(|pr| !avoid.contains(&pr.ip))
+        .take(want)
+        .collect();
+
+    if picked.is_empty() {
+        return Err(AetherError::NoCleanEndpoint);
+    }
+
+    for pr in &picked {
         log::info!(
             "[+] selected WireGuard endpoint {}:{} (rtt {:?})",
             pr.ip,
@@ -642,7 +916,7 @@ async fn select_wg_peers(
         );
     }
 
-    Ok(found
+    Ok(picked
         .into_iter()
         .map(|pr| SocketAddr::new(pr.ip, pr.port))
         .collect())
@@ -975,7 +1249,7 @@ async fn run_masque(
     let (mode_str, ip) = if forced.is_some() || quick_peer.is_some() {
         (String::new(), prober::IpScan::V4)
     } else {
-        let mode_str = select_scan_mode_str().await;
+        let mode_str = select_scan_mode_str("").await;
         let ip = select_ip_version().await;
         (mode_str, ip)
     };
@@ -1074,12 +1348,13 @@ async fn run_masque_tunnel(
     let mut tasks = TaskGuard::new();
     let (addr_tx, mut addr_rx) = tokio::sync::mpsc::channel::<quic::AssignedAddr>(8);
 
+    let mtu = masque_tunnel_mtu();
     let cap = crate::sysprofile::channel_capacity();
     let (stack_in_tx, stack_in_rx) = tokio::sync::mpsc::channel(cap);
     let spawned = netstack::spawn(
         &identity.ipv4,
         &identity.ipv6,
-        TUNNEL_MTU,
+        mtu,
         stack_in_rx,
         outbound_tx.clone(),
     )?;
@@ -1139,7 +1414,7 @@ async fn run_masque_tunnel(
             pin_endpoint: true,
             expected_pins: consts::MASQUE_PINS.iter().map(|p| p.to_vec()).collect(),
         };
-        log::info!("[+] MASQUE transport: HTTP/2 (TCP) to {}", h2cfg.peer);
+        log::info!("[+] MASQUE transport: HTTP/2 (TCP) to {} (inner mtu {mtu})", h2cfg.peer);
         tokio::spawn(masque_h2::run(h2cfg, internals, Some(addr_tx), Some(ready_tx)))
     } else {
         log::info!("[+] MASQUE transport: HTTP/3 (QUIC) to {}", peer);
@@ -1393,7 +1668,7 @@ async fn run_wireguard(identity: account::Identity, listen: SocketAddr, lastconn
     let (mode_str, ip) = if forced.is_some() || quick.is_some() {
         (String::new(), prober::IpScan::V4)
     } else {
-        let mode_str = select_scan_mode_str().await;
+        let mode_str = select_scan_mode_str("").await;
         let ip = select_ip_version().await;
         (mode_str, ip)
     };
@@ -1964,6 +2239,10 @@ async fn prompt_line(prompt: &str) -> Option<String> {
 
 const SCAN_MODE_PROMPT: &str = "\nScan mode:\n  [1] turbo     (fast, first hit)\n  [2] balanced  (default)\n  [3] thorough  (deep, best ping)\n  [4] stealth   (quiet, patient)\n  [5] ironclad  (real tunnel + real HTTP check per candidate, guaranteed working)\nChoose [1-5] (default 2): ";
 
+/// Shown above the scan mode question on warp-in-warp, where the addresses can
+/// be handed over instead of hunted for.
+const WIW_MANUAL_TIP: &str = "\n(tip: you can skip this scan and give the two gool hops yourself:\n        aether --gool --wiw-outer <ip:port> --wiw-inner <ip:port>\n      the port is required, and naming just one of the two lets the scan\n      find the other)\n";
+
 async fn select_scan_mode() -> prober::ScanMode {
     if let Ok(v) = std::env::var("AETHER_SCAN") {
         return prober::ScanMode::parse(&v);
@@ -1980,12 +2259,14 @@ async fn select_scan_mode() -> prober::ScanMode {
     }
 }
 
-async fn select_scan_mode_str() -> String {
+/// `tip` is printed above the question, for whatever the caller wants to point
+/// out about scanning in the mode it is about to run.
+async fn select_scan_mode_str(tip: &str) -> String {
     if let Ok(v) = std::env::var("AETHER_SCAN") {
         return v;
     }
 
-    let answer = prompt_line(SCAN_MODE_PROMPT).await;
+    let answer = prompt_line(&format!("{tip}{SCAN_MODE_PROMPT}")).await;
 
     match answer.as_deref() {
         Some("1") => "turbo".to_string(),
@@ -2456,5 +2737,220 @@ async fn select_ip_version() -> prober::IpScan {
         Some("2") => prober::IpScan::V6,
         Some("3") => prober::IpScan::Both,
         _ => prober::IpScan::V4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let values: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        move |key: &str| values.get(key).cloned()
+    }
+
+    #[test]
+    fn an_address_and_a_port_are_read_together() {
+        let peer = parse_endpoint("162.159.192.1:894").expect("address and port");
+        assert_eq!(peer, "162.159.192.1:894".parse().unwrap());
+    }
+
+    #[test]
+    fn an_address_without_a_port_is_refused_rather_than_guessed_at() {
+        let message = parse_endpoint("162.159.192.1")
+            .expect_err("the port carries too much meaning to be assumed")
+            .to_string();
+        assert!(
+            message.contains("162.159.192.1:2408"),
+            "the error should spell out the shape wanted, got: {message}"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_address_without_a_port_is_refused_the_same_way() {
+        for written in ["2606:4700:d0::a29f:c001", "[2606:4700:d0::a29f:c001]"] {
+            let message = parse_endpoint(written)
+                .expect_err(written)
+                .to_string();
+            assert!(
+                message.contains("[2606:4700:d0::a29f:c001]:2408"),
+                "the error should bracket the address it suggests, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_forgiven() {
+        let peer = parse_endpoint("  162.159.192.1:2408  ").expect("padded");
+        assert_eq!(peer, "162.159.192.1:2408".parse().unwrap());
+    }
+
+    #[test]
+    fn ipv6_is_read_when_it_is_bracketed_and_carries_its_port() {
+        let peer = parse_endpoint("[2606:4700:d0::a29f:c001]:2408").expect("ipv6 endpoint");
+        assert_eq!(peer, "[2606:4700:d0::a29f:c001]:2408".parse().unwrap());
+    }
+
+    #[test]
+    fn nonsense_is_reported_with_an_example_to_copy() {
+        let message = parse_endpoint("not-an-address")
+            .expect_err("a hostname is not an address")
+            .to_string();
+        assert!(
+            message.contains("162.159.192.1:2408"),
+            "the error should show the shape expected, got: {message}"
+        );
+    }
+
+    #[test]
+    fn an_impossible_port_is_rejected_rather_than_wrapped() {
+        assert!(parse_endpoint("162.159.192.1:70000").is_err());
+    }
+
+    #[test]
+    fn a_pair_may_be_written_with_a_comma_or_a_space() {
+        for written in [
+            "162.159.192.1:2408,162.159.195.1:500",
+            "162.159.192.1:2408, 162.159.195.1:500",
+            "162.159.192.1:2408 162.159.195.1:500",
+        ] {
+            let peers = parse_endpoint_list(written).expect(written);
+            assert_eq!(peers.len(), 2, "{written} names two hops");
+            assert_eq!(peers[0], "162.159.192.1:2408".parse().unwrap());
+            assert_eq!(peers[1], "162.159.195.1:500".parse().unwrap());
+        }
+    }
+
+    #[test]
+    fn a_third_address_is_refused_because_there_are_only_two_hops() {
+        let outcome = parse_endpoint_list("1.1.1.1:2408,2.2.2.2:2408,3.3.3.3:2408");
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn the_pair_setting_fills_the_outer_hop_first() {
+        let chosen = wiw_endpoints_of(&env(&[("AETHER_WIW_PEERS", "162.159.192.1:2408,162.159.195.1:500")]))
+            .expect("a usable pair");
+        assert_eq!(chosen.outer, Some("162.159.192.1:2408".parse().unwrap()));
+        assert_eq!(chosen.inner, Some("162.159.195.1:500".parse().unwrap()));
+    }
+
+    #[test]
+    fn one_address_pins_the_outer_hop_and_leaves_the_inner_one_to_the_scan() {
+        let chosen = wiw_endpoints_of(&env(&[("AETHER_WIW_PEERS", "162.159.192.1:894")]))
+            .expect("a single hop");
+        assert_eq!(chosen.outer, Some("162.159.192.1:894".parse().unwrap()));
+        assert_eq!(chosen.inner, None);
+    }
+
+    #[test]
+    fn a_hop_named_on_its_own_wins_over_the_pair() {
+        let chosen = wiw_endpoints_of(&env(&[
+            ("AETHER_WIW_PEERS", "162.159.192.1:2408,162.159.195.1:500"),
+            ("AETHER_WIW_INNER_PEER", "188.114.96.1:1701"),
+        ]))
+        .expect("the inner override");
+        assert_eq!(chosen.outer, Some("162.159.192.1:2408".parse().unwrap()));
+        assert_eq!(chosen.inner, Some("188.114.96.1:1701".parse().unwrap()));
+    }
+
+    #[test]
+    fn only_the_inner_hop_may_be_pinned() {
+        let chosen = wiw_endpoints_of(&env(&[("AETHER_WIW_INNER_PEER", "188.114.96.1:2408")]))
+            .expect("the inner hop");
+        assert_eq!(chosen.outer, None);
+        assert_eq!(chosen.inner, Some("188.114.96.1:2408".parse().unwrap()));
+    }
+
+    #[test]
+    fn one_address_cannot_serve_as_both_hops() {
+        let outcome = wiw_endpoints_of(&env(&[
+            ("AETHER_WIW_OUTER_PEER", "162.159.192.1:2408"),
+            ("AETHER_WIW_INNER_PEER", "162.159.192.1:894"),
+        ]));
+
+        let message = outcome
+            .expect_err("the same edge twice is not warp-in-warp")
+            .to_string();
+        assert!(
+            message.contains("162.159.192.1"),
+            "the error should name the address, got: {message}"
+        );
+    }
+
+    #[test]
+    fn asking_for_a_scan_leaves_both_hops_open() {
+        for written in ["auto", "scan", "off", "none", "0"] {
+            let lookup = env(&[("AETHER_WIW_PEERS", written)]);
+            assert!(wiw_scan_requested(&lookup), "{written} means scan");
+            assert!(
+                wiw_endpoints_of(&lookup).expect(written).is_empty(),
+                "{written} should pin nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_set_pins_nothing() {
+        assert!(wiw_endpoints_of(&env(&[])).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn a_malformed_address_is_an_error_rather_than_a_silent_scan() {
+        assert!(wiw_endpoints_of(&env(&[("AETHER_WIW_OUTER_PEER", "162.159.192")])).is_err());
+    }
+
+    #[test]
+    fn a_hop_set_without_a_port_is_an_error_rather_than_a_silent_scan() {
+        assert!(wiw_endpoints_of(&env(&[("AETHER_WIW_OUTER_PEER", "162.159.192.1")])).is_err());
+    }
+
+    #[test]
+    fn the_older_wg_peer_setting_still_names_the_outer_hop() {
+        let chosen = wiw_endpoints_with_fallback(&env(&[("AETHER_WG_PEER", "162.159.192.1:2408")]))
+            .expect("the documented --gool --wg-peer pairing");
+        assert_eq!(chosen.outer, Some("162.159.192.1:2408".parse().unwrap()));
+        assert_eq!(chosen.inner, None);
+    }
+
+    #[test]
+    fn the_generic_peer_setting_is_the_last_fallback() {
+        let chosen = wiw_endpoints_with_fallback(&env(&[("AETHER_PEER", "162.159.192.1:2408")]))
+            .expect("--peer names the outer hop too");
+        assert_eq!(chosen.outer, Some("162.159.192.1:2408".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_hop_chosen_for_warp_in_warp_beats_the_older_setting() {
+        let chosen = wiw_endpoints_with_fallback(&env(&[
+            ("AETHER_WG_PEER", "162.159.192.1:2408"),
+            ("AETHER_WIW_OUTER_PEER", "188.114.96.1:2408"),
+        ]))
+        .expect("the warp-in-warp setting is the specific one");
+        assert_eq!(chosen.outer, Some("188.114.96.1:2408".parse().unwrap()));
+    }
+
+    #[test]
+    fn the_older_setting_may_carry_both_hops_at_once() {
+        let chosen =
+            wiw_endpoints_with_fallback(&env(&[("AETHER_WG_PEER", "162.159.192.1:2408,188.114.96.1:2408")]))
+                .expect("a pair");
+        assert_eq!(chosen.outer, Some("162.159.192.1:2408".parse().unwrap()));
+        assert_eq!(chosen.inner, Some("188.114.96.1:2408".parse().unwrap()));
+    }
+
+    #[test]
+    fn the_older_setting_does_not_overwrite_a_pinned_inner_hop() {
+        let chosen = wiw_endpoints_with_fallback(&env(&[
+            ("AETHER_WG_PEER", "162.159.192.1:2408,188.114.96.1:2408"),
+            ("AETHER_WIW_INNER_PEER", "162.159.195.1:2408"),
+        ]))
+        .expect("the inner hop stays where it was put");
+        assert_eq!(chosen.outer, Some("162.159.192.1:2408".parse().unwrap()));
+        assert_eq!(chosen.inner, Some("162.159.195.1:2408".parse().unwrap()));
     }
 }

@@ -44,7 +44,29 @@ fn open_tun(tun_fd: i32) -> io::Result<AsyncFd<File>> {
     AsyncFd::new(unsafe { File::from_raw_fd(fd) })
 }
 
+fn is_stale_tun_fd(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::Interrupted
+    ) || matches!(error.raw_os_error(), Some(libc::EBADF | libc::ENXIO | libc::ENODEV | libc::EIO))
+}
+
+fn is_droppable_tun_write(error: &io::Error) -> bool {
+    is_stale_tun_fd(error)
+        || error.kind() == io::ErrorKind::WriteZero
+        || error.kind() == io::ErrorKind::InvalidInput
+        || matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EAGAIN))
+}
+
 /// Bridges Android's packet TUN file descriptor with Aether's raw-IP tunnel.
+///
+/// Android replaces the TUN when it promotes the default route. That destroys
+/// the old interface before the new fd is delivered, so a read/write error
+/// must not take the bridge down or MASQUE stays "connected" with no device
+/// traffic.
 #[cfg(unix)]
 pub async fn bridge(
     tun_fd: i32,
@@ -53,6 +75,7 @@ pub async fn bridge(
 ) -> Result<()> {
     let (tx, mut rx) = watch::channel(tun_fd);
     *TUN_FD_TX.lock().unwrap() = Some(tx);
+    let mut current_fd = tun_fd;
     let mut tun = open_tun(tun_fd).map_err(AetherError::Io)?;
     let mut packet = vec![0u8; 65_535];
     let mut rx_total = 0u64;
@@ -63,30 +86,55 @@ pub async fn bridge(
 
     loop {
         tokio::select! {
+            biased;
+
             changed = rx.changed() => {
                 if changed.is_err() {
                     return Ok(());
                 }
                 let fd = *rx.borrow_and_update();
-                if fd >= 0 {
-                    tun = open_tun(fd).map_err(AetherError::Io)?;
+                if fd >= 0 && fd != current_fd {
+                    match open_tun(fd) {
+                        Ok(next) => {
+                            tun = next;
+                            current_fd = fd;
+                        }
+                        Err(error) => {
+                            log::warn!("[-] Android TUN replace failed: {error}");
+                        }
+                    }
                 }
             }
             tunnel_packet = inbound_rx.recv() => match tunnel_packet {
                 Some(packet) => {
                     rx_total += packet.len() as u64;
-                    write_packet(&tun, &packet).await?;
+                    if let Err(error) = write_packet(&tun, &packet).await {
+                        if is_stale_tun_fd(&error) {
+                            log::warn!("[-] Android TUN write missed a route handoff; waiting for the new fd");
+                            continue;
+                        }
+                        if is_droppable_tun_write(&error) {
+                            log::debug!("[-] dropping a TUN packet ({error})");
+                            continue;
+                        }
+                        return Err(AetherError::Io(error));
+                    }
                 },
                 None => return Ok(()),
             },
             read = read_packet(&tun, &mut packet) => {
-                let length = read?;
-                if length == 0 {
-                    return Ok(());
+                match read {
+                    Ok(0) => return Ok(()),
+                    Ok(length) => {
+                        tx_total += length as u64;
+                        outbound_tx.send(packet[..length].to_vec()).await
+                            .map_err(|_| AetherError::Other("tunnel outbound channel closed".into()))?;
+                    }
+                    Err(error) if is_stale_tun_fd(&error) => {
+                        log::warn!("[-] Android TUN fd went stale during route promotion; waiting for replacement");
+                    }
+                    Err(error) => return Err(AetherError::Io(error)),
                 }
-                tx_total += length as u64;
-                outbound_tx.send(packet[..length].to_vec()).await
-                    .map_err(|_| AetherError::Other("tunnel outbound channel closed".into()))?;
             },
         }
 

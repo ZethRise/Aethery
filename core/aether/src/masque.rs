@@ -89,15 +89,25 @@ pub fn decode_ip_datagram(datagram: &[u8], expect_stream_id: u64) -> Result<Opti
 }
 
 pub fn encode_capsule(kind: u64, value: &[u8]) -> Vec<u8> {
-    let cap = varint_len(kind) + varint_len(value.len() as u64) + value.len();
-    let mut out = vec![0u8; cap];
-    {
-        let mut b = OctetsMut::with_slice(&mut out);
-        let _ = b.put_varint(kind);
-        let _ = b.put_varint(value.len() as u64);
-        let _ = b.put_bytes(value);
-    }
+    let mut out = Vec::with_capacity(capsule_len(kind, value));
+    append_capsule(&mut out, kind, value);
     out
+}
+
+fn capsule_len(kind: u64, value: &[u8]) -> usize {
+    varint_len(kind) + varint_len(value.len() as u64) + value.len()
+}
+
+/// Writes a capsule onto the end of `out` instead of into a buffer of its own,
+/// so a caller with several packets in hand can put them all in one frame.
+pub fn append_capsule(out: &mut Vec<u8>, kind: u64, value: &[u8]) {
+    let start = out.len();
+    out.resize(start + capsule_len(kind, value), 0);
+
+    let mut b = OctetsMut::with_slice(&mut out[start..]);
+    let _ = b.put_varint(kind);
+    let _ = b.put_varint(value.len() as u64);
+    let _ = b.put_bytes(value);
 }
 
 pub fn encode_address_request(request_id: u64, ip_version: u8, prefix_len: u8) -> Vec<u8> {
@@ -114,6 +124,10 @@ pub fn encode_address_request(request_id: u64, ip_version: u8, prefix_len: u8) -
 
 pub fn encode_datagram_capsule(ip_packet: &[u8]) -> Vec<u8> {
     encode_capsule(CAPSULE_DATAGRAM, ip_packet)
+}
+
+pub fn append_datagram_capsule(out: &mut Vec<u8>, ip_packet: &[u8]) {
+    append_capsule(out, CAPSULE_DATAGRAM, ip_packet)
 }
 
 pub fn strip_datagram_context(payload: &[u8]) -> Option<Vec<u8>> {
@@ -365,6 +379,35 @@ mod tests {
     fn the_h2_capsule_carries_the_bare_packet_that_the_cloudflare_edge_expects() {
         let packet = ip_packet();
         assert_eq!(capsule_value(&encode_datagram_capsule(&packet)), packet);
+    }
+
+    #[test]
+    fn several_packets_appended_in_a_row_stay_separable() {
+        let first = ip_packet();
+        let mut second = ip_packet();
+        second[19] = 9;
+
+        let mut batch = Vec::new();
+        append_datagram_capsule(&mut batch, &first);
+        append_datagram_capsule(&mut batch, &second);
+
+        assert_eq!(
+            batch,
+            [encode_datagram_capsule(&first), encode_datagram_capsule(&second)].concat(),
+            "appending has to lay the capsules down exactly as encoding each one would"
+        );
+
+        let mut parser = CapsuleParser::new();
+        parser.push(&batch);
+
+        let mut seen = Vec::new();
+        while let Ok(Some(capsule)) = parser.next() {
+            if let Capsule::Datagram(payload) = capsule {
+                seen.push(strip_datagram_context(&payload).expect("an ip packet"));
+            }
+        }
+
+        assert_eq!(seen, vec![first, second], "both packets should come back out");
     }
 
     #[test]

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_panel"
+    android:gravity="center"
+    android:orientation="vertical"
+    android:padding="10dp">
+
+    <ImageView
+        android:id="@+id/connect"
+        android:layout_width="72dp"
+        android:layout_height="72dp"
+        android:contentDescription="@string/widget_connect"
+        android:scaleType="fitCenter" />
+
+    <TextView
+        android:id="@+id/method"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:background="@drawable/widget_chip"
+        android:contentDescription="@string/widget_method"
+        android:fontFamily="sans-serif-medium"
+        android:gravity="center"
+        android:paddingLeft="8dp"
+        android:paddingTop="6dp"
+        android:paddingRight="8dp"
+        android:paddingBottom="6dp"
+        android:text="@string/widget_method_masque"
+        android:textColor="#E8F1EA"
+        android:textSize="12sp" />
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:ellipsize="end"
+        android:fontFamily="sans-serif"
+        android:gravity="center"
+        android:maxLines="1"
+        android:text="@string/vpn_disconnected"
+        android:textColor="#B9C6BB"
+        android:textSize="11sp" />
+</LinearLayout>

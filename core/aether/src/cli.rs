@@ -1,17 +1,35 @@
 use std::env;
 
 const USAGE: &str = "\
-Usage: aether [OPTIONS]
+Aether — a censorship circumvention client. It finds a way out of a filtered
+network, opens an encrypted tunnel, and serves it as a local SOCKS5 proxy.
+
+Usage:
+  aether [OPTIONS]
+  aether help              show this text
+
+Run it with no options and it asks for what it needs: protocol, scan mode, IP
+version. Every question has a flag, and every flag has an environment variable
+of its own. Setting either one is what stops the question being asked, and a
+flag beats a variable.
+
+  aether                                   answer the questions as they come
+  aether --masque --turbo -4               nothing asked, straight to work
+  aether --wg --thorough --noize gfw       classic wireguard on a strict network
+  aether --gool --wiw-outer 162.159.192.1:2408 --wiw-inner 188.114.96.1:2408
 
 Connection:
   --bind <addr>            local SOCKS5 listen address (default 127.0.0.1:1819)
   --http-proxy <addr>      also expose an HTTP CONNECT proxy on this address
                            (off by default, e.g. 127.0.0.1:1820)
+  --upstream <url>         dial out through a proxy already running here, e.g.
+                           socks5://127.0.0.1:1080 or http://user:pass@host:8080
   --quick-reconnect        auto-accept reconnecting with the last known working gateway
   --no-quick-reconnect     always scan fresh, ignore any saved last-connection gateway
   -4                       scan/connect over IPv4 only (default)
   -6                       scan/connect over IPv6 only
   --dual                   scan/connect over both IPv4 and IPv6
+  --ip <v4|v6|both>        the same choice written out
   --peer <ip:port>         force a MASQUE/WireGuard peer, skip scanning
   --wg-peer <ip:port>      force a WireGuard peer (warp-in-warp outer), skip scanning
 
@@ -20,17 +38,36 @@ Protocol:
   --wg, --wireguard, --warp
                            use classic WireGuard
   --gool, --wiw            use WARP-in-WARP (wireguard tunneled in wireguard)
+  --protocol <name>        masque | wg | gool
+
+WARP-in-WARP endpoints:
+  Both hops are found by the scan unless you name them here. The port is
+  required: which port gets through is exactly what differs between networks,
+  so none is assumed for you. Name one hop and the scan finds the other,
+  keeping your address out of the sweep. The two hops must be different
+  addresses, and naming one selects warp-in-warp on its own, so --gool
+  alongside is optional.
+  --wiw-outer <ip:port>    the outer hop, the one your network sees
+  --wiw-inner <ip:port>    the inner hop, reached through the outer one
+  --wiw-peers <out[,in]>   both hops in one value, or only the outer one
+  --wiw-scan               scan for both, ignoring any endpoint left in the
+                           environment
 
 Scan mode:
-  --scan <mode>            turbo | balanced | thorough | stealth
-  --turbo                  shortcut for --scan turbo
-  --balanced               shortcut for --scan balanced
-  --thorough               shortcut for --scan thorough
-  --stealth                shortcut for --scan stealth
-  --ironclad               shortcut for --scan ironclad (real tunnel + real HTTP check per candidate)
+  --scan <mode>            turbo | balanced | thorough | stealth | ironclad
+  --turbo                  stop at the first candidate that answers
+  --balanced               default: collect a few, keep the fastest
+  --thorough               sweep whole ranges, for when everything looks blocked
+  --stealth                few probes in flight, for networks that notice scanning
+  --ironclad               open a real tunnel and make a real HTTP request per
+                           candidate, so a gateway is only trusted once it has
+                           genuinely carried traffic
 
 Obfuscation:
-  --noize <profile>        obfuscation profile (off, light/firewall, balanced, gfw/aggressive, ...)
+  --noize <profile>        off | light | firewall | balanced | gfw | aggressive
+                           firewall is the default for MASQUE, balanced for
+                           WireGuard and gool; reach for gfw when the default
+                           does not get through
 
 MASQUE transport:
   --h2, --http2            use HTTP/2 (TCP) instead of HTTP/3 (QUIC)
@@ -81,6 +118,8 @@ Config files:
   --config <path>          base identity config path (default aether.toml)
   --wg-config <path>       identity config path for WireGuard
   --masque-config <path>   identity config path for MASQUE
+                           warp-in-warp adds a second identity of its own beside
+                           the wireguard one, named <config>-secondary.toml
 
 Advanced:
   --tls-groups <list>      TLS key share groups, e.g. \"P-256:X25519:P-384\"
@@ -93,7 +132,83 @@ Advanced:
   --verbose                shortcut for --log-level debug (RUST_LOG overrides both)
 
   -v, --version            show version and exit
-  -h, --help               show this help and exit
+  -h, --help, help         show this help and exit
+
+Environment variables:
+  Every flag above has one, for scripts and services. The last few have no flag
+  of their own.
+
+  AETHER_SOCKS                     --bind
+  AETHER_HTTP_PROXY                --http-proxy
+  AETHER_UPSTREAM                  --upstream
+  AETHER_QUICK_RECONNECT           1 or 0, for --quick-reconnect
+  AETHER_IP                        --ip: v4, v6 or both
+  AETHER_PEER                      --peer
+  AETHER_WG_PEER                   --wg-peer
+  AETHER_PROTOCOL                  --protocol: masque, wg or gool
+  AETHER_WIW_OUTER_PEER            --wiw-outer
+  AETHER_WIW_INNER_PEER            --wiw-inner
+  AETHER_WIW_PEERS                 --wiw-peers, or auto for --wiw-scan
+  AETHER_SCAN                      --scan
+  AETHER_NOIZE                     --noize
+  AETHER_MASQUE_HTTP2              --h2
+  AETHER_MASQUE_H2_PEER            --h2-peer
+  AETHER_ECH                       --ech
+  AETHER_MASQUE_NO_DATA_CHECK      --no-data-check, MASQUE side
+  AETHER_WG_NO_DATA_CHECK          --no-data-check, WireGuard side
+  AETHER_MASQUE_VALIDATE_SECS      --validate-secs, MASQUE side
+  AETHER_WG_VALIDATE_SECS          --validate-secs, WireGuard side
+  AETHER_MASQUE_STARTUP_SECS       --startup-secs
+  AETHER_MASQUE_RECONNECT_SECS     --reconnect-secs, MASQUE side
+  AETHER_WG_RECONNECT_SECS         --reconnect-secs, WireGuard side
+  AETHER_DNS                       --dns
+  AETHER_MASQUE_H2_FRAGMENT        --fragment
+  AETHER_MASQUE_H2_FRAGMENT_SIZE   --fragment-size
+  AETHER_MASQUE_H2_FRAGMENT_DELAY  --fragment-delay
+  AETHER_WG_KEEPALIVE              --keepalive
+  AETHER_WG_NO_PROFILE_RETRY       --no-profile-retry
+  AETHER_TEAM                      --team
+  AETHER_ACCESS_CLIENT_ID          --access-id
+  AETHER_ACCESS_CLIENT_SECRET      --access-secret
+  AETHER_ACCESS_TOKEN              --access-token
+  AETHER_ACCESS_EMAIL              --access-email
+  AETHER_GATEWAY                   --gateway
+  AETHER_ROUTE_BLOCK               --route-block
+  AETHER_ROUTE_DIRECT              --route-direct
+  AETHER_ROUTES_FILE               --routes
+  AETHER_CONFIG                    --config
+  AETHER_WG_CONFIG                 --wg-config
+  AETHER_MASQUE_CONFIG             --masque-config
+  AETHER_TLS_GROUPS                --tls-groups
+  AETHER_PERF_PROFILE              --perf
+  AETHER_LOG_LEVEL                 --log-level
+
+  AETHER_ROUTE_SNIFF               0 to stop reading the server name from the
+                                   first bytes of a connection (on by default,
+                                   which is what makes routing rules work behind
+                                   a tun front end)
+  AETHER_ROUTE_SNIFF_MS            how long to wait for those bytes (default 400)
+  AETHER_WG_ENDPOINT_COOLDOWN_SECS how long an endpoint that failed twice is left
+                                   out of rescans (default 300)
+  AETHER_WG_STALE_SECS             silence on a wireguard tunnel before it counts
+                                   as dead (default 10)
+  AETHER_MASQUE_H2_KEEPALIVE_SECS  HTTP/2 keepalive interval (default 15)
+  AETHER_MASQUE_H2_KEEPALIVE_TIMEOUT_SECS
+                                   how long a keepalive may go unanswered (default 20)
+  AETHER_IRONCLAD_PORT             port the ironclad scan makes its real HTTP
+                                   request to (default 80)
+  AETHER_REPROVISION               0 to stop replacing an identity Cloudflare has
+                                   refused with a freshly registered one
+  RUST_LOG                         standard rust log filter; overrides --log-level
+
+After startup the proxy is at the address --bind names, 127.0.0.1:1819 by
+default. Check it with:
+
+  curl -x socks5h://127.0.0.1:1819 https://www.cloudflare.com/cdn-cgi/trace
+
+The reply should show a Cloudflare colo and warp=on. The proxy has no
+authentication, so bind it to 0.0.0.0 only when you mean to share the tunnel
+with your network.
 ";
 
 pub fn parse_and_apply() -> crate::error::Result<()> {
@@ -121,7 +236,7 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<()> {
                 std::process::exit(0);
             }
 
-            "-h" | "--help" => {
+            "-h" | "--help" | "help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
             }
@@ -139,6 +254,15 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<()> {
 
             "--peer" => set("AETHER_PEER", next_value!()),
             "--wg-peer" => set("AETHER_WG_PEER", next_value!()),
+
+            "--wiw-outer" | "--gool-outer" | "--outer-peer" => {
+                set("AETHER_WIW_OUTER_PEER", next_value!())
+            }
+            "--wiw-inner" | "--gool-inner" | "--inner-peer" => {
+                set("AETHER_WIW_INNER_PEER", next_value!())
+            }
+            "--wiw-peers" | "--gool-peers" => set("AETHER_WIW_PEERS", next_value!()),
+            "--wiw-scan" | "--gool-scan" => set("AETHER_WIW_PEERS", "auto"),
 
             "--masque" => set("AETHER_PROTOCOL", "masque"),
             "--wg" | "--wireguard" | "--warp" => set("AETHER_PROTOCOL", "wg"),

@@ -1,4 +1,4 @@
-FROM rust:1.88 AS builder
+FROM rust:1.91 AS builder
 
 RUN apt-get update && \
     apt-get install -y \

@@ -65,22 +65,26 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
             ACTION_CONNECT -> {
                 getSharedPreferences("settings", MODE_PRIVATE).edit().putBoolean(TUNNEL_WANTED, true).apply()
                 val vpnMode = intent.getBooleanExtra(EXTRA_VPN_MODE, storedVpnModeFromPrefs())
-                startTunnel(CoreConfig.json(this), vpnMode)
+                startTunnel(configFromIntent(intent), vpnMode)
             }
             ACTION_DISCONNECT -> stopTunnel()
             ACTION_RECONNECT -> {
                 ConnectionLog.record("Quick reconnect requested")
                 getSharedPreferences("settings", MODE_PRIVATE).edit().putBoolean(TUNNEL_WANTED, true).apply()
+                rememberProtocol(intent)
                 if (connected.get()) {
                     reconnectRequested.set(true)
                     stopRequested.set(true)
                     NativeCore.stop()
                 } else {
-                    startTunnel(CoreConfig.json(this), storedVpnModeFromPrefs())
+                    startTunnel(configFromIntent(intent), storedVpnModeFromPrefs())
                 }
             }
             ACTION_NOTIFICATION_HEALTH -> {
-                intent.getStringExtra(EXTRA_NOTIFICATION_IP)?.let { currentVpnIp = it }
+                intent.getStringExtra(EXTRA_NOTIFICATION_IP)?.let {
+                    currentVpnIp = it
+                    AetherWidget.recordIp(this, it)
+                }
                 intent.getStringExtra(EXTRA_NOTIFICATION_PING)?.let { currentPing = it }
                 getSystemService(NotificationManager::class.java)
                     .notify(NOTIFICATION_ID, notification(currentTx, currentRx))
@@ -112,7 +116,12 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                 "status" -> {
                     val status = event.getString("status")
                     val detail = if (event.isNull("detail")) null else event.getString("detail")
-                    if (status == STATUS_CONNECTED) promoteVpnRoutes()
+                    if (status == STATUS_CONNECTED) {
+                        pendingAddresses?.ipv4?.substringBefore('/')?.trim()
+                            ?.takeIf { it.isNotEmpty() }
+                            ?.let { currentVpnIp = it }
+                        promoteVpnRoutes()
+                    }
                     sendStatus(status, detail)
                 }
                 "traffic" -> {
@@ -247,6 +256,20 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
     private fun storedVpnModeFromPrefs(): Boolean =
         getSharedPreferences("settings", MODE_PRIVATE).getString("connection_type", "VPN") != "PROXY"
 
+    private fun rememberProtocol(intent: Intent?) {
+        val protocol = intent?.getStringExtra(EXTRA_PROTOCOL)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            ?: return
+        getSharedPreferences("settings", MODE_PRIVATE)
+            .edit()
+            .putString("default_protocol", protocol)
+            .commit()
+    }
+
+    private fun configFromIntent(intent: Intent?): String {
+        rememberProtocol(intent)
+        return CoreConfig.json(this, intent?.getStringExtra(EXTRA_PROTOCOL)?.trim()?.takeIf { it.isNotEmpty() })
+    }
+
     private fun vpnBuilder(
         addresses: NativeCore.TunnelAddresses,
         config: String,
@@ -309,11 +332,23 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         sendBroadcast(Intent(ACTION_STATUS)
             .setPackage(packageName)
             .putExtra(EXTRA_STATUS, status)
-            .apply { detail?.let { putExtra(EXTRA_DETAIL, it) } })
+            .apply {
+                detail?.let { putExtra(EXTRA_DETAIL, it) }
+                if (status == STATUS_CONNECTED && currentVpnIp.isNotBlank()) {
+                    putExtra(EXTRA_VPN_IP, currentVpnIp)
+                }
+                putExtra(EXTRA_PROTOCOL, currentProtocol)
+            })
         TileService.requestListeningState(
             this,
             ComponentName(this, AetherTileService::class.java),
         )
+        AetherWidget.recordStatus(this, status)
+        if (status == STATUS_CONNECTED && currentVpnIp.isNotBlank()) {
+            AetherWidget.recordIp(this, currentVpnIp, AetherWidget.currentCountry(this))
+            AetherWidget.lookupPublicIp(this)
+        }
+        AetherWidget.refreshAll(this)
     }
 
     private fun updateTrafficNotification(tx: Long, rx: Long) {
@@ -336,6 +371,8 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         accountedTx = tx
         accountedRx = rx
         sendTraffic(tx, rx, monthTx, monthRx)
+        AetherWidget.recordSpeed(this, currentSpeedTx, currentSpeedRx)
+        AetherWidget.refreshAll(this)
 
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID, notification(tx, rx))
@@ -659,6 +696,8 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         const val EXTRA_TRAFFIC_MONTH_RX = "traffic_month_rx"
         const val EXTRA_NOTIFICATION_IP = "notification_ip"
         const val EXTRA_NOTIFICATION_PING = "notification_ping"
+        const val EXTRA_VPN_IP = "vpn_ip"
+        const val EXTRA_PROTOCOL = "protocol"
         private const val TUNNEL_WANTED = "tunnel_wanted"
         const val STATUS_CONNECTING = "connecting"
         const val STATUS_STARTING = "starting"

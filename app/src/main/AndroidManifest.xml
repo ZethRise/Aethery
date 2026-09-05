@@ -58,6 +58,40 @@
             </intent-filter>
         </service>
 
+        <receiver
+            android:name=".AetherWidget$ConnectProvider"
+            android:exported="true"
+            android:label="@string/widget_connect_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_connect_info" />
+        </receiver>
+        <receiver
+            android:name=".AetherWidget$MethodProvider"
+            android:exported="true"
+            android:label="@string/widget_method_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_method_info" />
+        </receiver>
+        <receiver
+            android:name=".AetherWidget$ConsoleProvider"
+            android:exported="true"
+            android:label="@string/widget_console_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_console_info" />
+        </receiver>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

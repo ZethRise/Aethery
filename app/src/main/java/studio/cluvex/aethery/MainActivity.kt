@@ -7,6 +7,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Canvas
@@ -100,6 +101,8 @@ class MainActivity : Activity() {
     private var splitTunnelDraftPackages: MutableSet<String>? = null
     private var headerLogo: ImageView? = null
     private var themePage: View? = null
+    private var widgetControlPage: View? = null
+    private var widgetTransportPage: View? = null
     private var trafficMonitorPage: View? = null
     private var trafficSpeedValue: TextView? = null
     private var trafficSessionValue: TextView? = null
@@ -114,6 +117,7 @@ class MainActivity : Activity() {
     private var latencyRequest = 0
     @Volatile private var pingInFlight = false
     private var ipRequest = 0
+    private var assignedVpnIp = ""
     @Volatile private var ipRefreshInFlight = false
     @Volatile private var ipRefreshPending = false
     private var ipRefreshAnimator: ValueAnimator? = null
@@ -154,11 +158,19 @@ class MainActivity : Activity() {
                 renderTrafficMonitor()
                 return
             }
+            intent.getStringExtra(AetherVpnService.EXTRA_PROTOCOL)?.let(::applyProtocolName)
+            syncSessionFromPrefs()
             when (intent.getStringExtra(AetherVpnService.EXTRA_STATUS)) {
                 AetherVpnService.STATUS_CONNECTING -> showConnecting(intent.getStringExtra(AetherVpnService.EXTRA_DETAIL))
                 AetherVpnService.STATUS_STARTING -> showStarting()
                 AetherVpnService.STATUS_SCANNING -> showScanning()
-                AetherVpnService.STATUS_CONNECTED -> showConnected()
+                AetherVpnService.STATUS_CONNECTED -> {
+                    intent.getStringExtra(AetherVpnService.EXTRA_VPN_IP)
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                        ?.let { assignedVpnIp = it }
+                    showConnected()
+                }
                 AetherVpnService.STATUS_FAILED -> showFailure(intent.getStringExtra(AetherVpnService.EXTRA_DETAIL))
                 AetherVpnService.STATUS_DISCONNECTED -> showDisconnected()
             }
@@ -253,6 +265,7 @@ class MainActivity : Activity() {
         refreshPublicIp()
         if (intent?.getBooleanExtra(EXTRA_START_CONNECT, false) == true) {
             intent.removeExtra(EXTRA_START_CONNECT)
+            syncSessionFromPrefs()
             if (!NativeCore.isRunning() && !isTunnelActive()) toggleTunnel()
         }
     }
@@ -267,9 +280,12 @@ class MainActivity : Activity() {
             registerReceiver(statusReceiver, filter)
         }
         receiverRegistered = true
+        preferences().registerOnSharedPreferenceChangeListener(prefListener)
+        syncSessionFromPrefs()
         connectionControl.resumeAnimation()
         statusHandler.removeCallbacks(statusPoll)
         statusPoll.run()
+        AetherWidget.refreshAll(this)
     }
 
     override fun onStop() {
@@ -279,6 +295,7 @@ class MainActivity : Activity() {
             unregisterReceiver(statusReceiver)
             receiverRegistered = false
         }
+        preferences().unregisterOnSharedPreferenceChangeListener(prefListener)
         super.onStop()
     }
 
@@ -297,7 +314,13 @@ class MainActivity : Activity() {
             recreate()
             return
         }
+        syncSessionFromPrefs()
         renderStatus()
+        if (NativeCore.isReady() || isTunnelActive()) {
+            if (assignedVpnIp.isBlank()) assignedVpnIp = AetherWidget.currentIp(this)
+            refreshPublicIp()
+        }
+        AetherWidget.refreshAll(this)
         appUpdater.resumeInstallIfPermitted()
     }
 
@@ -508,14 +531,11 @@ class MainActivity : Activity() {
         val request = ++ipRequest
         startIpRefreshAnimation()
         ipAddressLabel.text = if (isTunnelActive()) "VPN IP" else "PUBLIC IP"
-        ipAddressValue.text = "Checking…"
+        val knownIp = assignedVpnIp.takeIf { isTunnelActive() && it.isNotBlank() }
+        ipAddressValue.text = knownIp ?: "Checking…"
         Thread {
             val result = runCatching {
-                repeat(IP_FETCH_ATTEMPTS) { attempt ->
-                    runCatching { fetchPublicIp() }.getOrNull()?.let { return@runCatching it }
-                    if (attempt + 1 < IP_FETCH_ATTEMPTS) Thread.sleep(IP_RETRY_DELAY_MS)
-                }
-                error("IP unavailable")
+                fetchPublicIp()
             }
             runOnUiThread {
                 ipRefreshInFlight = false
@@ -532,10 +552,14 @@ class MainActivity : Activity() {
                     isTunnelActive() -> "VPN IP"
                     else -> "PUBLIC IP"
                 }
-                val flag = countryFlag(country)
+                val flag = AetherWidget.countryFlag(country)
                 ipAddressValue.text = listOf(flag, ip).filter(String::isNotBlank).joinToString(" ")
                 ipAddressCard.contentDescription = "${ipAddressLabel.text}: ${ipAddressValue.text}"
-                if (isTunnelActive() && ip != "IP unavailable") updateNotificationHealth(ip = ip)
+                if (isTunnelActive() && ip != "IP unavailable") {
+                    assignedVpnIp = ip
+                    updateNotificationHealth(ip = ip)
+                    AetherWidget.recordIp(this, ip, country)
+                }
                 ipAddressValue.alpha = 0f
                 ipAddressValue.translationY = dp(4).toFloat()
                 ipAddressValue.animate().alpha(1f).translationY(0f)
@@ -553,6 +577,7 @@ class MainActivity : Activity() {
                     connection.connectTimeout = IP_TIMEOUT_MS
                     connection.readTimeout = IP_TIMEOUT_MS
                     connection.requestMethod = "GET"
+                    connection.instanceFollowRedirects = false
                     check(connection.responseCode in 200..399) { "HTTP ${connection.responseCode}" }
                     val body = connection.inputStream.bufferedReader().use { it.readText().trim() }
                     val values = body.lineSequence().mapNotNull { line -> line.split('=', limit = 2).let { pair ->
@@ -568,6 +593,7 @@ class MainActivity : Activity() {
                 failure = error
             }
         }
+        assignedVpnIp.takeIf { it.isNotBlank() }?.let { return it to "" }
         throw failure ?: IllegalStateException("IP unavailable")
     }
 
@@ -597,11 +623,6 @@ class MainActivity : Activity() {
         ipAddressCard.alpha = 1f
         ipAddressCard.scaleX = 1f
         ipAddressCard.scaleY = 1f
-    }
-
-    private fun countryFlag(country: String): String {
-        if (country.length != 2 || country.any { !it.isLetter() }) return ""
-        return country.uppercase().map { char -> String(Character.toChars(0x1F1E6 + char.code - 'A'.code)) }.joinToString("")
     }
 
     private fun openTunnelConnection(url: String): HttpURLConnection =
@@ -1488,6 +1509,14 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             dp(52),
         ).apply { topMargin = dp(10) })
+        content.addView(label("HOME SCREEN", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(24) })
+        content.addView(createSettingsButton("Widget control ›") { openWidgetControlScreen() }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(52),
+        ).apply { topMargin = dp(10) })
         content.addView(label("CONNECTION ADVANCED", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1613,6 +1642,7 @@ class MainActivity : Activity() {
                 h2FallbackButton,
                 "HTTP/3 → HTTP/2 fallback · ${if (h3H2Fallback()) "On" else "Off"}",
             )
+            AetherWidget.refreshAll(this)
         }
         addControl("TLS fragmentation · ${if (h2Fragmentation() == H2Fragmentation.ON) "On" else "Off"} ›") {
             chooseH2Fragmentation()
@@ -1754,6 +1784,21 @@ class MainActivity : Activity() {
         description = { it.description },
     ) { chosen ->
         preferences().edit().putString(H2_FRAGMENTATION, chosen.coreName).apply()
+    }
+
+    private fun chooseMasqueTransport() = showChoiceSheet(
+        title = "HTTP/3 & HTTP/2",
+        subtitle = "MASQUE transport for the 3×4 widget and the next connection",
+        options = MasqueTransport.entries.toList(),
+        selected = defaultMasqueTransport(),
+        label = { it.label },
+        description = { it.description },
+    ) { chosen ->
+        preferences().edit().putString(DEFAULT_MASQUE_TRANSPORT, chosen.coreName).apply()
+        AetherWidget.refreshAll(this)
+        scanValue.text = scanSummary()
+        closeWidgetTransportScreen()
+        openWidgetTransportScreen()
     }
 
     private fun chooseLogLevel() = showChoiceSheet(
@@ -2214,6 +2259,169 @@ class MainActivity : Activity() {
         settingsPage?.let { animatePageClose(it) { settingsPage = null } }
     }
 
+    private fun openWidgetControlScreen() {
+        widgetControlPage?.let(pageHost::removeView)
+        val page = FrameLayout(this).apply {
+            setBackgroundColor(CANVAS)
+            isClickable = true
+        }
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(16), dp(24), dp(24))
+        }
+        content.addView(LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(createHeaderBackButton { closeWidgetControlScreen() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(label("Widget control", 22f, INK, TypefaceStyle.MEDIUM).apply { setPadding(dp(4), 0, 0, 0) })
+        })
+        content.addView(label("Add Aethery to the home screen. The controls use the same circle, type, and colours as the app.", 14f, MUTED), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { leftMargin = dp(4); bottomMargin = dp(20) })
+
+        content.addView(widgetCard(
+            size = "1×1",
+            title = "Connect",
+            detail = "Only the circular control. Tap to connect or disconnect.",
+            kind = AetherWidget.Kind.CONNECT,
+        ))
+        content.addView(widgetCard(
+            size = "2×2",
+            title = "Connect + method",
+            detail = "The control plus the current method. Tap the method to cycle MASQUE, WireGuard, and WARP-on-WARP.",
+            kind = AetherWidget.Kind.METHOD,
+        ))
+        content.addView(widgetCard(
+            size = "3×4",
+            title = "Console",
+            detail = "Connect, method, live speed, and HTTP/3 / HTTP/2. Fallback is the same setting as Tunnel controls.",
+            kind = AetherWidget.Kind.CONSOLE,
+        ))
+
+        content.addView(label("HTTP/3 AND HTTP/2", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(16) })
+        content.addView(createSettingsButton("HTTP/3 & HTTP/2 ›") { openWidgetTransportScreen() }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(52),
+        ).apply { topMargin = dp(10) })
+
+        scroll.addView(content)
+        page.addView(scroll)
+        page.setOnApplyWindowInsetsListener { _, insets ->
+            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
+            insets
+        }
+        widgetControlPage = page
+        pageHost.addView(page)
+        page.requestApplyInsets()
+        animatePageOpen(page)
+    }
+
+    private fun widgetCard(
+        size: String,
+        title: String,
+        detail: String,
+        kind: AetherWidget.Kind,
+    ): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(18), dp(16), dp(18), dp(16))
+        background = roundedBackground(SURFACE_VARIANT, 20, DIVIDER)
+        val mark = ImageView(this@MainActivity).apply {
+            setImageBitmap(
+                AetherWidget.connectMark(
+                    dp(64),
+                    if (NativeCore.isReady()) AetherWidget.State.CONNECTED else AetherWidget.State.DISCONNECTED,
+                    palette,
+                ),
+            )
+            contentDescription = title
+        }
+        addView(LinearLayout(this@MainActivity).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(mark, LinearLayout.LayoutParams(dp(64), dp(64)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(label(size, 12f, MUTED, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.1f })
+                addView(label(title, 16f, INK, TypefaceStyle.MEDIUM), LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(2) })
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(12) })
+        })
+        addView(label(detail, 13f, MUTED), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(10) })
+        addView(createSettingsButton("Add to home screen") { AetherWidget.pin(this@MainActivity, kind) }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(48),
+        ).apply { topMargin = dp(12) })
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(12) }
+    }
+
+    private fun closeWidgetControlScreen() {
+        widgetControlPage?.let { animatePageClose(it) { widgetControlPage = null } }
+    }
+
+    private fun openWidgetTransportScreen() {
+        widgetTransportPage?.let(pageHost::removeView)
+        val page = FrameLayout(this).apply {
+            setBackgroundColor(CANVAS)
+            isClickable = true
+        }
+        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(16), dp(24), dp(24))
+        }
+        content.addView(LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(createHeaderBackButton { closeWidgetTransportScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
+            addView(label("HTTP/3 & HTTP/2", 22f, INK, TypefaceStyle.MEDIUM))
+        })
+        content.addView(label("Used by the 3×4 widget and the next MASQUE connection.", 14f, MUTED), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(24) })
+        content.addView(label("MASQUE", 12f, MUTED).apply { letterSpacing = 0.1f })
+        content.addView(createSettingsButton("Transport · ${defaultMasqueTransport().label} ›") {
+            chooseMasqueTransport()
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(56),
+        ).apply { topMargin = dp(10) })
+        lateinit var fallbackButton: TextView
+        fallbackButton = createSettingsButton("HTTP/3 → HTTP/2 fallback · ${if (h3H2Fallback()) "On" else "Off"}") {
+            preferences().edit().putBoolean(H3_H2_FALLBACK, !h3H2Fallback()).apply()
+            fallbackButton.text = "HTTP/3 → HTTP/2 fallback · ${if (h3H2Fallback()) "On" else "Off"}"
+            AetherWidget.refreshAll(this)
+        }
+        content.addView(fallbackButton, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(56),
+        ).apply { topMargin = dp(10) })
+        scroll.addView(content)
+        page.addView(scroll)
+        page.setOnApplyWindowInsetsListener { _, insets ->
+            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
+            insets
+        }
+        widgetTransportPage = page
+        pageHost.addView(page)
+        page.requestApplyInsets()
+        animatePageOpen(page)
+    }
+
+    private fun closeWidgetTransportScreen() {
+        widgetTransportPage?.let { animatePageClose(it) { widgetTransportPage = null } }
+    }
+
     private fun openTrafficMonitorScreen() {
         trafficMonitorPage?.let(pageHost::removeView)
         val page = FrameLayout(this).apply {
@@ -2670,6 +2878,8 @@ class MainActivity : Activity() {
             splitTunnelAppsPage != null -> closeSplitTunnelAppsScreen()
             splitTunnelPage != null -> closeSplitTunnelScreen()
             themePage != null -> closeThemeScreen()
+            widgetTransportPage != null -> closeWidgetTransportScreen()
+            widgetControlPage != null -> closeWidgetControlScreen()
             trafficMonitorPage != null -> closeTrafficMonitorScreen()
             zeroTrustPage != null -> closeZeroTrustScreen()
             tunnelControlsPage != null -> closeTunnelControlsScreen()
@@ -2685,7 +2895,7 @@ class MainActivity : Activity() {
     private fun updateConnectionMode(protocol: Protocol) {
         if (selectedProtocol == protocol) return
         selectedProtocol = protocol
-        preferences().edit().putString(DEFAULT_PROTOCOL, protocol.coreName).apply()
+        preferences().edit().putString(DEFAULT_PROTOCOL, protocol.coreName).commit()
         modeSelector.contentDescription = "Connection mode, ${protocol.label}"
         scanValue.text = scanSummary()
         scannerSelector.contentDescription = "Scanner options, ${scanSummary()}"
@@ -2701,6 +2911,7 @@ class MainActivity : Activity() {
                     .start()
             }
             .start()
+        AetherWidget.refreshAll(this)
     }
 
     private fun toggleTunnel() {
@@ -2731,7 +2942,7 @@ class MainActivity : Activity() {
             .putExtra(AetherVpnService.EXTRA_VPN_MODE, connectionType() == ConnectionType.VPN))
     }
 
-    private fun configJson(): String = CoreConfig.json(this, selectedProtocol.coreName)
+    private fun configJson(): String = CoreConfig.json(this, savedProtocol().coreName)
 
     private fun renderStatus() {
         if (userDisconnecting) {
@@ -2785,8 +2996,9 @@ class MainActivity : Activity() {
         connectionDetail.text = if (restored) "${selectedProtocol.label} tunnel recovered" else "${selectedProtocol.label} tunnel is active"
         if (!restored) {
             latencyGraph.setLabel("Tap to ping")
-            refreshPublicIp()
         }
+        if (assignedVpnIp.isBlank()) assignedVpnIp = AetherWidget.currentIp(this)
+        refreshPublicIp()
         setModeEnabled(false)
     }
 
@@ -2801,6 +3013,7 @@ class MainActivity : Activity() {
     }
 
     private fun showFailure(detail: String? = null) {
+        assignedVpnIp = ""
         latencyRequest++
         pingInFlight = false
         latencyGraph.reset()
@@ -2813,6 +3026,7 @@ class MainActivity : Activity() {
     }
 
     private fun showDisconnected(detail: String = "Tap the circle to connect") {
+        assignedVpnIp = ""
         latencyRequest++
         pingInFlight = false
         latencyGraph.reset()
@@ -3034,7 +3248,51 @@ class MainActivity : Activity() {
 
     private fun savedProtocol(): Protocol {
         val name = preferences().getString(DEFAULT_PROTOCOL, Protocol.MASQUE.coreName)
-        return Protocol.entries.firstOrNull { it.coreName == name && it.androidAvailable } ?: Protocol.MASQUE
+        return protocolFromName(name)
+    }
+
+    private fun protocolFromName(name: String?): Protocol {
+        val key = name?.trim()?.lowercase().orEmpty()
+        return Protocol.entries.firstOrNull {
+            it.androidAvailable && (
+                it.coreName == key ||
+                    it.name.lowercase() == key ||
+                    it.label.lowercase() == key
+                )
+        } ?: Protocol.MASQUE
+    }
+
+    private fun applyProtocolName(name: String) {
+        val protocol = protocolFromName(name)
+        if (protocol.coreName != preferences().getString(DEFAULT_PROTOCOL, null)) {
+            preferences().edit().putString(DEFAULT_PROTOCOL, protocol.coreName).commit()
+        }
+        if (selectedProtocol != protocol) {
+            selectedProtocol = protocol
+            if (::modeValue.isInitialized) {
+                modeValue.text = protocol.label
+                modeSelector.contentDescription = "Connection mode, ${protocol.label}"
+            }
+            if (::scanValue.isInitialized) scanValue.text = scanSummary()
+        }
+    }
+
+    private fun syncSessionFromPrefs() {
+        if (!::modeValue.isInitialized) return
+        val protocol = savedProtocol()
+        if (selectedProtocol != protocol) {
+            selectedProtocol = protocol
+            modeValue.text = protocol.label
+            modeSelector.contentDescription = "Connection mode, ${protocol.label}"
+        }
+        scanValue.text = scanSummary()
+        AetherWidget.refreshAll(this)
+    }
+
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == DEFAULT_PROTOCOL || key == DEFAULT_MASQUE_TRANSPORT || key == H3_H2_FALLBACK) {
+            runOnUiThread { syncSessionFromPrefs() }
+        }
     }
 
     private fun openThemeScreen() {
@@ -3074,6 +3332,7 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     if (theme != current) {
                         AppAppearance.save(this@MainActivity, theme)
+                        AetherWidget.refreshAll(this@MainActivity)
                         recreate()
                     } else {
                         closeThemeScreen()
@@ -3377,19 +3636,16 @@ class MainActivity : Activity() {
         const val STATUS_POLL_MS = 5_000L
         const val PAGE_ANIMATION_MS = 220L
         const val LOG_CLOSE_ANIMATION_MS = 160L
-        const val PING_URL = "https://www.google.com/generate_204"
-        const val PING_TIMEOUT_MS = 5_000
+        const val PING_URL = "https://1.1.1.1/cdn-cgi/trace"
+        const val PING_TIMEOUT_MS = 3_000
         val IP_INFO_URLS = arrayOf(
-            "https://www.cloudflare.com/cdn-cgi/trace",
-            "https://one.one.one.one/cdn-cgi/trace",
             "https://1.1.1.1/cdn-cgi/trace",
-            "https://api64.ipify.org",
+            "https://1.0.0.1/cdn-cgi/trace",
+            "https://www.cloudflare.com/cdn-cgi/trace",
             "https://api.ipify.org",
         )
         val IP_ADDRESS = Regex("^[0-9A-Fa-f:.]+$")
-        const val IP_TIMEOUT_MS = 5_000
-        const val IP_FETCH_ATTEMPTS = 3
-        const val IP_RETRY_DELAY_MS = 300L
+        const val IP_TIMEOUT_MS = 2_000
         const val SETTINGS = "settings"
         const val CONNECTION_TYPE = "connection_type"
         const val DEFAULT_SCAN = "default_scan"

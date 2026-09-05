@@ -24,12 +24,14 @@ The flag syntax looks like this:
 ./aether --gool --wg-peer 162.159.192.1:2408 --dual
 ```
 
-Run `./aether --help` to see the full list. The most common ones:
+Run `./aether help` (or `--help`) to see the full list — every flag, every environment variable, and what each one does. The most common ones:
 
 ```
 --bind <addr>            local SOCKS5 listen address (default 127.0.0.1:1819)
 -4 / -6 / --dual          scan IPv4 only / IPv6 only / both
 --peer <ip:port>          force a peer and skip scanning
+--wiw-outer <ip:port>     force the outer gool hop (the one your network sees)
+--wiw-inner <ip:port>     force the inner gool hop (reached through the outer)
 --masque / --wg / --gool  choose the transport
 --scan <mode>             turbo | balanced | thorough | stealth | ironclad
 --turbo/--balanced/--thorough/--stealth/--ironclad  shortcuts for --scan
@@ -57,6 +59,8 @@ A classic tunnel, lean and very fast. It has the least overhead, so when it work
 ### 3) Tunnel-in-tunnel (gool)
 
 Here one WireGuard session is wrapped inside another WireGuard session. That means two layers of encryption stacked on top of each other. This is a little slower, but when a single layer is not enough for clean passage it can make the difference. If plain WireGuard connects but is not stable, try this mode.
+
+Because there are two hops, gool has to find two addresses, and by default it scans for both. If somebody on your network has already found addresses that work, you can hand them over instead of waiting for a sweep to rediscover them: `--wiw-outer 162.159.192.1:2408 --wiw-inner 188.114.96.1:2408`, or both at once with `--wiw-peers 162.159.192.1:2408,188.114.96.1:2408`. The port has to be written out — which port gets through is the part that differs between networks, so aether does not fill one in for you. Giving only one of the two is fine: it scans for the other and keeps the sweep off the address you already chose. The two hops have to be different addresses, since leaving through the edge you arrived on gains you nothing. You do not have to remember any of this at the keyboard — when gool is about to scan, it prints the same reminder above the scan mode question.
 
 ## Scanning: why it has no fixed address
 
@@ -217,7 +221,9 @@ Every prompt has a variable equivalent. If you set a variable beforehand, Aether
 
 ### Forcing the endpoint and the config path
 
-- `AETHER_PEER` or `AETHER_WG_PEER` (`--peer`, `--wg-peer`) — if you want to give a fixed address yourself and bypass the scan.
+- `AETHER_PEER` or `AETHER_WG_PEER` (`--peer`, `--wg-peer`) — if you want to give a fixed address yourself and bypass the scan. On gool this names the outer hop.
+- `AETHER_WIW_OUTER_PEER` and `AETHER_WIW_INNER_PEER` (`--wiw-outer`, `--wiw-inner`) — the two gool hops, one setting each, written as `ip:port`. The port is required. Set one and the scan looks for the other; set both and there is no scan. An address you set this way is retried on reconnect rather than replaced by a scanned one.
+- `AETHER_WIW_PEERS` (`--wiw-peers`) — both hops in one value, `outer,inner`. Set it to `auto` (or pass `--wiw-scan`) to always scan and never be asked.
 - `AETHER_CONFIG` (`--config`) — the path of the base config file. Default `aether.toml`.
 - `AETHER_WG_CONFIG` and `AETHER_MASQUE_CONFIG` (`--wg-config`, `--masque-config`) — the config path specific to each protocol.
 - `AETHER_WG_ENDPOINT_COOLDOWN_SECS` — how long an endpoint that fails twice is excluded from rescans. Default `300`.
@@ -249,6 +255,18 @@ AETHER_PROTOCOL=wg AETHER_NOIZE=aggressive AETHER_SCAN=thorough ./target/release
 
 ```
 AETHER_PROTOCOL=gool AETHER_SOCKS=127.0.0.1:1080 ./target/release/aether
+```
+
+### gool on addresses a friend told you about, with no scan at all
+
+```
+./target/release/aether --gool --wiw-peers 162.159.192.1:2408,188.114.96.1:2408
+```
+
+### gool where you only know one good address, and aether finds the other
+
+```
+./target/release/aether --gool --wiw-outer 162.159.192.1:2408 --turbo -4
 ```
 
 ### MASQUE on h2 with ClientHello fragmentation, for a network that blocks the h2 handshake specifically

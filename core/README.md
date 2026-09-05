@@ -16,7 +16,7 @@ Unlike traditional VPN clients, Aether is built for environments where Deep Pack
 - Automatic endpoint discovery, with end-to-end data-plane validation so a gateway is only trusted once it actually passes traffic, not just once it answers the handshake
 - MASQUE (HTTP/3 & HTTP/2), with optional TLS ClientHello fragmentation on HTTP/2
 - WireGuard support
-- Nested WireGuard mode (`gool`)
+- Nested WireGuard mode (`gool`), with both hops discovered by the scan or given by hand
 - Traffic obfuscation
 - Routing rules by domain, address, or port, matched from the TLS server name so they keep working behind a tun front end
 - Upstream proxy support, so Aether can dial out through another VPN or proxy already running on the machine
@@ -52,7 +52,7 @@ To update later, run `./aether.sh update`. To remove it, run `./aether.sh uninst
 
 ### Requirements
 
-- Rust (latest stable)
+- Rust 1.91 or newer
 - C/C++ compiler
 - CMake
 
@@ -122,7 +122,7 @@ Or skip the prompts with flags:
 
 On Windows, double-click `run-aether.bat` (included in the release zip) instead — it opens a terminal, runs `aether.exe`, and keeps the window open afterwards so you can read any errors.
 
-Every prompt has a flag and an environment variable equivalent. Run `./target/release/aether --help` for the full list, or see the guides linked below.
+Every prompt has a flag and an environment variable equivalent. Run `aether help` (or `--help`) for the full list — every flag, every variable, and what each one does — or see the guides linked below.
 
 After startup, a SOCKS5 proxy will be available at:
 
@@ -149,6 +149,8 @@ Fast and lightweight transport for networks with less aggressive inspection.
 ### Nested WireGuard (`gool`)
 
 A WireGuard tunnel running inside another WireGuard tunnel, providing an additional encryption layer.
+
+Its two hops are found by the scan by default. If you already know addresses that work on your network, name them instead with `--wiw-outer 162.159.192.1:2408 --wiw-inner 188.114.96.1:2408`, or both at once with `--wiw-peers 162.159.192.1:2408,188.114.96.1:2408`. The port is required — which port gets through is what differs between networks, so none is assumed. Give only one and the scan finds the other.
 
 ## Documentation
 

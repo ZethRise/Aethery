@@ -97,6 +97,35 @@ The last working endpoint is saved, and `--quick-reconnect` reuses it without a
 new sweep. An endpoint that just failed is held on a cooldown so the next attempt
 does not land on it again.
 
+### Choosing the WARP-in-WARP hops yourself
+
+`--peer` names one endpoint and warp-in-warp needs two, so each hop has its own
+setting. Name both and no scan runs at all; name one and the scan finds the
+other:
+
+```sh
+aether --gool --wiw-outer 162.159.192.1:2408 --wiw-inner 188.114.96.1:2408
+aether --gool --wiw-peers 162.159.192.1:2408,188.114.96.1:2408
+aether --gool --wiw-outer 162.159.192.1:2408   # the inner hop is scanned for
+aether --gool --wiw-inner 188.114.96.1:1701    # the outer hop is scanned for
+```
+
+The port is required and none is filled in for you: which port answers is
+exactly what differs between one network and the next, so an assumed one would
+only send you at an address nobody offered. The two hops also have to sit on
+different addresses — a second tunnel leaving through the edge it arrived on
+gains nothing — and a scan run for one hop leaves the other's address out of
+the sweep.
+
+Naming a hop is enough to select warp-in-warp, so `--gool` alongside it is
+optional, and `--wg-peer` names the outer hop. An endpoint you named is kept
+across reconnects rather than swapped for a scanned one, so a hop that stops
+answering is retried instead of replaced. `--wiw-scan` scans for both, ignoring
+an endpoint left in the environment.
+
+Nothing here is asked at startup. `--gool` on its own scans for both hops and
+prints a line above the scan mode question naming the alternative.
+
 ## Obfuscation
 
 Some networks fingerprint the first packets of a handshake. Aether can pad and
@@ -307,6 +336,13 @@ Every flag has an equivalent variable. Flags win when both are set.
 | `AETHER_NOIZE` | obfuscation profile |
 | `AETHER_IP` | `4`, `6`, `dual` |
 | `AETHER_PEER`, `AETHER_WG_PEER` | force an endpoint |
+| `AETHER_WIW_OUTER_PEER`, `AETHER_WIW_INNER_PEER` | force one warp-in-warp hop |
+| `AETHER_WIW_PEERS` | force both hops, or `auto` to always scan |
+| `AETHER_ROUTE_SNIFF`, `AETHER_ROUTE_SNIFF_MS` | reading the server name off the first bytes |
+| `AETHER_WG_STALE_SECS` | silence before a wireguard tunnel counts as dead |
+| `AETHER_MASQUE_H2_KEEPALIVE_SECS`, `_TIMEOUT_SECS` | HTTP/2 keepalive |
+| `AETHER_IRONCLAD_PORT` | port the ironclad scan makes its real request to |
+| `AETHER_REPROVISION` | replace an identity Cloudflare refused |
 | `AETHER_QUICK_RECONNECT` | reuse the saved endpoint |
 | `AETHER_MASQUE_HTTP2`, `AETHER_MASQUE_H2_PEER` | HTTP/2 carrier |
 | `AETHER_ECH` | `auto` or a base64 config |
