@@ -54,6 +54,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     if (releaseKeystore != null) {
         val envProps = Properties().apply {
             val envFile = rootProject.file("keystore.env")
@@ -85,6 +89,8 @@ android {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.core:core-splashscreen:1.0.1")
     implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.dynamicanimation:dynamicanimation:1.0.0")
+    testImplementation("junit:junit:4.13.2")
 }
 
 targetAbis.forEach { abi ->
