@@ -176,7 +176,9 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         pendingAddresses = null
         stopRequested.set(false)
         reconnectRequested.set(false)
-        vpnModeActive.set(vpnMode)
+        // Not yet: registering an identity must travel over whatever VPN is already up, because
+        // Cloudflare can be unreachable without one. Sockets are protected once our own interface exists.
+        vpnModeActive.set(false)
         startAsForeground()
         worker.execute {
             try {
@@ -194,6 +196,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                     closeTun()
                     tun = vpnBuilder(addresses, config, captureTraffic = false)
                         .establish() ?: error("Android could not establish the VPN interface")
+                    vpnModeActive.set(true)
                     ConnectionLog.record("Scanning gateways for VPN")
                     NativeCore.start(config, tun!!.fd)
                 } else {
