@@ -196,6 +196,9 @@ object AppAppearance {
                 connected = 0xFF176B3B.toInt(),
                 connectedContainer = 0xFFD7F5E3.toInt(),
                 theme = Theme.DYNAMIC,
+                // The defaults are pastels made for dark skies; on a light one they need to be darker.
+                warning = 0xFFA35F00.toInt(),
+                error = 0xFFB3261E.toInt(),
             )
         }
     }
