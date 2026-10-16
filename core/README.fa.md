@@ -54,7 +54,7 @@ aether
 
 ### پیش‌نیازها
 
-- Rust نسخه ۱.۹۱ یا بالاتر
+- Rust نسخه ۱.۹۸ یا بالاتر
 - کامپایلر C/C++
 - CMake
 
@@ -69,13 +69,14 @@ aether
 ساخت پروژه:
 
 ```bash
+cd aether
 cargo build --release
 ```
 
 فایل نهایی:
 
 ```text
-target/release/aether
+aether/target/release/aether
 ```
 
 ## داکر (Docker)

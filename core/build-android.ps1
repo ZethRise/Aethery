@@ -68,6 +68,8 @@ if (-not $ndk -or -not $bin -or -not $cmake) {
     throw "Android build requirements missing (NDK or CMake). SDK path: $sdk"
 }
 
+# BoringSSL's C++ runtime is linked into libaether.so; the APK ships no libc++_shared.so.
+Set-Item ("Env:BORING_BSSL_RUST_CPPLIB_" + $targetTriple.Replace('-', '_')) 'static:-bundle=c++'
 $env:ANDROID_NDK_HOME = $ndk
 $env:ANDROID_NDK_ROOT = $ndk
 $env:CMAKE = $cmake
@@ -93,6 +95,7 @@ finally {
 $bsslOut = Get-ChildItem -LiteralPath (Join-Path $target "$targetTriple/release/build").Replace('\', '/') -Directory -Filter 'boring-sys-*' |
     ForEach-Object { (Join-Path $_.FullName 'out').Replace('\', '/') } |
     Where-Object { Test-Path -LiteralPath (Join-Path $_ 'build/libssl.a').Replace('\', '/') } |
+    Sort-Object { (Get-Item -LiteralPath (Join-Path $_ 'build/libssl.a').Replace('\', '/')).LastWriteTime } |
     Select-Object -Last 1
 
 if (-not $bsslOut) {
@@ -101,7 +104,15 @@ if (-not $bsslOut) {
 
 $sysroot = (Join-Path $ndk 'toolchains/llvm/prebuilt/windows-x86_64/sysroot').Replace('\', '/')
 $env:BORING_BSSL_PATH = (Join-Path $bsslOut 'build').Replace('\', '/')
-$env:BORING_BSSL_INCLUDE_PATH = (Join-Path $bsslOut 'boringssl/src/include').Replace('\', '/')
+# boring-sys 5 keeps the headers in boringssl/include; boring-sys 4 kept them in boringssl/src/include.
+$bsslInclude = (Join-Path $bsslOut 'boringssl/include').Replace('\', '/')
+if (-not (Test-Path -LiteralPath $bsslInclude)) {
+    $bsslInclude = (Join-Path $bsslOut 'boringssl/src/include').Replace('\', '/')
+}
+if (-not (Test-Path -LiteralPath $bsslInclude)) {
+    throw "BoringSSL headers not found under $bsslOut/boringssl."
+}
+$env:BORING_BSSL_INCLUDE_PATH = $bsslInclude
 $env:BORING_BSSL_ASSUME_PATCHED = '1'
 $env:CLANG_PATH = (Join-Path $bin 'clang.exe').Replace('\', '/')
 

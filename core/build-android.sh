@@ -78,6 +78,9 @@ if [[ -z "$NDK" || ! -d "$NDK" || ! -d "$BIN" || -z "$CMAKE" || ! -x "$CMAKE" ]]
   exit 1
 fi
 
+# BoringSSL's C++ runtime is linked into libaether.so; the APK ships no libc++_shared.so.
+export "BORING_BSSL_RUST_CPPLIB_${TARGET_TRIPLE//-/_}=static:-bundle=c++"
+
 export ANDROID_NDK_HOME="$NDK"
 export ANDROID_NDK_ROOT="$NDK"
 export CMAKE="$CMAKE"
@@ -102,14 +105,26 @@ set +e
 BOOTSTRAP_EXIT=$?
 set -e
 
-BSSL_OUT="$(find "$TARGET/$TARGET_TRIPLE/release/build" -path '*/out/build/libssl.a' -print 2>/dev/null | sed 's#/build/libssl\.a$##' | tail -n 1)"
-if [[ -z "$BSSL_OUT" ]]; then
+# Older build directories of other boring-sys versions may linger, so take the newest build.
+BSSL_LIB="$(find "$TARGET/$TARGET_TRIPLE/release/build" -path '*/out/build/libssl.a' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 1 | cut -d' ' -f2-)"
+if [[ -z "$BSSL_LIB" ]]; then
   echo "BoringSSL bootstrap failed before static libraries were produced (cargo exit $BOOTSTRAP_EXIT)." >&2
+  exit 1
+fi
+BSSL_OUT="${BSSL_LIB%/build/libssl.a}"
+
+# boring-sys 5 keeps the headers in boringssl/include; boring-sys 4 kept them in boringssl/src/include.
+BSSL_INCLUDE="$BSSL_OUT/boringssl/include"
+if [[ ! -d "$BSSL_INCLUDE" ]]; then
+  BSSL_INCLUDE="$BSSL_OUT/boringssl/src/include"
+fi
+if [[ ! -d "$BSSL_INCLUDE" ]]; then
+  echo "BoringSSL headers not found under $BSSL_OUT/boringssl." >&2
   exit 1
 fi
 
 export BORING_BSSL_PATH="$BSSL_OUT/build"
-export BORING_BSSL_INCLUDE_PATH="$BSSL_OUT/boringssl/src/include"
+export BORING_BSSL_INCLUDE_PATH="$BSSL_INCLUDE"
 export BORING_BSSL_ASSUME_PATCHED="1"
 export CLANG_PATH="$BIN/clang"
 

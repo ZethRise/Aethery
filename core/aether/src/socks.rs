@@ -1,11 +1,13 @@
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::error::{AetherError, Result};
 use crate::netstack::{StackHandle, TcpSender, UdpSender};
@@ -22,7 +24,7 @@ const REP_GENERAL: u8 = 0x01;
 const REP_NOT_ALLOWED: u8 = 0x02;
 const REP_NOT_SUPPORTED: u8 = 0x07;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Target {
     Ip(IpAddr),
     Domain(String),
@@ -61,6 +63,7 @@ pub fn clear_gateway_proxy() {
     GATEWAY_HEALTHY.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+// The core can be started again in the same process, so the rules are reloaded on every start.
 static ROUTES: std::sync::LazyLock<std::sync::RwLock<RuleSet>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(RuleSet::default()));
 
@@ -141,6 +144,36 @@ pub(crate) fn warn_if_world_reachable(kind: &str, listen: SocketAddr) {
     );
 }
 
+pub async fn bind_listener(kind: &str, listen: SocketAddr) -> Result<TcpListener> {
+    TcpListener::bind(listen).await.map_err(|error| {
+        AetherError::Other(format!(
+            "the {kind} listener cannot use {listen}: {error}{}",
+            bind_hint(&error)
+        ))
+    })
+}
+
+fn bind_hint(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            "; another program already listens there, so stop it or choose another port with --bind"
+        }
+        std::io::ErrorKind::PermissionDenied if cfg!(windows) => {
+            "; Windows reserves some port ranges for Hyper-V and WSL (see `netsh interface ipv4 show \
+             excludedportrange protocol=tcp`), so choose a port outside them with --bind"
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            "; ports below 1024 need extra privileges, so choose a higher one with --bind"
+        }
+        std::io::ErrorKind::AddrNotAvailable => {
+            "; that address does not belong to this machine"
+        }
+        _ => "",
+    }
+}
+
+/// The addresses a listener on `listen` also needs: `localhost` is both 127.0.0.1 and ::1, and
+/// an app on the phone may resolve it to either.
 pub fn extra_listen_addrs(listen: SocketAddr) -> Vec<SocketAddr> {
     let mut addrs = vec![listen];
     match listen.ip() {
@@ -158,91 +191,201 @@ pub fn extra_listen_addrs(listen: SocketAddr) -> Vec<SocketAddr> {
     addrs
 }
 
-async fn bind_listeners(kind: &str, listen: SocketAddr) -> Result<Vec<TcpListener>> {
-    let mut listeners = Vec::new();
-    let mut errors = Vec::new();
-    for addr in extra_listen_addrs(listen) {
+/// The sockets one proxy accepts on: `listen`, and its IPv4/IPv6 twin when it has one.
+pub struct Listeners(Vec<TcpListener>);
+
+impl From<TcpListener> for Listeners {
+    fn from(listener: TcpListener) -> Self {
+        Listeners(vec![listener])
+    }
+}
+
+/// Binds `listen` and, best effort, its IPv4/IPv6 twin. Only the first has to bind.
+pub async fn bind_listeners(kind: &str, listen: SocketAddr) -> Result<Listeners> {
+    let primary = bind_listener(kind, listen).await?;
+    crate::ffi::record_log(format!("{kind} listening on {listen}"));
+    let mut listeners = vec![primary];
+    for addr in extra_listen_addrs(listen).into_iter().skip(1) {
         match TcpListener::bind(addr).await {
             Ok(listener) => {
-                log::info!("[+] {kind} listening on {addr}");
-                warn_if_world_reachable(kind, addr);
                 crate::ffi::record_log(format!("{kind} listening on {addr}"));
                 listeners.push(listener);
             }
-            Err(error) => {
-                log::warn!("[-] {kind} could not bind {addr}: {error}");
-                crate::ffi::record_log(format!("{kind} could not bind {addr}: {error}"));
-                errors.push(format!("{addr} ({error})"));
-            }
+            Err(error) => log::debug!("[-] {kind} could not also bind {addr}: {error}"),
         }
     }
-    if listeners.is_empty() {
-        return Err(AetherError::Other(format!(
-            "{kind} failed to bind {listen}: {}",
-            errors.join("; ")
-        )));
-    }
-    Ok(listeners)
+    Ok(Listeners(listeners))
 }
 
-fn spawn_acceptors(
-    listeners: Vec<TcpListener>,
-) -> mpsc::Receiver<std::io::Result<(tokio::net::TcpStream, SocketAddr)>> {
-    let (tx, rx) = mpsc::channel(32);
-    for listener in listeners {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            loop {
-                let result = listener.accept().await;
-                let retry = result
-                    .as_ref()
-                    .err()
-                    .and_then(|error| accept_backoff(error));
-                if tx.send(result).await.is_err() {
-                    break;
-                }
-                if let Some(delay) = retry {
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        });
+/// Runs `serve_one` on every listener; returns when the first of them ends, and drops, which
+/// stops, the others.
+async fn serve_all<F, Fut>(listeners: Listeners, serve_one: F) -> Result<()>
+where
+    F: Fn(TcpListener) -> Fut,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let mut running = tokio::task::JoinSet::new();
+    for listener in listeners.0 {
+        running.spawn(serve_one(listener));
     }
-    rx
+    match running.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(AetherError::Other(format!("a listener stopped: {error}"))),
+        None => Err(AetherError::Other("there was no listener to serve".into())),
+    }
 }
 
-pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
-    let listeners = bind_listeners("SOCKS5", listen).await?;
+fn proxy_credentials() -> Option<(String, String)> {
+    let user = std::env::var("AETHER_PROXY_USER").ok()?.trim().to_string();
+    let pass = std::env::var("AETHER_PROXY_PASS").ok()?.trim().to_string();
+    if user.is_empty() || pass.is_empty() {
+        None
+    } else {
+        Some((user, pass))
+    }
+}
+
+const METHOD_NO_AUTH: u8 = 0x00;
+const METHOD_USER_PASS: u8 = 0x02;
+const METHOD_UNACCEPTABLE: u8 = 0xFF;
+
+pub async fn serve(listeners: impl Into<Listeners>, stack: StackHandle) -> Result<()> {
+    serve_all(listeners.into(), move |listener| {
+        let stack = stack.clone();
+        serve_one(listener, stack)
+    })
+    .await
+}
+
+async fn serve_one(listener: TcpListener, stack: StackHandle) -> Result<()> {
+    let listen = listener.local_addr()?;
+    log::info!("[+] socks5 server listening on {listen}");
+    warn_if_world_reachable("socks5", listen);
     let bind_ip = listen.ip();
-    let mut incoming = spawn_acceptors(listeners);
+
+    accept_clients(listener, "socks5", client_limit(), move |sock, peer| {
+        let stack = stack.clone();
+        async move {
+            if let Err(e) = handle_client(sock, stack, bind_ip).await {
+                log::debug!("socks client {peer} ended: {e}");
+            }
+        }
+    })
+    .await
+}
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+const ACCEPT_WARN_EVERY: Duration = Duration::from_secs(10);
+
+fn client_limit() -> usize {
+    if let Some(limit) = std::env::var("AETHER_MAX_CLIENTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+    {
+        return limit;
+    }
+
+    let by_tier = match crate::sysprofile::tuning().tier {
+        crate::sysprofile::Tier::Low => 512,
+        crate::sysprofile::Tier::Medium => 2048,
+        crate::sysprofile::Tier::High => 8192,
+    };
+
+    match crate::sysprofile::open_file_limit() {
+        Some(files) => by_tier.min((files.saturating_sub(64) / 2).max(32)),
+        None => by_tier,
+    }
+}
+
+async fn accept_clients<F, Fut>(
+    listener: TcpListener,
+    kind: &'static str,
+    max: usize,
+    serve_one: F,
+) -> Result<()>
+where
+    F: Fn(TcpStream, SocketAddr) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let limit = Arc::new(Semaphore::new(max));
     let mut clients = tokio::task::JoinSet::new();
+    let mut last_accept_warning: Option<std::time::Instant> = None;
+    let mut last_limit_warning: Option<std::time::Instant> = None;
+
     loop {
+        if limit.available_permits() == 0 && due(&mut last_limit_warning, ACCEPT_WARN_EVERY) {
+            log::warn!(
+                "{kind}: {max} clients are connected, the most served at once; new ones wait \
+                 until one finishes (AETHER_MAX_CLIENTS raises the limit)"
+            );
+        }
+
         tokio::select! {
-            accept = incoming.recv() => {
-                let (sock, peer) = match accept {
-                    Some(Ok(accepted)) => accepted,
-                    Some(Err(error)) => {
-                        if accept_backoff(&error).is_some() {
-                            log::warn!(
-                                "socks5 accept failed: {error}; the listener stays open and retries"
-                            );
+            Some(_) = clients.join_next(), if !clients.is_empty() => {}
+            permit = Arc::clone(&limit).acquire_owned() => {
+                let permit = permit.expect("the client limit is never closed");
+                let (sock, peer) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        if let Some(delay) = accept_backoff(&error) {
+                            if due(&mut last_accept_warning, ACCEPT_WARN_EVERY) {
+                                log::warn!(
+                                    "{kind} accept failed: {error}; the listener stays open and retries"
+                                );
+                            }
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
-                        log::error!("socks5 listener cannot continue: {error}");
+                        log::error!("{kind} listener cannot continue: {error}");
                         return Err(error.into());
                     }
-                    None => {
-                        return Err(AetherError::Other("socks5 listeners closed".into()));
-                    }
                 };
-                let stack = stack.clone();
+                enable_keepalive(&sock);
+                let client = serve_one(sock, peer);
                 clients.spawn(async move {
-                    if let Err(e) = handle_client(sock, stack, bind_ip).await {
-                        log::debug!("socks client {peer} ended: {e}");
-                    }
+                    client.await;
+                    drop(permit);
                 });
             }
-            Some(_) = clients.join_next(), if !clients.is_empty() => {}
         }
+    }
+}
+
+fn due(last: &mut Option<std::time::Instant>, every: Duration) -> bool {
+    let now = std::time::Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < every) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+fn enable_keepalive(sock: &TcpStream) {
+    let idle = crate::netstack::tcp_keepalive();
+    let probes = socket2::TcpKeepalive::new().with_time(idle);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
+    let probes =
+        probes.with_interval((idle / 4).clamp(Duration::from_secs(5), Duration::from_secs(30)));
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    ))]
+    let probes = probes.with_retries(4);
+
+    if let Err(error) = socket2::SockRef::from(sock).set_tcp_keepalive(&probes) {
+        log::debug!("could not enable keep-alive on a connection: {error}");
     }
 }
 
@@ -264,31 +407,23 @@ pub fn accept_backoff(error: &std::io::Error) -> Option<std::time::Duration> {
     }
 
     match error.raw_os_error() {
-        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS)
-        | Some(libc::ENOMEM) => Some(Duration::from_millis(100)),
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM) => {
+            Some(Duration::from_millis(100))
+        }
         _ => None,
     }
 }
 
 async fn handle_client(mut sock: TcpStream, stack: StackHandle, bind_ip: IpAddr) -> Result<()> {
-    let bind_ip = sock.local_addr().map(|addr| addr.ip()).unwrap_or(bind_ip);
-    handshake(&mut sock).await?;
-
-    let mut head = [0u8; 4];
-    sock.read_exact(&mut head).await?;
-    if head[0] != VER {
-        return Err(AetherError::Other("bad socks version".into()));
-    }
-
-    let cmd = head[1];
-    let atyp = head[3];
-    let (target, port) = read_target(&mut sock, atyp).await?;
+    let (cmd, target, port) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_request(&mut sock))
+        .await
+        .map_err(|_| {
+            AetherError::Other("the client did not finish the socks5 handshake in time".into())
+        })??;
 
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
-        CMD_UDP_ASSOCIATE => {
-            handle_udp_associate(sock, stack, bind_ip, target, port).await
-        }
+        CMD_UDP_ASSOCIATE => handle_udp_associate(sock, stack, bind_ip, target, port).await,
         _ => {
             reply(&mut sock, REP_NOT_SUPPORTED).await?;
             Err(AetherError::Other("unsupported socks command".into()))
@@ -296,19 +431,18 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle, bind_ip: IpAddr)
     }
 }
 
-fn proxy_credentials() -> Option<(String, String)> {
-    let user = std::env::var("AETHER_PROXY_USER").ok()?.trim().to_string();
-    let pass = std::env::var("AETHER_PROXY_PASS").ok()?.trim().to_string();
-    if user.is_empty() || pass.is_empty() {
-        None
-    } else {
-        Some((user, pass))
-    }
-}
+async fn read_request(sock: &mut TcpStream) -> Result<(u8, Target, u16)> {
+    handshake(sock).await?;
 
-const METHOD_NO_AUTH: u8 = 0x00;
-const METHOD_USER_PASS: u8 = 0x02;
-const METHOD_UNACCEPTABLE: u8 = 0xFF;
+    let mut head = [0u8; 4];
+    sock.read_exact(&mut head).await?;
+    if head[0] != VER {
+        return Err(AetherError::Other("bad socks version".into()));
+    }
+
+    let (target, port) = read_target(sock, head[3]).await?;
+    Ok((head[1], target, port))
+}
 
 async fn handshake(sock: &mut TcpStream) -> Result<()> {
     let mut prefix = [0u8; 2];
@@ -322,7 +456,9 @@ async fn handshake(sock: &mut TcpStream) -> Result<()> {
     if let Some((user, pass)) = proxy_credentials() {
         if !methods.contains(&METHOD_USER_PASS) {
             sock.write_all(&[VER, METHOD_UNACCEPTABLE]).await?;
-            return Err(AetherError::Other("socks client did not offer username/password".into()));
+            return Err(AetherError::Other(
+                "socks client did not offer username/password".into(),
+            ));
         }
         sock.write_all(&[VER, METHOD_USER_PASS]).await?;
         socks_userpass(sock, &user, &pass).await?;
@@ -330,7 +466,9 @@ async fn handshake(sock: &mut TcpStream) -> Result<()> {
     }
     if !methods.contains(&METHOD_NO_AUTH) {
         sock.write_all(&[VER, METHOD_UNACCEPTABLE]).await?;
-        return Err(AetherError::Other("socks client did not offer no-auth".into()));
+        return Err(AetherError::Other(
+            "socks client did not offer no-auth".into(),
+        ));
     }
     sock.write_all(&[VER, METHOD_NO_AUTH]).await?;
     Ok(())
@@ -422,9 +560,32 @@ async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
 pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     let udp = stack.open_udp().await?;
     let (sender, mut from_stack) = udp.into_split();
-    let outcome = dns_exchange(&sender, &mut from_stack, name).await;
+    let outcome = resolve_preferring_v4(&sender, &mut from_stack, name).await;
     sender.close().await;
     outcome
+}
+
+async fn resolve_preferring_v4(
+    sender: &UdpSender,
+    from_stack: &mut mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+    name: &str,
+) -> Result<IpAddr> {
+    match dns_exchange(sender, from_stack, name, QTYPE_A).await? {
+        DnsAnswer::Found(ip) => Ok(ip),
+        DnsAnswer::NoSuchName => Err(AetherError::Other(format!("{name} does not exist"))),
+        DnsAnswer::NoRecord => match dns_exchange(sender, from_stack, name, QTYPE_AAAA).await? {
+            DnsAnswer::Found(ip) => Ok(ip),
+            _ => Err(AetherError::Other(format!(
+                "no A or AAAA record for {name}"
+            ))),
+        },
+    }
+}
+
+enum DnsAnswer {
+    Found(IpAddr),
+    NoRecord,
+    NoSuchName,
 }
 
 pub(crate) fn resolver_addresses() -> Vec<SocketAddr> {
@@ -462,11 +623,11 @@ async fn dns_exchange(
     sender: &UdpSender,
     from_stack: &mut mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     name: &str,
-) -> Result<IpAddr> {
+    qtype: u16,
+) -> Result<DnsAnswer> {
     let mut last = AetherError::Other("dns timeout".into());
 
     for server in resolver_addresses() {
-      for qtype in [QTYPE_A, QTYPE_AAAA] {
         let (query, id) = build_dns_query(name, qtype);
         if let Err(error) = sender.send_to(server, query).await {
             last = error;
@@ -488,13 +649,14 @@ async fn dns_exchange(
             if !dns_response_matches(&resp.1, id, name, qtype) {
                 continue;
             }
-            if let Some(ip) = parse_dns_address(&resp.1) {
-                return Ok(ip);
+            if let Some(ip) = parse_dns_answer(&resp.1, qtype) {
+                return Ok(DnsAnswer::Found(ip));
             }
-            last = AetherError::Other(format!("no address record for {name} from {server}"));
-            break;
+            if dns_rcode(&resp.1) == Some(RCODE_NXDOMAIN) {
+                return Ok(DnsAnswer::NoSuchName);
+            }
+            return Ok(DnsAnswer::NoRecord);
         }
-      }
     }
 
     Err(last)
@@ -502,6 +664,11 @@ async fn dns_exchange(
 
 const QTYPE_A: u16 = 1;
 const QTYPE_AAAA: u16 = 28;
+const RCODE_NXDOMAIN: u8 = 3;
+
+fn dns_rcode(resp: &[u8]) -> Option<u8> {
+    resp.get(3).map(|flags| flags & 0x0f)
+}
 
 fn build_dns_query(name: &str, qtype: u16) -> (Vec<u8>, u16) {
     let mut q = Vec::with_capacity(32 + name.len());
@@ -511,9 +678,6 @@ fn build_dns_query(name: &str, qtype: u16) -> (Vec<u8>, u16) {
     q.extend_from_slice(&[0x00, 0x01]);
     q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     for label in name.split('.') {
-        if label.is_empty() || label.len() > 63 {
-            continue;
-        }
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
     }
@@ -576,7 +740,7 @@ pub(crate) fn dns_response_matches(
     u16::from_be_bytes([resp[pos], resp[pos + 1]]) == expected_qtype
 }
 
-fn parse_dns_address(resp: &[u8]) -> Option<IpAddr> {
+fn parse_dns_answer(resp: &[u8], qtype: u16) -> Option<IpAddr> {
     if resp.len() < 12 {
         return None;
     }
@@ -600,7 +764,7 @@ fn parse_dns_address(resp: &[u8]) -> Option<IpAddr> {
         if pos + rdlen > resp.len() {
             return None;
         }
-        if rtype == QTYPE_A && rdlen == 4 {
+        if rtype == qtype && qtype == QTYPE_A && rdlen == 4 {
             return Some(IpAddr::V4(Ipv4Addr::new(
                 resp[pos],
                 resp[pos + 1],
@@ -608,10 +772,10 @@ fn parse_dns_address(resp: &[u8]) -> Option<IpAddr> {
                 resp[pos + 3],
             )));
         }
-        if rtype == QTYPE_AAAA && rdlen == 16 {
+        if rtype == qtype && qtype == QTYPE_AAAA && rdlen == 16 {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&resp[pos..pos + 16]);
-            return Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+            return Some(IpAddr::V6(Ipv6Addr::from(octets)));
         }
         pos += rdlen;
     }
@@ -631,12 +795,7 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-fn decide_route(
-    set: &RuleSet,
-    target: &Target,
-    sniffed: Option<&str>,
-    port: u16,
-) -> Action {
+fn decide_route(set: &RuleSet, target: &Target, sniffed: Option<&str>, port: u16) -> Action {
     match sniffed {
         Some(name) => match set.decide(Host::Domain(name), port) {
             Action::Proxy => set.decide(host_of(target), port),
@@ -783,48 +942,397 @@ async fn handle_connect(
         reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
     }
 
-    let (sender, mut from_stack, leftover) = conn;
+    let (sender, from_stack, leftover) = conn;
 
     if !head.is_empty() && sender.send(head).await.is_err() {
         return Ok(());
     }
 
-    let (mut rd, mut wr) = sock.into_split();
-
-    if !leftover.is_empty() && wr.write_all(&leftover).await.is_err() {
+    if !leftover.is_empty() && sock.write_all(&leftover).await.is_err() {
         return Ok(());
     }
 
-    let up = tokio::spawn(async move {
-        let mut buf = vec![0u8; 16384];
-        loop {
-            match rd.read(&mut buf).await {
-                Ok(0) => {
-                    sender.close().await;
-                    break;
-                }
-                Ok(n) => {
-                    if sender.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    sender.close().await;
-                    break;
-                }
+    relay_tunneled(sock, sender, from_stack, half_close_linger()).await;
+    Ok(())
+}
+
+pub(crate) async fn serve_connector<F, Fut, S>(
+    listener: TcpListener,
+    kind: &'static str,
+    connect: F,
+) -> Result<()>
+where
+    F: Fn(String, u16) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = std::io::Result<S>> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let listen = listener.local_addr()?;
+    log::info!("[+] {kind} listening on {listen}");
+    warn_if_world_reachable(kind, listen);
+
+    accept_clients(listener, kind, client_limit(), move |sock, peer| {
+        let connect = connect.clone();
+        async move {
+            if let Err(e) = serve_one_through(sock, connect).await {
+                log::debug!("{kind} client {peer} ended: {e}");
             }
         }
-    });
+    })
+    .await
+}
 
-    while let Some(chunk) = from_stack.recv().await {
-        if wr.write_all(&chunk).await.is_err() {
-            break;
+async fn serve_one_through<F, Fut, S>(mut sock: TcpStream, connect: F) -> Result<()>
+where
+    F: Fn(String, u16) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = std::io::Result<S>> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (cmd, target, port) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_request(&mut sock))
+        .await
+        .map_err(|_| {
+            AetherError::Other("the client did not finish the socks5 handshake in time".into())
+        })??;
+
+    if cmd == CMD_UDP_ASSOCIATE {
+        return handle_udp_over_connector(sock, connect, target).await;
+    }
+
+    if cmd != CMD_CONNECT {
+        let _ = reply(&mut sock, REP_NOT_SUPPORTED).await;
+        return Err(AetherError::Other(
+            "only connect and udp associate are carried on this listener".into(),
+        ));
+    }
+
+    let host = match &target {
+        Target::Domain(name) => name.clone(),
+        Target::Ip(ip) => ip.to_string(),
+    };
+
+    match connect(host.clone(), port).await {
+        Ok(remote) => {
+            reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
+            relay_generic(sock, remote, half_close_linger()).await;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = reply(&mut sock, REP_GENERAL).await;
+            Err(AetherError::Other(format!("{host}:{port}: {error}")))
+        }
+    }
+}
+
+const DNS_PORT: u16 = 53;
+const DNS_OVER_TCP_TIMEOUT: Duration = Duration::from_secs(20);
+const DNS_MAX_IN_FLIGHT: usize = 32;
+
+async fn dns_over_stream<S>(mut stream: S, query: Vec<u8>) -> std::io::Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    if query.len() > u16::MAX as usize {
+        return Err(std::io::Error::other("dns query is too long to frame"));
+    }
+
+    let mut framed = Vec::with_capacity(query.len() + 2);
+    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&query);
+    stream.write_all(&framed).await?;
+    stream.flush().await?;
+
+    let mut len = [0u8; 2];
+    stream.read_exact(&mut len).await?;
+    let mut answer = vec![0u8; u16::from_be_bytes(len) as usize];
+    stream.read_exact(&mut answer).await?;
+    Ok(answer)
+}
+
+async fn handle_udp_over_connector<F, Fut, S>(
+    mut sock: TcpStream,
+    connect: F,
+    requested: Target,
+) -> Result<()>
+where
+    F: Fn(String, u16) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = std::io::Result<S>> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let control_peer = sock.peer_addr()?;
+    let expected_ip = expected_udp_source(control_peer, &requested);
+    let bind_ip = sock.local_addr()?.ip();
+
+    let relay = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?;
+    let relay_addr = relay.local_addr()?;
+    reply_bound(&mut sock, relay_addr).await?;
+
+    let (answers_tx, mut answers_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(64);
+    let in_flight = Arc::new(Semaphore::new(DNS_MAX_IN_FLIGHT));
+
+    let mut client: Option<SocketAddr> = None;
+    let mut refused: u64 = 0;
+    let mut dropped_udp: u64 = 0;
+    let mut cbuf = vec![0u8; 65535];
+    let mut ctrl = [0u8; 256];
+
+    loop {
+        tokio::select! {
+            r = relay.recv_from(&mut cbuf) => {
+                let (n, from) = match r { Ok(v) => v, Err(_) => break };
+                if !udp_source_allowed(expected_ip, client, from) {
+                    refused += 1;
+                    if refused == 1 || refused.is_multiple_of(64) {
+                        log::warn!(
+                            "[-] udp relay {relay_addr} dropped a datagram from {from}; \
+                             this association only serves {expected_ip} (refused={refused})"
+                        );
+                    }
+                    continue;
+                }
+                if client.is_none() {
+                    log::debug!("udp relay {relay_addr} latched to client {from}");
+                    client = Some(from);
+                }
+
+                let Some((dst, (dst_port, payload))) = parse_udp_request(&cbuf[..n]) else {
+                    continue;
+                };
+
+                if dst_port != DNS_PORT {
+                    dropped_udp += 1;
+                    if dropped_udp == 1 || dropped_udp.is_multiple_of(64) {
+                        log::debug!(
+                            "[-] udp to {dst}:{dst_port} cannot be carried: this listener \
+                             reaches the internet over tcp only (dropped={dropped_udp})"
+                        );
+                    }
+                    continue;
+                }
+
+                let resolver = match dst {
+                    Target::Ip(ip) => SocketAddr::new(ip, dst_port),
+                    Target::Domain(name) => {
+                        log::debug!("[-] dns resolver given as the name {name}; give an address instead");
+                        continue;
+                    }
+                };
+
+                let permit = match in_flight.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        log::debug!("[-] too many dns lookups are already in flight; dropping one");
+                        continue;
+                    }
+                };
+
+                let connect = connect.clone();
+                let answers_tx = answers_tx.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let exchange = async {
+                        let stream = connect(resolver.ip().to_string(), resolver.port()).await?;
+                        dns_over_stream(stream, payload).await
+                    };
+                    match tokio::time::timeout(DNS_OVER_TCP_TIMEOUT, exchange).await {
+                        Ok(Ok(answer)) => {
+                            let _ = answers_tx.send((resolver, answer)).await;
+                        }
+                        Ok(Err(e)) => log::debug!("dns over tcp to {resolver} failed: {e}"),
+                        Err(_) => log::debug!("dns over tcp to {resolver} timed out"),
+                    }
+                });
+            }
+
+            maybe = answers_rx.recv() => {
+                let Some((src, answer)) = maybe else { break };
+                if let Some(c) = client {
+                    let pkt = build_udp_reply(src, &answer);
+                    let _ = relay.send_to(&pkt, c).await;
+                }
+            }
+
+            r = sock.read(&mut ctrl) => {
+                match r { Ok(0) | Err(_) => break, Ok(_) => {} }
+            }
         }
     }
 
-    let _ = wr.shutdown().await;
-    up.abort();
     Ok(())
+}
+
+pub(crate) async fn relay_generic<A, B>(client: A, remote: B, linger: Duration)
+where
+    A: AsyncRead + AsyncWrite + Send + Unpin,
+    B: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    let (mut client_rd, mut client_wr) = tokio::io::split(client);
+    let (mut remote_rd, mut remote_wr) = tokio::io::split(remote);
+    let activity = Activity::new();
+
+    let upload = async {
+        let _ = pump(&mut client_rd, &mut remote_wr, &activity, Way::Up).await;
+        let _ = remote_wr.shutdown().await;
+    };
+
+    let download = async {
+        if pump(&mut remote_rd, &mut client_wr, &activity, Way::Down)
+            .await
+            .is_ok()
+        {
+            let _ = client_wr.shutdown().await;
+        }
+    };
+
+    relay_halves(upload, download, &activity, linger).await;
+}
+
+const RELAY_CHUNK: usize = 16384;
+
+pub(crate) fn half_close_linger() -> Duration {
+    let secs = std::env::var("AETHER_HALF_CLOSE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.min(86_400))
+        .unwrap_or(30);
+    Duration::from_secs(secs)
+}
+
+struct Activity {
+    started: tokio::time::Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.last_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    fn quiet_until(&self, idle: Duration) -> tokio::time::Instant {
+        self.started + Duration::from_millis(self.last_ms.load(Ordering::Relaxed)) + idle
+    }
+}
+
+async fn relay_halves<U, D>(upload: U, download: D, activity: &Activity, linger: Duration)
+where
+    U: Future<Output = ()>,
+    D: Future<Output = ()>,
+{
+    tokio::pin!(upload);
+    tokio::pin!(download);
+
+    tokio::select! {
+        _ = &mut download => return,
+        _ = &mut upload => {}
+    }
+
+    activity.touch();
+    loop {
+        tokio::select! {
+            _ = &mut download => return,
+            _ = tokio::time::sleep_until(activity.quiet_until(linger)) => {
+                if activity.quiet_until(linger) <= tokio::time::Instant::now() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+pub(crate) async fn relay_tunneled(
+    sock: TcpStream,
+    sender: TcpSender,
+    mut from_stack: mpsc::Receiver<Vec<u8>>,
+    linger: Duration,
+) {
+    let (mut rd, mut wr) = sock.into_split();
+    let activity = Activity::new();
+
+    let upload = async {
+        let mut buf = vec![0u8; RELAY_CHUNK];
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sender.send(buf[..n].to_vec()).await.is_err() {
+                        return;
+                    }
+                    crate::stats::add_up(n);
+                    activity.touch();
+                }
+            }
+        }
+        sender.close().await;
+    };
+
+    let download = async {
+        while let Some(chunk) = from_stack.recv().await {
+            if wr.write_all(&chunk).await.is_err() {
+                return;
+            }
+            crate::stats::add_down(chunk.len());
+            activity.touch();
+        }
+        let _ = wr.shutdown().await;
+    };
+
+    relay_halves(upload, download, &activity, linger).await;
+}
+
+async fn relay_direct(client: TcpStream, remote: TcpStream, linger: Duration) {
+    let (mut client_rd, mut client_wr) = client.into_split();
+    let (mut remote_rd, mut remote_wr) = remote.into_split();
+    let activity = Activity::new();
+
+    let upload = async {
+        let _ = pump(&mut client_rd, &mut remote_wr, &activity, Way::Up).await;
+        let _ = remote_wr.shutdown().await;
+    };
+
+    let download = async {
+        if pump(&mut remote_rd, &mut client_wr, &activity, Way::Down)
+            .await
+            .is_ok()
+        {
+            let _ = client_wr.shutdown().await;
+        }
+    };
+
+    relay_halves(upload, download, &activity, linger).await;
+}
+
+#[derive(Clone, Copy)]
+enum Way {
+    Up,
+    Down,
+}
+
+async fn pump<R, W>(from: &mut R, to: &mut W, activity: &Activity, way: Way) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; RELAY_CHUNK];
+    loop {
+        let n = from.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        to.write_all(&buf[..n]).await?;
+        to.flush().await?;
+        match way {
+            Way::Up => crate::stats::add_up(n),
+            Way::Down => crate::stats::add_down(n),
+        }
+        activity.touch();
+    }
 }
 
 fn normalize_ip(ip: IpAddr) -> IpAddr {
@@ -844,11 +1352,7 @@ fn expected_udp_source(control_peer: SocketAddr, requested: &Target) -> IpAddr {
     }
 }
 
-fn udp_source_allowed(
-    expected_ip: IpAddr,
-    latched: Option<SocketAddr>,
-    from: SocketAddr,
-) -> bool {
+fn udp_source_allowed(expected_ip: IpAddr, latched: Option<SocketAddr>, from: SocketAddr) -> bool {
     match latched {
         Some(known) => known == from,
         None => normalize_ip(from.ip()) == normalize_ip(expected_ip),
@@ -862,35 +1366,37 @@ async fn handle_direct(
     head: Vec<u8>,
     replied: bool,
 ) -> Result<()> {
-    let address = match &target {
-        Target::Domain(name) => format!("{name}:{port}"),
-        Target::Ip(ip) => SocketAddr::new(*ip, port).to_string(),
+    let host = match &target {
+        Target::Domain(name) => name.clone(),
+        Target::Ip(ip) => ip.to_string(),
     };
+    let client = sock.peer_addr()?.ip();
 
-    let mut upstream = match tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect(&address),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            log::debug!("[route] direct connect to {address} failed: {error}");
-            if !replied {
-                let _ = reply(&mut sock, REP_GENERAL).await;
+    let mut upstream =
+        match tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect_direct(&host, port, client))
+            .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                log::debug!("[route] direct connect to {host}:{port} failed: {error}");
+                if !replied {
+                    let code = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        REP_NOT_ALLOWED
+                    } else {
+                        REP_GENERAL
+                    };
+                    let _ = reply(&mut sock, code).await;
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        Err(_) => {
-            log::debug!("[route] direct connect to {address} timed out");
-            if !replied {
-                let _ = reply(&mut sock, REP_GENERAL).await;
+            Err(_) => {
+                log::debug!("[route] direct connect to {host}:{port} timed out");
+                if !replied {
+                    let _ = reply(&mut sock, REP_GENERAL).await;
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-    };
-
-    let _ = upstream.set_nodelay(true);
+        };
 
     if !head.is_empty() && upstream.write_all(&head).await.is_err() {
         return Ok(());
@@ -900,14 +1406,47 @@ async fn handle_direct(
         reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
     }
 
-    let (mut client_rd, mut client_wr) = sock.into_split();
-    let (mut remote_rd, mut remote_wr) = upstream.into_split();
-
-    let up = tokio::spawn(async move { tokio::io::copy(&mut client_rd, &mut remote_wr).await });
-    let _ = tokio::io::copy(&mut remote_rd, &mut client_wr).await;
-    let _ = client_wr.shutdown().await;
-    up.abort();
+    relay_direct(sock, upstream, half_close_linger()).await;
     Ok(())
+}
+
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn direct_target_allowed(client: IpAddr, address: IpAddr) -> bool {
+    let address = normalize_ip(address);
+    if address.is_loopback() || address.is_unspecified() {
+        return normalize_ip(client).is_loopback();
+    }
+    true
+}
+
+async fn connect_direct(host: &str, port: u16, client: IpAddr) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in tokio::net::lookup_host((host, port)).await? {
+        if !direct_target_allowed(client, address.ip()) {
+            last_error = Some(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{address} is this machine's own loopback, which only local clients may reach"
+                ),
+            ));
+            continue;
+        }
+        match crate::egress::tcp_connect(address).await {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                enable_keepalive(&stream);
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{host} did not resolve to any address"),
+        )
+    }))
 }
 
 const GATEWAY_HEAD_LIMIT: usize = 8192;
@@ -930,7 +1469,9 @@ async fn open_through_gateway(
 ) -> Result<GatewayChannel> {
     let conn = tokio::time::timeout(GATEWAY_PROBE_TIMEOUT, stack.open_tcp(proxy))
         .await
-        .map_err(|_| AetherError::Other(format!("gateway {proxy} did not accept a connection")))??;
+        .map_err(|_| {
+            AetherError::Other(format!("gateway {proxy} did not accept a connection"))
+        })??;
     let (sender, mut from_stack) = conn.into_split();
 
     sender.send(build_proxy_connect(authority, port)).await?;
@@ -974,7 +1515,6 @@ async fn open_through_gateway(
     }
 }
 
-
 async fn handle_udp_associate(
     mut sock: TcpStream,
     stack: StackHandle,
@@ -992,7 +1532,7 @@ async fn handle_udp_associate(
     let udp = stack.open_udp().await?;
     let (sender, mut from_stack) = udp.into_split();
 
-    let direct_relay = UdpSocket::bind("0.0.0.0:0").await?;
+    let direct_relay = crate::egress::udp_bind("0.0.0.0:0".parse().expect("a wildcard address"))?;
 
     let mut client: Option<SocketAddr> = None;
     let mut refused: u64 = 0;
@@ -1006,7 +1546,7 @@ async fn handle_udp_associate(
                 let (n, from) = match r { Ok(v) => v, Err(_) => break };
                 if !udp_source_allowed(expected_ip, client, from) {
                     refused += 1;
-                    if refused == 1 || refused % 64 == 0 {
+                    if refused == 1 || refused.is_multiple_of(64) {
                         log::warn!(
                             "[-] udp relay {relay_addr} dropped a datagram from {from}; \
                              this association only serves {expected_ip} (refused={refused})"
@@ -1037,6 +1577,11 @@ async fn handle_udp_associate(
                                 }
                             };
                             match outside {
+                                Some(addr) if !direct_target_allowed(control_peer.ip(), addr.ip()) => {
+                                    log::debug!(
+                                        "[route] direct udp to {addr} refused: only local clients may reach this machine's loopback"
+                                    );
+                                }
                                 Some(addr) => {
                                     log::trace!("[route] direct udp {dst}:{dst_port}");
                                     let _ = direct_relay.send_to(&payload.1, addr).await;
@@ -1147,6 +1692,175 @@ fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
     pkt.extend_from_slice(&src.port().to_be_bytes());
     pkt.extend_from_slice(data);
     pkt
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (dialed, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        (dialed.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_far_end_that_never_closes_does_not_pin_a_half_closed_client() {
+        let (mut client, proxied) = pair().await;
+        let (dialed, mut far_end) = pair().await;
+        let relay = tokio::spawn(relay_direct(proxied, dialed, Duration::from_millis(200)));
+
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut request = Vec::new();
+        far_end.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"request");
+
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the relay must let go once the answer stops coming")
+            .unwrap();
+
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut rest))
+            .await
+            .expect("the client must see the connection end");
+        assert_eq!(read.unwrap(), 0);
+        drop(far_end);
+    }
+
+    #[tokio::test]
+    async fn the_answer_to_a_half_closed_request_still_arrives_whole() {
+        let (mut client, proxied) = pair().await;
+        let (dialed, mut far_end) = pair().await;
+        let relay = tokio::spawn(relay_direct(proxied, dialed, Duration::from_secs(5)));
+
+        client.write_all(b"GET").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut request = Vec::new();
+        far_end.read_to_end(&mut request).await.unwrap();
+        far_end.write_all(b"the answer").await.unwrap();
+        drop(far_end);
+
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await.unwrap();
+        assert_eq!(answer, b"the answer");
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the relay ends with the far end")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_keeps_moving_outlives_the_linger() {
+        let (mut client, proxied) = pair().await;
+        let (dialed, mut far_end) = pair().await;
+        let relay = tokio::spawn(relay_direct(proxied, dialed, Duration::from_millis(500)));
+
+        client.shutdown().await.unwrap();
+        let mut request = Vec::new();
+        far_end.read_to_end(&mut request).await.unwrap();
+
+        for byte in 0..20u8 {
+            far_end.write_all(&[byte]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(far_end);
+
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await.unwrap();
+        assert_eq!(answer, (0..20u8).collect::<Vec<_>>());
+        relay.await.unwrap();
+    }
+
+    #[test]
+    fn only_local_clients_may_reach_this_machines_loopback_directly() {
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        assert!(direct_target_allowed(local, "127.0.0.1".parse().unwrap()));
+        assert!(direct_target_allowed(
+            "::1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap()
+        ));
+        assert!(!direct_target_allowed(lan, "127.0.0.1".parse().unwrap()));
+        assert!(!direct_target_allowed(lan, "127.8.9.10".parse().unwrap()));
+        assert!(!direct_target_allowed(lan, "::1".parse().unwrap()));
+        assert!(!direct_target_allowed(
+            lan,
+            "::ffff:127.0.0.1".parse().unwrap()
+        ));
+        assert!(!direct_target_allowed(lan, "0.0.0.0".parse().unwrap()));
+        assert!(direct_target_allowed(lan, "192.168.1.1".parse().unwrap()));
+        assert!(direct_target_allowed(lan, "93.184.216.34".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_lan_client_is_refused_a_loopback_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let refused = connect_direct("127.0.0.1", port, "192.168.1.20".parse().unwrap())
+            .await
+            .expect_err("a lan client must not reach this machine's loopback");
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+
+        assert!(
+            connect_direct("127.0.0.1", port, "127.0.0.1".parse().unwrap())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn clients_past_the_limit_wait_for_a_free_slot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (served_tx, mut served) = mpsc::unbounded_channel::<SocketAddr>();
+
+        let server = tokio::spawn(accept_clients(
+            listener,
+            "test",
+            1,
+            move |mut sock, peer| {
+                let served_tx = served_tx.clone();
+                async move {
+                    let _ = served_tx.send(peer);
+                    let mut buf = [0u8; 16];
+                    while let Ok(read) = sock.read(&mut buf).await {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                }
+            },
+        ));
+
+        let first = TcpStream::connect(address).await.unwrap();
+        let first_served = tokio::time::timeout(Duration::from_secs(2), served.recv())
+            .await
+            .expect("the first client is served")
+            .unwrap();
+        assert_eq!(first_served, first.local_addr().unwrap());
+
+        let second = TcpStream::connect(address).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), served.recv())
+                .await
+                .is_err(),
+            "the second client must wait while the first holds the only slot"
+        );
+
+        drop(first);
+        let second_served = tokio::time::timeout(Duration::from_secs(2), served.recv())
+            .await
+            .expect("the second client is served once the slot frees up")
+            .unwrap();
+        assert_eq!(second_served, second.local_addr().unwrap());
+        server.abort();
+    }
 }
 
 #[cfg(test)]
@@ -1442,44 +2156,334 @@ mod tests {
             ));
         }
     }
+
+    const V6_ONLY: &str = "2001:470:1:18::125";
+
+    fn answer(id: u16, name: &str, qtype: u16, rcode: u8, records: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&id.to_be_bytes());
+        msg.push(0x81);
+        msg.push(0x80 | rcode);
+        msg.extend_from_slice(&1u16.to_be_bytes());
+        msg.extend_from_slice(&(records.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&[0, 0, 0, 0]);
+        for label in name.split('.') {
+            msg.push(label.len() as u8);
+            msg.extend_from_slice(label.as_bytes());
+        }
+        msg.push(0);
+        msg.extend_from_slice(&qtype.to_be_bytes());
+        msg.extend_from_slice(&1u16.to_be_bytes());
+        for (rtype, data) in records {
+            msg.extend_from_slice(&[0xc0, 0x0c]);
+            msg.extend_from_slice(&rtype.to_be_bytes());
+            msg.extend_from_slice(&1u16.to_be_bytes());
+            msg.extend_from_slice(&300u32.to_be_bytes());
+            msg.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            msg.extend_from_slice(data);
+        }
+        msg
+    }
+
+    #[test]
+    fn an_aaaa_answer_is_read_for_an_aaaa_question() {
+        let v6: Ipv6Addr = V6_ONLY.parse().unwrap();
+        let msg = answer(
+            1,
+            "ip6only.me",
+            QTYPE_AAAA,
+            0,
+            &[(QTYPE_AAAA, v6.octets().to_vec())],
+        );
+        assert_eq!(parse_dns_answer(&msg, QTYPE_AAAA), Some(IpAddr::V6(v6)));
+        assert_eq!(parse_dns_answer(&msg, QTYPE_A), None);
+    }
+
+    #[test]
+    fn an_alias_ahead_of_the_address_is_skipped() {
+        let v6: Ipv6Addr = V6_ONLY.parse().unwrap();
+        let alias = vec![3, b'w', b'w', b'w', 0xc0, 0x0c];
+        let msg = answer(
+            1,
+            "ip6only.me",
+            QTYPE_AAAA,
+            0,
+            &[(5, alias), (QTYPE_AAAA, v6.octets().to_vec())],
+        );
+        assert_eq!(parse_dns_answer(&msg, QTYPE_AAAA), Some(IpAddr::V6(v6)));
+    }
+
+    #[test]
+    fn a_name_that_does_not_exist_is_told_apart_from_a_missing_record() {
+        let gone = answer(1, "nothing.example", QTYPE_A, RCODE_NXDOMAIN, &[]);
+        let empty = answer(1, "ip6only.me", QTYPE_A, 0, &[]);
+        assert_eq!(dns_rcode(&gone), Some(RCODE_NXDOMAIN));
+        assert_eq!(dns_rcode(&empty), Some(0));
+        assert_eq!(parse_dns_answer(&empty, QTYPE_A), None);
+    }
+
+    async fn fake_resolver(
+        mut from_stack: mpsc::Receiver<Vec<u8>>,
+        to_stack: mpsc::Sender<Vec<u8>>,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<(String, u16)>>>,
+    ) {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr};
+
+        let caps = ChecksumCapabilities::default();
+        while let Some(pkt) = from_stack.recv().await {
+            let Ok(ip) = Ipv4Packet::new_checked(&pkt[..]) else {
+                continue;
+            };
+            let Ok(ip_repr) = Ipv4Repr::parse(&ip, &caps) else {
+                continue;
+            };
+            if ip_repr.next_header != IpProtocol::Udp {
+                continue;
+            }
+            let src = IpAddress::Ipv4(ip_repr.src_addr);
+            let dst = IpAddress::Ipv4(ip_repr.dst_addr);
+            let Ok(udp) = UdpPacket::new_checked(ip.payload()) else {
+                continue;
+            };
+            let Ok(udp_repr) = UdpRepr::parse(&udp, &src, &dst, &caps) else {
+                continue;
+            };
+
+            let query = udp.payload();
+            let mut pos = 12;
+            let mut labels = Vec::new();
+            while pos < query.len() && query[pos] != 0 {
+                let n = query[pos] as usize;
+                labels.push(String::from_utf8_lossy(&query[pos + 1..pos + 1 + n]).to_string());
+                pos += 1 + n;
+            }
+            let name = labels.join(".");
+            let qtype = u16::from_be_bytes([query[pos + 1], query[pos + 2]]);
+            let id = u16::from_be_bytes([query[0], query[1]]);
+            asked.lock().unwrap().push((name.clone(), qtype));
+
+            let v6: Ipv6Addr = V6_ONLY.parse().unwrap();
+            let dual_v6: Ipv6Addr = "2606:2800:220:1::1".parse().unwrap();
+            let reply = match (name.as_str(), qtype) {
+                ("dualstack.example", QTYPE_A) => {
+                    answer(id, &name, qtype, 0, &[(QTYPE_A, vec![93, 184, 216, 34])])
+                }
+                ("dualstack.example", QTYPE_AAAA) => answer(
+                    id,
+                    &name,
+                    qtype,
+                    0,
+                    &[(QTYPE_AAAA, dual_v6.octets().to_vec())],
+                ),
+                ("ip6only.me", QTYPE_AAAA) => {
+                    answer(id, &name, qtype, 0, &[(QTYPE_AAAA, v6.octets().to_vec())])
+                }
+                ("ip6only.me", _) => answer(id, &name, qtype, 0, &[]),
+                _ => answer(id, &name, qtype, RCODE_NXDOMAIN, &[]),
+            };
+
+            let out_udp = UdpRepr {
+                src_port: 53,
+                dst_port: udp_repr.src_port,
+            };
+            let out_ip = Ipv4Repr {
+                src_addr: ip_repr.dst_addr,
+                dst_addr: ip_repr.src_addr,
+                next_header: IpProtocol::Udp,
+                payload_len: 8 + reply.len(),
+                hop_limit: 64,
+            };
+            let mut buf = vec![0u8; out_ip.buffer_len() + out_ip.payload_len];
+            let mut packet = Ipv4Packet::new_unchecked(&mut buf[..]);
+            out_ip.emit(&mut packet, &caps);
+            let mut datagram = UdpPacket::new_unchecked(packet.payload_mut());
+            out_udp.emit(
+                &mut datagram,
+                &dst,
+                &src,
+                reply.len(),
+                |b| b.copy_from_slice(&reply),
+                &caps,
+            );
+            let _ = to_stack.send(buf).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_name_with_only_an_ipv6_address_resolves_through_the_tunnel() {
+        let (to_stack, stack_in) = mpsc::channel(64);
+        let (stack_out, from_stack) = mpsc::channel(64);
+        let stack = crate::netstack::spawn(
+            "172.16.0.2",
+            "2606:4700:110:8a36::1",
+            1280,
+            stack_in,
+            stack_out,
+        )
+        .unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tokio::spawn(fake_resolver(from_stack, to_stack, asked.clone()));
+
+        assert_eq!(
+            dns_resolve(&stack, "dualstack.example").await.unwrap(),
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))
+        );
+        assert_eq!(
+            resolve(&stack, Target::Domain("ip6only.me".into()))
+                .await
+                .unwrap(),
+            IpAddr::V6(V6_ONLY.parse().unwrap())
+        );
+        let missing = dns_resolve(&stack, "nothing.example")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("does not exist"), "{missing}");
+
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            vec![
+                ("dualstack.example".to_string(), QTYPE_A),
+                ("ip6only.me".to_string(), QTYPE_A),
+                ("ip6only.me".to_string(), QTYPE_AAAA),
+                ("nothing.example".to_string(), QTYPE_A),
+            ]
+        );
+    }
 }
 
 const HTTP_HEAD_LIMIT: usize = 16 * 1024;
 
-pub async fn serve_http(listen: SocketAddr, stack: StackHandle) -> Result<()> {
-    let listeners = bind_listeners("HTTP CONNECT", listen).await?;
-    let mut incoming = spawn_acceptors(listeners);
-    let mut clients = tokio::task::JoinSet::new();
+pub async fn serve_http(listeners: impl Into<Listeners>, stack: StackHandle) -> Result<()> {
+    serve_all(listeners.into(), move |listener| {
+        let stack = stack.clone();
+        serve_http_one(listener, stack)
+    })
+    .await
+}
 
-    loop {
-        tokio::select! {
-            accept = incoming.recv() => {
-                let (sock, peer) = match accept {
-                    Some(Ok(accepted)) => accepted,
-                    Some(Err(error)) => {
-                        if accept_backoff(&error).is_some() {
-                            log::warn!(
-                                "http proxy accept failed: {error}; the listener stays open and retries"
-                            );
-                            continue;
-                        }
-                        log::error!("http proxy listener cannot continue: {error}");
-                        return Err(error.into());
-                    }
-                    None => {
-                        return Err(AetherError::Other("http proxy listeners closed".into()));
-                    }
-                };
-                let stack = stack.clone();
-                clients.spawn(async move {
-                    if let Err(e) = handle_http_client(sock, stack).await {
-                        log::debug!("http proxy client {peer} ended: {e}");
-                    }
-                });
+async fn serve_http_one(listener: TcpListener, stack: StackHandle) -> Result<()> {
+    let listen = listener.local_addr()?;
+    log::info!("[+] http proxy listening on {listen}");
+    warn_if_world_reachable("http proxy", listen);
+
+    accept_clients(listener, "http proxy", client_limit(), move |sock, peer| {
+        let stack = stack.clone();
+        async move {
+            if let Err(e) = handle_http_client(sock, stack).await {
+                log::debug!("http proxy client {peer} ended: {e}");
             }
-            Some(_) = clients.join_next(), if !clients.is_empty() => {}
+        }
+    })
+    .await
+}
+
+pub(crate) async fn serve_http_connector<F, Fut, S>(
+    listener: TcpListener,
+    kind: &'static str,
+    connect: F,
+) -> Result<()>
+where
+    F: Fn(String, u16) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = std::io::Result<S>> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let listen = listener.local_addr()?;
+    log::info!("[+] {kind} listening on {listen}");
+    warn_if_world_reachable(kind, listen);
+
+    accept_clients(listener, kind, client_limit(), move |sock, peer| {
+        let connect = connect.clone();
+        async move {
+            if let Err(e) = handle_http_through(sock, connect).await {
+                log::debug!("{kind} client {peer} ended: {e}");
+            }
+        }
+    })
+    .await
+}
+
+async fn handle_http_through<F, Fut, S>(mut sock: TcpStream, connect: F) -> Result<()>
+where
+    F: Fn(String, u16) -> Fut,
+    Fut: Future<Output = std::io::Result<S>>,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (head, early) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_head(&mut sock))
+        .await
+        .map_err(|_| {
+            AetherError::Other("the client did not send a request head in time".into())
+        })??;
+    let text = String::from_utf8_lossy(&head).to_string();
+    let first_line = text.lines().next().unwrap_or_default();
+
+    let request = match parse_request_line(first_line) {
+        Some(value) => value,
+        None => {
+            let _ = sock
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                .await;
+            return Err(AetherError::Other(format!(
+                "unsupported http proxy request: {first_line}"
+            )));
+        }
+    };
+
+    let target = match request.authority.parse::<IpAddr>() {
+        Ok(ip) => Target::Ip(ip),
+        Err(_) => Target::Domain(request.authority.clone()),
+    };
+
+    match route_action(host_of(&target), request.port) {
+        Action::Block => {
+            log::debug!("[route] block http {}:{}", request.authority, request.port);
+            let _ = sock
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                .await;
+            return Ok(());
+        }
+        Action::Direct => {
+            log::debug!("[route] direct http {}:{}", request.authority, request.port);
+            return relay_http_direct(sock, &request, &head, &early).await;
+        }
+        Action::Proxy => {}
+    }
+
+    let remote = match connect(request.authority.clone(), request.port).await {
+        Ok(remote) => remote,
+        Err(error) => {
+            let _ = sock
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                .await;
+            return Err(AetherError::Other(format!(
+                "{}:{}: {error}",
+                request.authority, request.port
+            )));
+        }
+    };
+
+    let mut remote = remote;
+
+    match &request.rewritten {
+        Some(line) => {
+            let rest = text.split_once("\r\n").map(|(_, tail)| tail).unwrap_or("");
+            remote.write_all(format!("{line}{rest}").as_bytes()).await?;
+        }
+        None => {
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await?;
         }
     }
+
+    if !early.is_empty() {
+        remote.write_all(&early).await?;
+    }
+    remote.flush().await?;
+
+    relay_generic(sock, remote, half_close_linger()).await;
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1565,47 +2569,33 @@ fn http_proxy_authorized(head: &str, user: &str, pass: &str) -> bool {
     })
 }
 
-async fn read_head(sock: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; HTTP_HEAD_LIMIT + 4];
-    let mut seen = 0usize;
+async fn read_head(sock: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 2048];
 
     loop {
-        let window = (seen + 1024).min(buf.len());
-        let available = sock.peek(&mut buf[..window]).await?;
-        if available == 0 {
+        let read = sock.read(&mut chunk).await?;
+        if read == 0 {
             return Err(AetherError::Other(
                 "the http client closed before sending a request".into(),
             ));
         }
 
-        let search_from = seen.saturating_sub(3);
-        if let Some(pos) = buf[..available]
-            .windows(4)
-            .skip(search_from)
-            .position(|w| w == b"\r\n\r\n")
-        {
-            let end = search_from + pos + 4;
-            let mut head = vec![0u8; end];
-            sock.read_exact(&mut head).await?;
-            return Ok(head);
+        let search_from = buf.len().saturating_sub(3);
+        buf.extend_from_slice(&chunk[..read]);
+
+        if let Some(pos) = buf[search_from..].windows(4).position(|w| w == b"\r\n\r\n") {
+            let early = buf.split_off(search_from + pos + 4);
+            return Ok((buf, early));
         }
 
-        if available > HTTP_HEAD_LIMIT {
+        if buf.len() > HTTP_HEAD_LIMIT {
             return Err(AetherError::Other("http request head too large".into()));
         }
-
-        if available == seen {
-            sock.readable().await?;
-        }
-        seen = available;
     }
 }
 
-async fn open_tunneled(
-    stack: &StackHandle,
-    target: Target,
-    port: u16,
-) -> Result<GatewayChannel> {
+async fn open_tunneled(stack: &StackHandle, target: Target, port: u16) -> Result<GatewayChannel> {
     let via_gateway = gateway_proxy().filter(|_| should_use_gateway(port));
 
     if let Some(proxy) = via_gateway {
@@ -1626,7 +2616,11 @@ async fn open_tunneled(
 }
 
 async fn handle_http_client(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
-    let head = read_head(&mut sock).await?;
+    let (head, early) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_head(&mut sock))
+        .await
+        .map_err(|_| {
+            AetherError::Other("the client did not send a request head in time".into())
+        })??;
     let text = String::from_utf8_lossy(&head).to_string();
     let first_line = text.lines().next().unwrap_or_default();
 
@@ -1647,7 +2641,9 @@ async fn handle_http_client(mut sock: TcpStream, stack: StackHandle) -> Result<(
             let _ = sock
                 .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Aethery\"\r\nConnection: close\r\n\r\n")
                 .await;
-            return Err(AetherError::Other("http proxy authentication required".into()));
+            return Err(AetherError::Other(
+                "http proxy authentication required".into(),
+            ));
         }
     }
 
@@ -1666,7 +2662,7 @@ async fn handle_http_client(mut sock: TcpStream, stack: StackHandle) -> Result<(
         }
         Action::Direct => {
             log::debug!("[route] direct http {}:{}", request.authority, request.port);
-            return relay_http_direct(sock, &request, &head).await;
+            return relay_http_direct(sock, &request, &head, &early).await;
         }
         Action::Proxy => match open_tunneled(&stack, target, request.port).await {
             Ok(channel) => channel,
@@ -1679,7 +2675,7 @@ async fn handle_http_client(mut sock: TcpStream, stack: StackHandle) -> Result<(
         },
     };
 
-    let (sender, mut from_stack, leftover) = channel;
+    let (sender, from_stack, leftover) = channel;
 
     let preamble = match &request.rewritten {
         Some(line) => {
@@ -1694,9 +2690,7 @@ async fn handle_http_client(mut sock: TcpStream, stack: StackHandle) -> Result<(
             .await?;
     }
 
-    let (mut rd, mut wr) = sock.into_split();
-
-    if !leftover.is_empty() && wr.write_all(&leftover).await.is_err() {
+    if !leftover.is_empty() && sock.write_all(&leftover).await.is_err() {
         return Ok(());
     }
     if let Some(bytes) = preamble {
@@ -1704,36 +2698,11 @@ async fn handle_http_client(mut sock: TcpStream, stack: StackHandle) -> Result<(
             return Ok(());
         }
     }
-
-    let up = tokio::spawn(async move {
-        let mut buf = vec![0u8; 16384];
-        loop {
-            match rd.read(&mut buf).await {
-                Ok(0) => {
-                    sender.close().await;
-                    break;
-                }
-                Ok(n) => {
-                    if sender.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    sender.close().await;
-                    break;
-                }
-            }
-        }
-    });
-
-    while let Some(chunk) = from_stack.recv().await {
-        if wr.write_all(&chunk).await.is_err() {
-            break;
-        }
+    if !early.is_empty() && sender.send(early).await.is_err() {
+        return Ok(());
     }
 
-    let _ = wr.shutdown().await;
-    up.abort();
+    relay_tunneled(sock, sender, from_stack, half_close_linger()).await;
     Ok(())
 }
 
@@ -1741,19 +2710,33 @@ async fn relay_http_direct(
     mut sock: TcpStream,
     request: &HttpRequestLine,
     head: &[u8],
+    early: &[u8],
 ) -> Result<()> {
-    let upstream = tokio::net::TcpStream::connect((
-        request.authority.as_str(),
-        request.port,
-    ))
-    .await;
+    let client = sock.peer_addr()?.ip();
+    let upstream = tokio::time::timeout(
+        DIRECT_CONNECT_TIMEOUT,
+        connect_direct(&request.authority, request.port, client),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "direct connect to {}:{} timed out",
+                request.authority, request.port
+            ),
+        ))
+    });
 
     let mut upstream = match upstream {
         Ok(stream) => stream,
         Err(error) => {
-            let _ = sock
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-                .await;
+            let answer: &[u8] = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"
+            } else {
+                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+            };
+            let _ = sock.write_all(answer).await;
             return Err(error.into());
         }
     };
@@ -1771,15 +2754,17 @@ async fn relay_http_direct(
                 .await?;
         }
     }
+    if !early.is_empty() {
+        upstream.write_all(early).await?;
+    }
 
-    let _ = tokio::io::copy_bidirectional(&mut sock, &mut upstream).await;
+    relay_direct(sock, upstream, half_close_linger()).await;
     Ok(())
 }
 
 #[cfg(test)]
 mod http_proxy_tests {
-    use super::{extra_listen_addrs, parse_authority, parse_request_line, read_head};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use super::{parse_authority, parse_request_line, read_head};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1799,17 +2784,17 @@ mod http_proxy_tests {
         });
 
         let (mut server, _) = listener.accept().await.expect("accept");
-        let head = read_head(&mut server).await.expect("head");
+        let (head, mut leftover) = read_head(&mut server).await.expect("head");
 
-        let mut leftover = vec![0u8; 64];
+        let mut more = vec![0u8; 64];
         let n = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            server.read(&mut leftover),
+            server.read(&mut more),
         )
         .await
         .map(|r| r.unwrap_or(0))
         .unwrap_or(0);
-        leftover.truncate(n);
+        leftover.extend_from_slice(&more[..n]);
 
         writer.abort();
         (head, leftover)
@@ -1817,25 +2802,21 @@ mod http_proxy_tests {
 
     #[tokio::test]
     async fn a_head_arriving_in_one_piece_is_read_exactly() {
-        let (head, leftover) = head_over_socket(&[b"CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n"]).await;
+        let (head, leftover) =
+            head_over_socket(&[b"CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n"]).await;
         assert_eq!(head, b"CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n");
         assert!(leftover.is_empty());
     }
 
     #[tokio::test]
     async fn a_head_split_across_writes_is_still_assembled() {
-        let (head, _) = head_over_socket(&[
-            b"CONNECT a:443 HT",
-            b"TP/1.1\r\nHos",
-            b"t: a\r\n",
-            b"\r\n",
-        ])
-        .await;
+        let (head, _) =
+            head_over_socket(&[b"CONNECT a:443 HT", b"TP/1.1\r\nHos", b"t: a\r\n", b"\r\n"]).await;
         assert_eq!(head, b"CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n");
     }
 
     #[tokio::test]
-    async fn bytes_after_the_head_are_left_on_the_socket() {
+    async fn bytes_after_the_head_are_kept_for_the_far_end() {
         let (head, leftover) =
             head_over_socket(&[b"CONNECT a:443 HTTP/1.1\r\n\r\n\x16\x03\x01pipelined"]).await;
         assert_eq!(head, b"CONNECT a:443 HTTP/1.1\r\n\r\n");
@@ -1859,9 +2840,8 @@ mod http_proxy_tests {
 
     #[test]
     fn an_absolute_get_is_rewritten_to_origin_form() {
-        let parsed =
-            parse_request_line("GET http://ip-api.com/json/?fields=query HTTP/1.1")
-                .expect("parsed");
+        let parsed = parse_request_line("GET http://ip-api.com/json/?fields=query HTTP/1.1")
+            .expect("parsed");
         assert_eq!(parsed.authority, "ip-api.com");
         assert_eq!(parsed.port, 80);
         assert_eq!(
@@ -1878,8 +2858,7 @@ mod http_proxy_tests {
 
     #[test]
     fn an_explicit_port_in_an_absolute_url_is_honoured() {
-        let parsed =
-            parse_request_line("GET http://example.com:8080/x HTTP/1.1").expect("parsed");
+        let parsed = parse_request_line("GET http://example.com:8080/x HTTP/1.1").expect("parsed");
         assert_eq!(parsed.port, 8080);
         assert_eq!(parsed.authority, "example.com");
     }
@@ -1908,18 +2887,6 @@ mod http_proxy_tests {
     fn a_malformed_line_is_rejected() {
         assert!(parse_request_line("").is_none());
         assert!(parse_request_line("CONNECT").is_none());
-    }
-
-    #[test]
-    fn a_loopback_ipv4_listen_also_covers_ipv6_localhost() {
-        let addrs = extra_listen_addrs(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1820));
-        assert_eq!(
-            addrs,
-            vec![
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1820),
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1820),
-            ]
-        );
     }
 }
 
@@ -2030,5 +2997,23 @@ mod sniff_route_tests {
         std::env::set_var("AETHER_ROUTE_SNIFF", "1");
         assert!(sniff_enabled());
         std::env::remove_var("AETHER_ROUTE_SNIFF");
+    }
+}
+
+#[cfg(test)]
+mod dual_stack_tests {
+    use super::extra_listen_addrs;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn a_loopback_ipv4_listen_also_covers_ipv6_localhost() {
+        let addrs = extra_listen_addrs(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1820));
+        assert_eq!(
+            addrs,
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1820),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1820),
+            ]
+        );
     }
 }

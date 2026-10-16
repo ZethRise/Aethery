@@ -361,7 +361,10 @@ async fn sign_in(settings: &TeamSettings) -> Result<String> {
                 "the supplied access token has expired; sign in again to get a fresh one".into(),
             ));
         }
-        log::info!("[+] using the access token supplied for team {}", settings.team);
+        log::info!(
+            "[+] using the access token supplied for team {}",
+            settings.team
+        );
         return Ok(token.clone());
     }
 
@@ -384,12 +387,23 @@ async fn sign_in(settings: &TeamSettings) -> Result<String> {
 }
 
 fn access_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(crate::consts::UA_REGISTER)
-        .timeout(AUTH_TIMEOUT)
-        .cookie_store(true)
-        .build()
-        .map_err(|e| AetherError::Api(format!("access client: {e}")))
+    through_upstream(
+        reqwest::Client::builder()
+            .user_agent(crate::consts::UA_REGISTER)
+            .timeout(AUTH_TIMEOUT)
+            // TLS server-certificate verification disabled (unconditional).
+            .danger_accept_invalid_certs(true)
+            .cookie_store(true),
+    )?
+    .build()
+    .map_err(|e| AetherError::Api(format!("access client: {e}")))
+}
+
+fn through_upstream(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+    match crate::upstream::configured() {
+        Some(upstream) => Ok(builder.proxy(upstream.as_reqwest_proxy()?)),
+        None => Ok(builder),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -692,12 +706,16 @@ async fn fetch_token_with_service_token(settings: &TeamSettings) -> Result<Strin
         settings.team_domain()
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent(crate::consts::UA_REGISTER)
-        .timeout(AUTH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| AetherError::Api(format!("access client: {e}")))?;
+    let client = through_upstream(
+        reqwest::Client::builder()
+            .user_agent(crate::consts::UA_REGISTER)
+            .timeout(AUTH_TIMEOUT)
+            // TLS server-certificate verification disabled (unconditional).
+            .danger_accept_invalid_certs(true)
+            .redirect(reqwest::redirect::Policy::none()),
+    )?
+    .build()
+    .map_err(|e| AetherError::Api(format!("access client: {e}")))?;
 
     let response = client
         .get(&url)

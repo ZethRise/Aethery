@@ -6,7 +6,7 @@
 - Android NDK `26.3.11579264`
 - CMake `3.22.1`
 - JDK 17
-- Rust stable with Android targets
+- Rust stable 1.98 or newer, with Android targets
 - `cargo-ndk`
 
 ## Build debug APKs
