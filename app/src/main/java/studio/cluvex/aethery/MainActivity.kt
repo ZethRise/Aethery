@@ -18,6 +18,7 @@ import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.widget.ImageView.ScaleType
+import studio.cluvex.aethery.ui.HaloOrb
 import studio.cluvex.aethery.ui.HaloType
 import studio.cluvex.aethery.ui.StageText
 import android.net.ConnectivityManager
@@ -62,7 +63,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
-    private lateinit var connectionControl: ConnectionControl
+    private lateinit var connectionControl: HaloOrb
     private lateinit var connectionTitle: TextView
     private lateinit var connectionDetail: TextView
     private lateinit var latencyGraph: LatencyGraphView
@@ -83,7 +84,7 @@ class MainActivity : Activity() {
     private var predictiveBackCallback: Any? = null
     private var selectedProtocol = Protocol.MASQUE
     private var pendingConfig: String? = null
-    private var visualState = ConnectionControl.State.DISCONNECTED
+    private var visualState = HaloOrb.State.DISCONNECTED
     private var receiverRegistered = false
     private var showingSettings = false
     private var showingLogs = false
@@ -128,7 +129,7 @@ class MainActivity : Activity() {
         override fun run() {
             renderStatus()
             if (isTunnelActive() || NativeCore.isRunning()) {
-                val delay = if (visualState == ConnectionControl.State.CONNECTING) 2_000L else STATUS_POLL_MS
+                val delay = if (visualState == HaloOrb.State.CONNECTING) 2_000L else STATUS_POLL_MS
                 statusHandler.postDelayed(this, delay)
             }
         }
@@ -136,6 +137,7 @@ class MainActivity : Activity() {
     private lateinit var palette: AppAppearance.Palette
     private var lastNightMode = false
     @Volatile private var userDisconnecting = false
+    private var previewing = false
     private val CANVAS get() = palette.canvas
     private val SURFACE get() = palette.surface
     private val SURFACE_VARIANT get() = palette.surfaceVariant
@@ -152,7 +154,7 @@ class MainActivity : Activity() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == AetherVpnService.ACTION_STAGE) {
                 // Stage text only describes an attempt in progress; any other state overwrites it.
-                if (visualState == ConnectionControl.State.CONNECTING) {
+                if (visualState == HaloOrb.State.CONNECTING) {
                     intent.getStringExtra(AetherVpnService.EXTRA_STAGE)
                         ?.let(StageText::plain)
                         ?.let { connectionDetail.text = it }
@@ -206,7 +208,7 @@ class MainActivity : Activity() {
         ConnectionLog.bind(File(filesDir, "connection.log"))
         appUpdater = AppUpdater(this)
 
-        connectionControl = ConnectionControl(this, primary, primaryContainer, connected, connectedContainer).apply {
+        connectionControl = HaloOrb(this, palette).apply {
             id = View.generateViewId()
             setOnClickListener { toggleTunnel() }
         }
@@ -273,6 +275,7 @@ class MainActivity : Activity() {
         configureSystemBars()
         if (savedInstanceState == null) showOpeningOverlay()
         restoreTunnelUi()
+        applyDebugPreview()
         refreshPublicIp()
         if (intent?.getBooleanExtra(EXTRA_START_CONNECT, false) == true) {
             intent.removeExtra(EXTRA_START_CONNECT)
@@ -394,6 +397,21 @@ class MainActivity : Activity() {
             .start()
     }
 
+    /** Debug builds only: `--es preview_state <state>` shows a state without a live tunnel. */
+    private fun applyDebugPreview() {
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
+        if (intent?.getBooleanExtra("preview_fallback", false) == true) connectionControl.forceFallback = true
+        val name = intent?.getStringExtra("preview_state") ?: return
+        previewing = true
+        when (name) {
+            "connecting" -> showConnecting("Finding a verified gateway")
+            "connected" -> showConnected()
+            "degraded" -> { showConnected(); showDegraded() }
+            "failed" -> showFailure("Preview of a failure")
+            else -> showDisconnected()
+        }
+    }
+
     private fun restoreTunnelUi() {
         if (!NativeCore.isRunning()) return
         if (NativeCore.isReady()) showConnected(restored = true)
@@ -426,7 +444,7 @@ class MainActivity : Activity() {
                 if (request == latencyRequest && isTunnelActive()) {
                     if (result != null) {
                         latencyGraph.addPoint(result)
-                        if (visualState == ConnectionControl.State.DEGRADED) showConnected(restored = true)
+                        if (visualState == HaloOrb.State.DEGRADED) showConnected(restored = true)
                         updateNotificationHealth(ping = latencyGraph.currentLabel())
                     } else {
                         latencyGraph.setLabel("Ping unavailable")
@@ -972,8 +990,8 @@ class MainActivity : Activity() {
     }
 
     private fun openScannerScreen(animate: Boolean = true) {
-        if (visualState == ConnectionControl.State.CONNECTING ||
-            visualState == ConnectionControl.State.CONNECTED ||
+        if (visualState == HaloOrb.State.CONNECTING ||
+            visualState == HaloOrb.State.CONNECTED ||
             NativeCore.isRunning()
         ) return
 
@@ -1228,8 +1246,8 @@ class MainActivity : Activity() {
     }
 
     private fun showConnectionTypeSheet() {
-        if (visualState == ConnectionControl.State.CONNECTING ||
-            visualState == ConnectionControl.State.CONNECTED ||
+        if (visualState == HaloOrb.State.CONNECTING ||
+            visualState == HaloOrb.State.CONNECTED ||
             NativeCore.isRunning()
         ) return
 
@@ -1304,8 +1322,8 @@ class MainActivity : Activity() {
     }
 
     private fun openModeScreen() {
-        if (visualState == ConnectionControl.State.CONNECTING ||
-            visualState == ConnectionControl.State.CONNECTED ||
+        if (visualState == HaloOrb.State.CONNECTING ||
+            visualState == HaloOrb.State.CONNECTED ||
             NativeCore.isRunning()
         ) return
 
@@ -2958,6 +2976,7 @@ class MainActivity : Activity() {
     private fun configJson(): String = CoreConfig.json(this, savedProtocol().coreName)
 
     private fun renderStatus() {
+        if (previewing) return
         if (userDisconnecting) {
             if (!NativeCore.isRunning()) userDisconnecting = false
             return
@@ -2991,7 +3010,7 @@ class MainActivity : Activity() {
         latencyRequest++
         pingInFlight = false
         latencyGraph.reset()
-        visualState = ConnectionControl.State.CONNECTING
+        visualState = HaloOrb.State.CONNECTING
         connectionControl.state = visualState
         statusHandler.removeCallbacks(statusPoll)
         statusHandler.post(statusPoll)
@@ -3002,7 +3021,7 @@ class MainActivity : Activity() {
     }
 
     private fun showConnected(restored: Boolean = false) {
-        visualState = ConnectionControl.State.CONNECTED
+        visualState = HaloOrb.State.CONNECTED
         connectionControl.state = visualState
         connectionTitle.setTextColor(connected)
         connectionTitle.text = "Connected"
@@ -3017,7 +3036,7 @@ class MainActivity : Activity() {
 
     private fun showDegraded() {
         if (!isTunnelActive()) return
-        visualState = ConnectionControl.State.DEGRADED
+        visualState = HaloOrb.State.DEGRADED
         connectionControl.state = visualState
         connectionTitle.setTextColor(0xFFFFD180.toInt())
         connectionTitle.text = "Connection degraded"
@@ -3030,7 +3049,7 @@ class MainActivity : Activity() {
         latencyRequest++
         pingInFlight = false
         latencyGraph.reset()
-        visualState = ConnectionControl.State.FAILED
+        visualState = HaloOrb.State.FAILED
         connectionControl.state = visualState
         connectionTitle.setTextColor(ERROR)
         connectionTitle.text = "Connection failed"
@@ -3043,7 +3062,7 @@ class MainActivity : Activity() {
         latencyRequest++
         pingInFlight = false
         latencyGraph.reset()
-        visualState = ConnectionControl.State.DISCONNECTED
+        visualState = HaloOrb.State.DISCONNECTED
         connectionControl.state = visualState
         connectionTitle.setTextColor(INK)
         connectionTitle.text = "Not connected"
@@ -3059,8 +3078,8 @@ class MainActivity : Activity() {
         scannerSelector.alpha = if (enabled) 1f else DISABLED_ALPHA
     }
 
-    private fun isTunnelActive(): Boolean = visualState == ConnectionControl.State.CONNECTED ||
-        visualState == ConnectionControl.State.DEGRADED
+    private fun isTunnelActive(): Boolean = visualState == HaloOrb.State.CONNECTED ||
+        visualState == HaloOrb.State.DEGRADED
 
     private fun configureSystemBars() {
         window.statusBarColor = CANVAS
@@ -3732,200 +3751,6 @@ private class ChevronView(context: Context, private val color: Int) : View(conte
     }
 }
 
-
-private class ConnectionControl(
-    context: Context,
-    private val primary: Int,
-    private val primaryContainer: Int,
-    private val connected: Int,
-    private val connectedContainer: Int,
-) : View(context) {
-    enum class State { DISCONNECTED, CONNECTING, CONNECTED, DEGRADED, FAILED }
-
-    var state: State = State.DISCONNECTED
-        set(value) {
-            if (field == value) return
-            field = value
-            contentDescription = when (value) {
-                State.DISCONNECTED, State.FAILED -> "Connect"
-                State.CONNECTING -> "Connecting"
-                State.CONNECTED, State.DEGRADED -> "Disconnect"
-            }
-            if (value == State.CONNECTING) startConnectingAnimation() else stopConnectingAnimation()
-            animate().cancel()
-            animate().scaleX(0.9f).scaleY(0.9f).setDuration(90).withEndAction {
-                animate().scaleX(1f).scaleY(1f).setDuration(180).start()
-            }.start()
-            invalidate()
-        }
-
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val arcBounds = RectF()
-    private val density = resources.displayMetrics.density
-    private var progress = 0f
-    private var pulse = 0f
-    private var connectingAnimator: ValueAnimator? = null
-
-    init {
-        isClickable = true
-        isFocusable = true
-        isFocusableInTouchMode = false
-        contentDescription = "Connect"
-    }
-
-    override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: android.graphics.Rect?) {
-        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
-        invalidate()
-    }
-
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
-            performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-            performClick()
-            return true
-        }
-        return super.onKeyDown(keyCode, event)
-    }
-
-    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val desired = dp(238)
-        setMeasuredDimension(resolveSize(desired, widthMeasureSpec), resolveSize(desired, heightMeasureSpec))
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        val centerX = width / 2f
-        val centerY = height / 2f
-        val radius = dp(95).toFloat() + if (state == State.CONNECTING) dp(3) * pulse else 0f
-        val palette = when (state) {
-            State.DISCONNECTED, State.CONNECTING -> Palette(primaryContainer, primary)
-            State.CONNECTED -> Palette(connectedContainer, connected)
-            State.DEGRADED -> Palette(DEGRADED_CONTAINER, DEGRADED)
-            State.FAILED -> Palette(ERROR_CONTAINER, ERROR)
-        }
-
-        paint.style = Paint.Style.FILL
-        val active = state == State.CONNECTED || state == State.DEGRADED
-        paint.color = (if (active) 0x33000000 else 0x22000000) or (palette.accent and 0x00FFFFFF)
-        canvas.drawCircle(centerX, centerY, radius + dp(if (active) 10 else 6), paint)
-        paint.color = palette.container
-        canvas.drawCircle(centerX, centerY, radius, paint)
-
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = dp(if (isFocused) 4 else if (state == State.DISCONNECTED) 1 else 2).toFloat()
-        paint.color = palette.accent
-        canvas.drawCircle(centerX, centerY, radius, paint)
-        if (isFocused) {
-            paint.strokeWidth = dp(2).toFloat()
-            canvas.drawCircle(centerX, centerY, radius + dp(8), paint)
-        }
-
-        val iconRadius = dp(31).toFloat()
-        arcBounds.set(centerX - iconRadius, centerY - iconRadius, centerX + iconRadius, centerY + iconRadius)
-        paint.strokeWidth = dp(3).toFloat()
-        paint.strokeCap = Paint.Cap.ROUND
-        canvas.drawArc(arcBounds, 330f, 240f, false, paint)
-        canvas.drawLine(centerX, centerY - dp(34), centerX, centerY - dp(8), paint)
-        paint.strokeCap = Paint.Cap.BUTT
-
-        if (state == State.CONNECTING) {
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = dp(3).toFloat()
-            canvas.drawArc(
-                RectF(
-                    centerX - radius - dp(7),
-                    centerY - radius - dp(7),
-                    centerX + radius + dp(7),
-                    centerY + radius + dp(7),
-                ),
-                progress * 360f,
-                78f + pulse * 42f,
-                false,
-                paint,
-            )
-        } else if (state == State.CONNECTED || state == State.DEGRADED) {
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = dp(2).toFloat()
-            canvas.drawCircle(centerX, centerY, radius + dp(6), paint)
-        }
-
-
-    }
-
-    override fun onTouchEvent(event: MotionEvent): Boolean = when (event.actionMasked) {
-        MotionEvent.ACTION_DOWN -> {
-            animate().scaleX(0.97f).scaleY(0.97f).setDuration(90).start()
-            true
-        }
-        MotionEvent.ACTION_UP -> {
-            animate().scaleX(1f).scaleY(1f).setDuration(180).start()
-            performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-            performClick()
-            true
-        }
-        MotionEvent.ACTION_CANCEL -> {
-            animate().scaleX(1f).scaleY(1f).setDuration(180).start()
-            true
-        }
-        else -> super.onTouchEvent(event)
-    }
-
-    override fun performClick(): Boolean {
-        super.performClick()
-        return true
-    }
-
-    override fun onDetachedFromWindow() {
-        stopConnectingAnimation()
-        super.onDetachedFromWindow()
-    }
-
-    fun pauseAnimation() {
-        connectingAnimator?.pause()
-    }
-
-    fun resumeAnimation() {
-        if (state == State.CONNECTING) {
-            connectingAnimator?.resume() ?: startConnectingAnimation()
-        }
-    }
-
-    private fun startConnectingAnimation() {
-        if (connectingAnimator != null) return
-        connectingAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 1_050
-            repeatCount = ValueAnimator.INFINITE
-            addUpdateListener {
-                progress = it.animatedFraction
-                pulse = if (progress < 0.5f) progress * 2f else (1f - progress) * 2f
-                invalidate()
-            }
-            start()
-        }
-    }
-
-    private fun stopConnectingAnimation() {
-        connectingAnimator?.cancel()
-        connectingAnimator = null
-        progress = 0f
-        pulse = 0f
-    }
-
-    private fun dp(value: Int): Int = (value * density).roundToInt()
-
-    private fun preferences() = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
-
-    private data class Palette(val container: Int, val accent: Int)
-
-    private companion object {
-        const val ERROR = 0xFFFFB4AB.toInt()
-        const val ERROR_CONTAINER = 0xFF4A1E1C.toInt()
-        const val CONNECTED_BRIGHT = 0xFF8FFFB5.toInt()
-        const val CONNECTED_BRIGHT_CONTAINER = 0xFF176B3B.toInt()
-        const val DEGRADED = 0xFFFFD180.toInt()
-        const val DEGRADED_CONTAINER = 0xFF5A4300.toInt()
-    }
-}
 
 private class LatencyGraphView(context: Context) : View(context) {
     private val maxPoints = 20
