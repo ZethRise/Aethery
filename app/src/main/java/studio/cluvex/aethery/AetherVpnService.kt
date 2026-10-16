@@ -150,6 +150,12 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
             tun = null
             killSwitchHeld.set(false)
         }
+        if (connected.get() && stopRequested.get()) {
+            // A cancelled attempt is still unwinding (registration cannot be interrupted); the
+            // new one starts as soon as it has finished.
+            reconnectRequested.set(true)
+            return
+        }
         if (!connected.compareAndSet(false, true)) return
         val gen = session.incrementAndGet()
         storedConfig = config
@@ -179,6 +185,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                 NativeCore.attach(this)
                 val result = if (vpnMode) {
                     val addresses = NativeCore.prepare(config)
+                    if (stopRequested.get()) throw CancelledException()
                     pendingAddresses = addresses
                     ConnectionLog.record("Creating Android VPN interface (scan; default route after the tunnel is ready)")
                     if (addresses.organization.isNotBlank()) {
@@ -206,9 +213,15 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                     sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly")
                 }
             } catch (error: Exception) {
-                val detail = NativeCore.lastError().ifBlank { error.message ?: "Tunnel setup failed" }
-                Log.e(LOG_TAG, "Tunnel failed: $detail", error)
-                sendStatus(STATUS_FAILED, detail)
+                if (error is CancelledException || stopRequested.get()) {
+                    // The user cancelled; whatever the attempt ended with is not a failure.
+                    ConnectionLog.record("Connection cancelled")
+                    if (!reconnectRequested.get()) sendStatus(STATUS_DISCONNECTED)
+                } else {
+                    val detail = NativeCore.lastError().ifBlank { error.message ?: "Tunnel setup failed" }
+                    Log.e(LOG_TAG, "Tunnel failed: $detail", error)
+                    sendStatus(STATUS_FAILED, detail)
+                }
             } finally {
                 NativeCore.detach()
                 vpnModeActive.set(false)
@@ -719,6 +732,8 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         private const val LOG_TAG = "AetheryVpn"
     }
 }
+
+private class CancelledException : Exception()
 
 object ConnectionLog {
     private const val MAX_ENTRIES = 100

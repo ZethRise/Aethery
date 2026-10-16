@@ -30,6 +30,7 @@ import studio.cluvex.aethery.ui.haloBackButton
 import studio.cluvex.aethery.ui.haloPageBackground
 import studio.cluvex.aethery.ui.Motion
 import studio.cluvex.aethery.ui.Tilt
+import studio.cluvex.aethery.ui.TunnelToggle
 import studio.cluvex.aethery.ui.UpdatePageController
 import studio.cluvex.aethery.ui.buildChoicePage
 import studio.cluvex.aethery.ui.buildEditorPage
@@ -2748,10 +2749,12 @@ class MainActivity : Activity() {
     }
 
     private fun toggleTunnel() {
-        if (NativeCore.isRunning() || isTunnelActive() || userDisconnecting) {
+        val decision = TunnelToggle.decide(OrbState.valueOf(visualState.name), NativeCore.isRunning(), userDisconnecting)
+        if (decision == TunnelToggle.Decision.DISCONNECT) {
+            val cancelling = visualState == HaloOrb.State.CONNECTING
             userDisconnecting = true
             startService(Intent(this, AetherVpnService::class.java).setAction(AetherVpnService.ACTION_DISCONNECT))
-            showDisconnected("Disconnecting")
+            showDisconnected(if (cancelling) "Connection cancelled" else "Disconnecting")
             return
         }
 
