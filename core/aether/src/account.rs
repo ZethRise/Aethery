@@ -468,6 +468,14 @@ async fn api_call(
     let mut ech = api_ech().await?;
     let fingerprint = crate::tls::Fingerprint::configured();
     let fragment = api_fragment();
+    // A name or address the user gave is used as given; otherwise the first attempts dial edge
+    // addresses directly (see `edge_address`).
+    let user_address = std::env::var("AETHER_ENROLL_ADDRESS").is_ok_and(|value| !value.trim().is_empty());
+    let seed = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0)
+        % 251) as u8;
     let headers = front_headers(bearer, jwt);
     let request = crate::https::Request {
         method,
@@ -499,11 +507,26 @@ async fn api_call(
             tokio::time::sleep(wait).await;
         }
 
+        let edge = if user_address { None } else { edge_address(attempt, seed) };
+        let routed = crate::https::Request {
+            method: request.method,
+            host: request.host,
+            port: request.port,
+            address: match edge.as_deref() {
+                Some(ip) => Some((ip, 443)),
+                None => request.address,
+            },
+            sni: request.sni,
+            path: request.path,
+            headers: request.headers,
+            body: request.body,
+        };
+        let timeout = if edge.is_some() { attempt_timeout(attempt) } else { API_TIMEOUT };
         let sent = crate::https::send_fragmented(
-            &request,
+            &routed,
             &fingerprint,
             ech.as_mut(),
-            API_TIMEOUT,
+            timeout,
             fragment_for_attempt(fragment, attempt),
         )
         .await;
@@ -601,6 +624,32 @@ fn fragment_for_attempt(
         crate::fragment::FragmentConfig { enabled: false, ..policy }
     } else {
         policy
+    }
+}
+
+/// The first Cloudflare edge range the calls to the WARP API dial directly, as the core before 2.x
+/// did: nothing is looked up, so a network that poisons the API's name cannot misdirect them, and
+/// the name stays the server name of the ClientHello and the HTTP host.
+const EDGE_PREFIX: [u8; 3] = [141, 101, 113];
+
+/// How long an attempt at an edge address waits; one by name waits `API_TIMEOUT`.
+const EDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The edge address attempt `attempt` (counting from 0) dials, for the first three attempts, each a
+/// different host of the range, picked from `seed`; none after that, which go by name.
+fn edge_address(attempt: u32, seed: u8) -> Option<String> {
+    if attempt >= 3 {
+        return None;
+    }
+    let last = (u32::from(seed) + attempt * 83) % 254 + 1;
+    Some(format!("{}.{}.{}.{last}", EDGE_PREFIX[0], EDGE_PREFIX[1], EDGE_PREFIX[2]))
+}
+
+fn attempt_timeout(attempt: u32) -> std::time::Duration {
+    if edge_address(attempt, 0).is_some() {
+        EDGE_TIMEOUT
+    } else {
+        API_TIMEOUT
     }
 }
 
@@ -994,6 +1043,36 @@ impl Identity {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_first_attempts_dial_distinct_cloudflare_edge_addresses_and_the_last_use_the_name() {
+        let first: Vec<String> = (0..3).map(|attempt| edge_address(attempt, 7).expect("an edge address")).collect();
+        for address in &first {
+            let octets: Vec<u32> = address.split('.').map(|part| part.parse().expect("a number")).collect();
+            assert_eq!(&octets[..3], &[141, 101, 113], "{address}");
+            assert!((1..=254).contains(&octets[3]), "{address}");
+        }
+        assert!(first[0] != first[1] && first[1] != first[2] && first[0] != first[2], "{first:?}");
+        assert_eq!(edge_address(3, 7), None);
+        assert_eq!(edge_address(4, 7), None);
+    }
+
+    #[test]
+    fn an_edge_address_stays_in_range_whatever_the_seed() {
+        for seed in 0..=255u8 {
+            for attempt in 0..3 {
+                let address = edge_address(attempt, seed).expect("an edge address");
+                let last: u32 = address.rsplit('.').next().unwrap().parse().unwrap();
+                assert!((1..=254).contains(&last), "{address}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_edge_attempt_gives_up_sooner_than_one_by_name() {
+        assert!(attempt_timeout(0) < attempt_timeout(3));
+        assert_eq!(attempt_timeout(3), API_TIMEOUT);
+    }
+
     fn on() -> crate::fragment::FragmentConfig {
         crate::fragment::FragmentConfig {
             enabled: true,

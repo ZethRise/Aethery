@@ -557,8 +557,8 @@ class MainActivity : Activity() {
         })
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(logSelector, LinearLayout.LayoutParams(0, dp(52), 1f).apply { rightMargin = dp(5) })
-            addView(perfSelector, LinearLayout.LayoutParams(0, dp(52), 1f).apply { leftMargin = dp(5) })
+            addView(logSelector, LinearLayout.LayoutParams(0, dp(60), 1f).apply { rightMargin = dp(5) })
+            addView(perfSelector, LinearLayout.LayoutParams(0, dp(60), 1f).apply { leftMargin = dp(5) })
         }, LinearLayout.LayoutParams(fullWidth, wrap).apply {
             topMargin = dp(10); leftMargin = dp(24); rightMargin = dp(24)
         })
@@ -756,10 +756,14 @@ class MainActivity : Activity() {
             isFocusable = true
             highlightOnFocus(18, HaloColors.withAlpha(INK, 0.06f), DIVIDER)
             setOnClickListener { onClick() }
-            addView(sectionLabel(title))
-            addView(label(value, 15f, INK, TypefaceStyle.MEDIUM, singleLine = true), LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f,
-            ).apply { leftMargin = dp(10) })
+            // The label sits above its value, so a long value such as "Medium" is never cut short.
+            val valueView = label(value, 15f, INK, TypefaceStyle.MEDIUM, singleLine = true)
+            tag = valueView
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(sectionLabel(title).apply { textSize = 12f })
+                addView(valueView)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(ChevronView(this@MainActivity, MUTED), LinearLayout.LayoutParams(dp(20), dp(20)))
         }
 
@@ -1684,7 +1688,7 @@ class MainActivity : Activity() {
         description = { it.description },
     ) { chosen ->
         preferences().edit().putString(PERF_PROFILE, chosen.coreName).apply()
-        (perfSelector.getChildAt(1) as? TextView)?.text = chosen.label
+        (perfSelector.tag as? TextView)?.text = chosen.label
     }
 
     private fun chooseH2Fragmentation() = showChoiceSheet(
