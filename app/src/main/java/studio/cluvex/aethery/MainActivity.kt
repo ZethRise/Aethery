@@ -21,6 +21,9 @@ import android.widget.ImageView.ScaleType
 import studio.cluvex.aethery.ui.HaloColors
 import studio.cluvex.aethery.ui.HaloOrb
 import studio.cluvex.aethery.ui.HaloSky
+import studio.cluvex.aethery.ui.PageMotion
+import studio.cluvex.aethery.ui.PageStack
+import studio.cluvex.aethery.ui.haloBackButton
 import studio.cluvex.aethery.ui.Motion
 import studio.cluvex.aethery.ui.Tilt
 import studio.cluvex.aethery.ui.glassBackground
@@ -88,6 +91,7 @@ class MainActivity : Activity() {
     private lateinit var sky: HaloSky
     private var tilt: Tilt? = null
     private lateinit var pageHost: FrameLayout
+    private lateinit var pageStack: PageStack
     private lateinit var appUpdater: AppUpdater
     private var predictiveBackCallback: Any? = null
     private var selectedProtocol = Protocol.MASQUE
@@ -290,6 +294,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
             ))
         }
+        pageStack = PageStack(pageHost)
         setContentView(pageHost)
         configureSystemBars()
         if (savedInstanceState == null) showOpeningOverlay()
@@ -774,14 +779,14 @@ class MainActivity : Activity() {
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeLogsScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
+            addView(createHeaderBackButton { closeLogsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Logs", 22f, INK, TypefaceStyle.MEDIUM))
         }
         content.addView(header)
         content.addView(label("Aether and VPN events", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(16) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(16) })
         val logLevelRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -917,52 +922,17 @@ class MainActivity : Activity() {
     }
 
     private fun animatePageOpen(page: View) {
-        page.alpha = 0f
-        page.translationY = dp(24).toFloat()
-        page.scaleX = 0.92f
-        page.scaleY = 0.92f
-
         val behind = if (pageHost.childCount > 1) pageHost.getChildAt(pageHost.childCount - 2) else mainRoot
-        behind.animate()
-            .alpha(0.5f)
-            .scaleX(0.94f)
-            .scaleY(0.94f)
-            .setDuration(PAGE_ANIMATION_MS)
-            .setInterpolator(motionInterpolator)
-            .start()
-
-        page.animate()
-            .alpha(1f)
-            .translationY(0f)
-            .scaleX(1f)
-            .scaleY(1f)
-            .setDuration(PAGE_ANIMATION_MS)
-            .setInterpolator(motionInterpolator)
-            .start()
+        PageMotion.open(page, behind)
     }
 
     private fun animatePageClose(page: View, onEnd: () -> Unit) {
-        page.animate()
-            .alpha(0f)
-            .translationY(dp(24).toFloat())
-            .scaleX(0.92f)
-            .scaleY(0.92f)
-            .setDuration(LOG_CLOSE_ANIMATION_MS)
-            .setInterpolator(motionInterpolator)
-            .withEndAction {
-                if (page.parent == pageHost) pageHost.removeView(page)
-                onEnd()
-            }
-            .start()
-
-        val behind = if (pageHost.childCount > 1) pageHost.getChildAt(pageHost.childCount - 2) else mainRoot
-        behind.animate()
-            .alpha(1f)
-            .scaleX(1f)
-            .scaleY(1f)
-            .setDuration(LOG_CLOSE_ANIMATION_MS)
-            .setInterpolator(motionInterpolator)
-            .start()
+        val index = pageHost.indexOfChild(page)
+        val behind = if (index > 0) pageHost.getChildAt(index - 1) else mainRoot
+        PageMotion.close(page, behind) {
+            if (page.parent == pageHost) pageHost.removeView(page)
+            onEnd()
+        }
     }
 
     private fun staggerListItems(container: ViewGroup) {
@@ -1016,7 +986,7 @@ class MainActivity : Activity() {
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(CANVAS)
-            addView(createHeaderBackButton { closeScannerScreen() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(createHeaderBackButton { closeScannerScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Scanner options", 22f, INK, TypefaceStyle.MEDIUM).apply {
                 setPadding(dp(4), 0, 0, 0)
             })
@@ -1343,7 +1313,7 @@ class MainActivity : Activity() {
 
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeModeScreen() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(createHeaderBackButton { closeModeScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Connection mode", 22f, INK, TypefaceStyle.MEDIUM).apply {
                 setPadding(dp(4), 0, 0, 0)
             })
@@ -1446,7 +1416,7 @@ class MainActivity : Activity() {
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(CANVAS)
-            addView(createHeaderBackButton { closeSettingsScreen() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(createHeaderBackButton { closeSettingsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Settings", 22f, INK, TypefaceStyle.MEDIUM).apply {
                 setPadding(dp(4), 0, 0, 0)
             })
@@ -1626,12 +1596,12 @@ class MainActivity : Activity() {
         }
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeTunnelControlsScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
+            addView(createHeaderBackButton { closeTunnelControlsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Tunnel controls", 22f, INK, TypefaceStyle.MEDIUM))
         })
         content.addView(label("Applied on your next connection", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(24) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(24) })
         fun addControl(text: String, action: () -> Unit): TextView = createSettingsButton(text, onClick = action).also { button ->
             content.addView(button, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(56),
@@ -1737,12 +1707,12 @@ class MainActivity : Activity() {
         }
         sheet.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Obfuscation", 22f, INK, TypefaceStyle.MEDIUM))
         })
         sheet.addView(label("Adjust traffic-shape padding for filtered networks", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-4); bottomMargin = dp(20) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-4); bottomMargin = dp(20) })
         val options = mutableMapOf<ObfuscationProfile, SelectionOption>()
         ObfuscationProfile.entries.forEachIndexed { index, profile ->
             val title = label(profile.label, 16f, INK, TypefaceStyle.MEDIUM)
@@ -1886,12 +1856,12 @@ class MainActivity : Activity() {
         }
         sheet.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Manual endpoint", 22f, INK, TypefaceStyle.MEDIUM))
         })
         sheet.addView(label("Numeric IPv4 or bracketed IPv6 address with port. Bypasses discovery.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-4); bottomMargin = dp(20) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-4); bottomMargin = dp(20) })
         sheet.addView(field, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)))
         val buttons = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         buttons.addView(createSettingsButton("Clear") {
@@ -1962,12 +1932,12 @@ class MainActivity : Activity() {
         }
         sheet.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label(title, 22f, INK, TypefaceStyle.MEDIUM))
         })
         sheet.addView(label(subtitle, 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-4); bottomMargin = dp(16) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-4); bottomMargin = dp(16) })
         fields.forEach { (name, field) ->
             sheet.addView(label(name, 11f, MUTED).apply { letterSpacing = 0.08f }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -2118,12 +2088,12 @@ class MainActivity : Activity() {
         }
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeZeroTrustScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
+            addView(createHeaderBackButton { closeZeroTrustScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Zero Trust", 22f, INK, TypefaceStyle.MEDIUM))
         })
         content.addView(label("Use email OTP, a service token, or an existing Access JWT.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(12) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(12) })
         listOf(
             "TEAM" to team,
             "EMAIL" to email,
@@ -2239,12 +2209,12 @@ class MainActivity : Activity() {
         }
         sheet.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label(title, 22f, INK, TypefaceStyle.MEDIUM))
         })
         sheet.addView(label(subtitle, 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-4); bottomMargin = dp(20) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-4); bottomMargin = dp(20) })
         val rows = mutableMapOf<T, SelectionOption>()
         options.forEachIndexed { index, item ->
             val optionTitle = label(label(item), 16f, INK, TypefaceStyle.MEDIUM)
@@ -2308,7 +2278,7 @@ class MainActivity : Activity() {
         }
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeWidgetControlScreen() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(createHeaderBackButton { closeWidgetControlScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Widget control", 22f, INK, TypefaceStyle.MEDIUM).apply { setPadding(dp(4), 0, 0, 0) })
         })
         content.addView(label("Add Aethery to the home screen. The controls use the same circle, type, and colours as the app.", 14f, MUTED), LinearLayout.LayoutParams(
@@ -2418,12 +2388,12 @@ class MainActivity : Activity() {
         }
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeWidgetTransportScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
+            addView(createHeaderBackButton { closeWidgetTransportScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("HTTP/3 & HTTP/2", 22f, INK, TypefaceStyle.MEDIUM))
         })
         content.addView(label("Used by the 3×4 widget and the next MASQUE connection.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(24) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(24) })
         content.addView(label("MASQUE", 12f, MUTED).apply { letterSpacing = 0.1f })
         content.addView(createSettingsButton("Transport · ${defaultMasqueTransport().label} ›") {
             chooseMasqueTransport()
@@ -2468,7 +2438,7 @@ class MainActivity : Activity() {
         }
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeTrafficMonitorScreen() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(createHeaderBackButton { closeTrafficMonitorScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Traffic monitor", 22f, INK, TypefaceStyle.MEDIUM).apply { setPadding(dp(4), 0, 0, 0) })
         })
         content.addView(label("Traffic carried by Aethery. Per-app attribution is not available from encrypted tunnel counters.", 14f, MUTED), LinearLayout.LayoutParams(
@@ -2545,7 +2515,7 @@ class MainActivity : Activity() {
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeSplitTunnelScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
+            addView(createHeaderBackButton { closeSplitTunnelScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Split tunneling", 22f, INK, TypefaceStyle.MEDIUM), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(createSettingsButton("Done", backgroundOverride = primary, textColorOverride = primaryContainer) {
                 settings.save(settings.mode(), selected)
@@ -2556,7 +2526,7 @@ class MainActivity : Activity() {
         content.addView(label("Choose which apps use Aethery. Changes apply next connection.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(20) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(20) })
         content.addView(label("MODE", 12f, MUTED).apply { letterSpacing = 0.1f })
         val modeOptions = mutableMapOf<SplitTunnelSettings.Mode, SelectionOption>()
         SplitTunnelSettings.Mode.entries.forEachIndexed { index, mode ->
@@ -2616,7 +2586,7 @@ class MainActivity : Activity() {
 
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeSplitTunnelAppsScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
+            addView(createHeaderBackButton { closeSplitTunnelAppsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Apps", 22f, INK, TypefaceStyle.MEDIUM), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(createSettingsButton("Done", backgroundOverride = primary, textColorOverride = primaryContainer) {
                 settings.save(mode, selected.toHashSet())
@@ -2627,7 +2597,7 @@ class MainActivity : Activity() {
         content.addView(label("Select apps to ${if (mode == SplitTunnelSettings.Mode.INCLUDE) "include" else "exclude"}", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(16) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(16) })
 
         val searchField = EditText(this).apply {
             hint = "Search apps…"
@@ -2907,6 +2877,7 @@ class MainActivity : Activity() {
     }
 
     private fun handleBack(): Boolean {
+        if (pageStack.pop()) return true
         when {
             splitTunnelAppsPage != null -> closeSplitTunnelAppsScreen()
             splitTunnelPage != null -> closeSplitTunnelScreen()
@@ -3130,19 +3101,7 @@ class MainActivity : Activity() {
         return (r * 299 + g * 587 + b * 114) / 1000 < 140
     }
 
-    private fun createHeaderBackButton(onClick: () -> Unit): ImageView = ImageView(this).apply {
-        setImageResource(R.drawable.ic_back)
-        contentDescription = "Back"
-        isClickable = true
-        isFocusable = true
-        val p = dp(12)
-        setPadding(p, p, p, p)
-        setColorFilter(INK)
-        val outValue = android.util.TypedValue()
-        context.theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, outValue, true)
-        setBackgroundResource(outValue.resourceId)
-        setOnClickListener { onClick() }
-    }
+    private fun createHeaderBackButton(onClick: () -> Unit): ImageView = haloBackButton(this, palette, onClick)
 
     private fun dynamicColor(resource: Int, fallback: Int): Int =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) getColor(resource) else fallback
@@ -3359,13 +3318,13 @@ class MainActivity : Activity() {
         }
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeThemeScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
+            addView(createHeaderBackButton { closeThemeScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
             addView(label("Theme", 22f, INK, TypefaceStyle.MEDIUM))
         })
         content.addView(label("Halo is the default. Dynamic follows the phone's light or dark theme. Your choice stays until you change it.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(20) })
+        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(20) })
         val current = AppAppearance.current(this)
         AppAppearance.Theme.entries.forEachIndexed { index, theme ->
             val selected = theme == current

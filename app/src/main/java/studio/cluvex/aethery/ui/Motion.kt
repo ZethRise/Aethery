@@ -30,14 +30,19 @@ class SpringValue(
 ) {
     private val holder = FloatValueHolder(initial)
     private var animation: SpringAnimation? = null
+    private var pendingEnd: (() -> Unit)? = null
 
     val value: Float get() = holder.value
 
-    fun animateTo(target: Float, velocity: Float = 0f) {
+    fun animateTo(target: Float, velocity: Float = 0f, onEnd: (() -> Unit)? = null) {
+        pendingEnd = onEnd
         val running = animation ?: SpringAnimation(holder).also { spring ->
             spring.spring = SpringForce(target)
             spring.setMinimumVisibleChange(0.001f)
             spring.addUpdateListener { _, v, _ -> onUpdate(v) }
+            spring.addEndListener { _, canceled, _, _ ->
+                if (!canceled) pendingEnd?.also { pendingEnd = null }?.invoke()
+            }
             animation = spring
         }
         running.spring.setStiffness(stiffness).setDampingRatio(damping).setFinalPosition(target)
@@ -52,6 +57,7 @@ class SpringValue(
     }
 
     fun cancel() {
+        pendingEnd = null
         animation?.cancel()
     }
 }
