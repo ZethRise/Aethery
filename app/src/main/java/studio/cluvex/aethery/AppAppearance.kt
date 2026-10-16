@@ -21,10 +21,28 @@ object AppAppearance {
         val primaryContainer: Long = 0L,
         val connected: Long = 0L,
         val connectedContainer: Long = 0L,
+        val skyTop: Long = 0L,
+        val skyBottom: Long = 0L,
     ) {
+        HALO(
+            "Halo",
+            "Default. Dusk sky that warms to dawn when you connect",
+            canvas = 0xFF0B0D24,
+            surface = 0xFF1B1A45,
+            surfaceVariant = 0xFF26245C,
+            ink = 0xFFF2EEFF,
+            muted = 0xFFA9A7C9,
+            divider = 0xFF3A3870,
+            primary = 0xFF9DB0FF,
+            primaryContainer = 0xFF2B3470,
+            connected = 0xFFFFC58A,
+            connectedContainer = 0xFF5A3A1E,
+            skyTop = 0xFF0B0D24,
+            skyBottom = 0xFF1B1A45,
+        ),
         DYNAMIC(
             "Dynamic",
-            "Default. Follows the phone's light or dark theme",
+            "Follows the phone's light or dark theme",
             followsSystem = true,
             connected = 0xFF8FFFB5,
             connectedContainer = 0xFF176B3B,
@@ -99,12 +117,17 @@ object AppAppearance {
         val connected: Int,
         val connectedContainer: Int,
         val theme: Theme,
+        val skyTop: Int = canvas,
+        val skyBottom: Int = surface,
+        val dawn: Int = connected,
+        val warning: Int = 0xFFFFB24A.toInt(),
+        val error: Int = 0xFFFF8FA3.toInt(),
     )
 
     fun current(context: Context): Theme {
         val name = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
-            .getString(PREFERENCE, Theme.DYNAMIC.name)
-        return Theme.entries.firstOrNull { it.name == name } ?: Theme.DYNAMIC
+            .getString(PREFERENCE, null)
+        return Theme.entries.firstOrNull { it.name == name } ?: Theme.HALO
     }
 
     fun save(context: Context, theme: Theme) {
@@ -129,6 +152,8 @@ object AppAppearance {
             connected = theme.connected.toInt(),
             connectedContainer = theme.connectedContainer.toInt(),
             theme = theme,
+            skyTop = (if (theme.skyTop != 0L) theme.skyTop else theme.canvas).toInt(),
+            skyBottom = (if (theme.skyBottom != 0L) theme.skyBottom else theme.surface).toInt(),
         )
     }
 

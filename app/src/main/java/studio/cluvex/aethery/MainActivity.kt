@@ -18,6 +18,7 @@ import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.widget.ImageView.ScaleType
+import studio.cluvex.aethery.ui.HaloType
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -3123,10 +3124,16 @@ class MainActivity : Activity() {
             setSingleLine(true)
             ellipsize = android.text.TextUtils.TruncateAt.END
         }
-        typeface = when (style) {
-            TypefaceStyle.REGULAR -> android.graphics.Typeface.create("sans", android.graphics.Typeface.NORMAL)
-            TypefaceStyle.MEDIUM -> android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
-        }
+        typeface = HaloType.body(this@MainActivity, medium = style == TypefaceStyle.MEDIUM)
+    }
+
+    private fun sectionLabel(text: String): TextView = label(text, 13f, MUTED, TypefaceStyle.MEDIUM)
+
+    private fun pageTitle(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 28f
+        setTextColor(INK)
+        typeface = HaloType.display(this@MainActivity)
     }
 
     private fun roundedBackground(fill: Int, radius: Int, stroke: Int, strokeWidth: Int = 1): GradientDrawable =
@@ -3310,7 +3317,7 @@ class MainActivity : Activity() {
             addView(createHeaderBackButton { closeThemeScreen() }, LinearLayout.LayoutParams(dp(48), dp(56)))
             addView(label("Theme", 22f, INK, TypefaceStyle.MEDIUM))
         })
-        content.addView(label("Dynamic is the default and follows the phone's light or dark theme. The other palettes stay until you change them.", 14f, MUTED), LinearLayout.LayoutParams(
+        content.addView(label("Halo is the default. Dynamic follows the phone's light or dark theme. Your choice stays until you change it.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { leftMargin = dp(48); topMargin = dp(-8); bottomMargin = dp(20) })
