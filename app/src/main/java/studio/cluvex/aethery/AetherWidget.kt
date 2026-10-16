@@ -285,7 +285,7 @@ object AetherWidget {
         prefs.edit().putString(DEFAULT_PROTOCOL, chosen).commit()
         val proxy = prefs.getString(CONNECTION_TYPE, "VPN") == "PROXY"
         if (!proxy) {
-            val permission = VpnService.prepare(context)
+            val permission = if (CoreConfig.hasIdentity(context)) VpnService.prepare(context) else Intent()
             if (permission != null) {
                 context.startActivity(
                     Intent(context, MainActivity::class.java)

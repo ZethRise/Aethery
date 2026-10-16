@@ -56,6 +56,13 @@ object CoreConfig {
         }.toString()
     }
 
+    /**
+     * True once any identity has been saved. Callers that would ask Android whether VPN permission
+     * is held must register first when this is false, because that question drops other VPNs.
+     */
+    fun hasIdentity(context: Context): Boolean =
+        context.filesDir.listFiles().orEmpty().any { it.name.startsWith("aether") && it.name.endsWith(".toml") }
+
     fun lanProxyPassword(prefs: android.content.SharedPreferences): String {
         val existing = prefs.getString("lan_proxy_password", "")?.trim().orEmpty()
         if (existing.isNotEmpty()) return existing

@@ -2780,16 +2780,14 @@ class MainActivity : Activity() {
             connect()
             return
         }
-        if (VpnService.prepare(this) == null) {
-            connect()
-        } else {
-            // Approving the permission hands the VPN slot to Aethery and drops whatever VPN was up,
-            // which may be the very one this device needs to reach Cloudflare. Register first.
-            awaitingRegistration = true
-            showConnecting("Registering with Cloudflare")
-            startForegroundService(Intent(this, AetherVpnService::class.java)
-                .setAction(AetherVpnService.ACTION_REGISTER))
-        }
+        // Even asking whether permission is held (VpnService.prepare) hands the VPN slot to Aethery
+        // and drops whatever VPN was up, which may be the one this device needs to reach Cloudflare.
+        // So the identity is registered first; that is quick when it already exists.
+        awaitingRegistration = true
+        showConnecting("Preparing your identity")
+        startForegroundService(Intent(this, AetherVpnService::class.java)
+            .setAction(AetherVpnService.ACTION_REGISTER)
+            .putExtra(AetherVpnService.EXTRA_PROTOCOL, savedProtocol().coreName))
     }
 
     private fun requestVpnPermissionThenConnect() {

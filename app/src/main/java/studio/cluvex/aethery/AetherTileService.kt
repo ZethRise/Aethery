@@ -75,7 +75,7 @@ class AetherTileService : TileService() {
                 tile.updateTile()
             } else {
                 // VPN mode - need permission
-                val permissionIntent = VpnService.prepare(this)
+                val permissionIntent = if (CoreConfig.hasIdentity(this)) VpnService.prepare(this) else Intent()
                 if (permissionIntent == null) {
                     startForegroundService(
                         Intent(this, AetherVpnService::class.java)
