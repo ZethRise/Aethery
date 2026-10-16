@@ -22,8 +22,10 @@ import studio.cluvex.aethery.ui.EditorField
 import studio.cluvex.aethery.ui.HaloColors
 import studio.cluvex.aethery.ui.HaloOrb
 import studio.cluvex.aethery.ui.HaloSky
+import studio.cluvex.aethery.ui.OrbState
 import studio.cluvex.aethery.ui.PageMotion
 import studio.cluvex.aethery.ui.PageStack
+import studio.cluvex.aethery.ui.RunningTunnel
 import studio.cluvex.aethery.ui.haloBackButton
 import studio.cluvex.aethery.ui.haloPageBackground
 import studio.cluvex.aethery.ui.Motion
@@ -2782,9 +2784,10 @@ class MainActivity : Activity() {
             return
         }
         if (NativeCore.isRunning()) {
-            if (!isTunnelActive()) {
-                if (NativeCore.isReady()) showConnected(restored = true)
-                else showConnecting("Tunnel is still running")
+            when (RunningTunnel.action(OrbState.valueOf(visualState.name), NativeCore.isReady())) {
+                RunningTunnel.Action.SHOW_RECOVERED -> showConnected(restored = true)
+                RunningTunnel.Action.SHOW_STILL_RUNNING -> showConnecting("Tunnel is still running")
+                RunningTunnel.Action.KEEP -> Unit
             }
             return
         }
