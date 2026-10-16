@@ -11,16 +11,9 @@
         <item name="android:statusBarColor">#101411</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
-        <item name="materialAlertDialogTheme">@style/ThemeOverlay.Aethery.AlertDialog</item>
     </style>
 
     <style name="Theme.Aethery.Starting" parent="Theme.Aethery" />
 
-    <style name="ThemeOverlay.Aethery.AlertDialog" parent="ThemeOverlay.Material3.MaterialAlertDialog">
-        <item name="shapeAppearanceMediumComponent">@style/ShapeAppearance.Aethery.Dialog</item>
-    </style>
 
-    <style name="ShapeAppearance.Aethery.Dialog" parent="ShapeAppearance.Material3.MediumComponent">
-        <item name="cornerSize">28dp</item>
-    </style>
 </resources>

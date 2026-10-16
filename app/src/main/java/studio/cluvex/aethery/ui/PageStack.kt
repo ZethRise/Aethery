@@ -66,11 +66,14 @@ object PageMotion {
 /** Pushes pages onto [host] above whatever is showing and pops them, one per back press. */
 class PageStack(private val host: FrameLayout) {
     private val model = PageStackModel<View>()
+    private val guards = HashMap<View, () -> Boolean>()
 
     val isEmpty: Boolean get() = model.size == 0
 
-    fun push(page: View) {
+    /** [canClose] is asked before a back press may close [page]; a page doing work says no. */
+    fun push(page: View, canClose: () -> Boolean = { true }) {
         val behind = host.getChildAt(host.childCount - 1)
+        guards[page] = canClose
         model.push(page)
         host.addView(page, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -80,9 +83,15 @@ class PageStack(private val host: FrameLayout) {
         PageMotion.open(page, behind)
     }
 
-    /** Removes the top page; false when there was none. */
-    fun pop(): Boolean {
+    /**
+     * Removes the top page; false when there was none. A page that refuses to close (and is not
+     * [force]d) keeps the press: the result is true and nothing moves.
+     */
+    fun pop(force: Boolean = false): Boolean {
+        val top = model.top() ?: return false
+        if (!force && guards[top]?.invoke() == false) return true
         val page = model.pop() ?: return false
+        guards.remove(page)
         val index = host.indexOfChild(page)
         val behind = if (index > 0) host.getChildAt(index - 1) else page
         PageMotion.close(page, behind) { host.removeView(page) }

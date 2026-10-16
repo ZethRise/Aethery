@@ -5,32 +5,29 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
-import android.widget.LinearLayout
-import android.widget.ProgressBar
 import androidx.core.content.FileProvider
-import androidx.appcompat.app.AlertDialog
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.json.JSONObject
+import studio.cluvex.aethery.ui.UpdateActions
+import studio.cluvex.aethery.ui.UpdatePages
+import studio.cluvex.aethery.ui.UpdateUi
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 
-class AppUpdater(private val activity: Activity) {
+class AppUpdater(private val activity: Activity, private val pages: UpdatePages) {
     private val worker = Executors.newSingleThreadExecutor()
     private var pendingApk: File? = null
-    private var progressDialog: AlertDialog? = null
-    private var progressBar: ProgressBar? = null
+    private var downloadingVersion: String = ""
     private var busy = false
 
     fun checkForUpdate() {
         if (busy) return
         busy = true
-        showProgress("Checking for updates", indeterminate = true)
+        pages.show(UpdateUi.Checking)
         worker.execute {
             val result = runCatching(::latestRelease)
             activity.runOnUiThread {
-                dismissProgress()
                 busy = false
                 result.onFailure { showMessage("Update check failed", it.message ?: "Try again later") }
                     .onSuccess { release ->
@@ -49,25 +46,27 @@ class AppUpdater(private val activity: Activity) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !activity.packageManager.canRequestPackageInstalls()) return
         pendingApk = null
         install(apk)
+        pages.dismiss()
     }
 
     private fun confirmDownload(release: Release) {
-        dialogBuilder()
-            .setTitle("Update available")
-            .setMessage("Aethery ${release.version} is ready to download.")
-            .setNegativeButton("Not now", null)
-            .setPositiveButton("Download") { _, _ -> download(release) }
-            .show()
+        pages.show(
+            UpdateUi.Available(release.version),
+            UpdateActions(
+                primary = "Download" to { download(release) },
+                secondary = "Not now" to { pages.dismiss() },
+            ),
+        )
     }
 
     private fun download(release: Release) {
         if (busy) return
         busy = true
-        showProgress("Downloading ${release.version}", indeterminate = false)
+        downloadingVersion = release.version
+        pages.show(UpdateUi.Downloading(release.version, null))
         worker.execute {
             val result = runCatching { downloadApk(release) }
             activity.runOnUiThread {
-                dismissProgress()
                 busy = false
                 result.onFailure { showMessage("Download failed", it.message ?: "Try again later") }
                     .onSuccess { requestInstall(it) }
@@ -78,17 +77,21 @@ class AppUpdater(private val activity: Activity) {
     private fun requestInstall(apk: File) {
         pendingApk = apk
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !activity.packageManager.canRequestPackageInstalls()) {
-            dialogBuilder()
-                .setTitle("Allow update installs")
-                .setMessage("Android needs permission to install the downloaded Aethery update.")
-                .setNegativeButton("Cancel") { _, _ -> pendingApk = null }
-                .setPositiveButton("Open settings") { _, _ ->
-                    activity.startActivity(Intent(
-                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                        Uri.parse("package:${activity.packageName}"),
-                    ))
-                }
-                .show()
+            pages.show(
+                UpdateUi.NeedsPermission,
+                UpdateActions(
+                    primary = "Open settings" to {
+                        activity.startActivity(Intent(
+                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:${activity.packageName}"),
+                        ))
+                    },
+                    secondary = "Cancel" to {
+                        pendingApk = null
+                        pages.dismiss()
+                    },
+                ),
+            )
         } else {
             resumeInstallIfPermitted()
         }
@@ -181,44 +184,16 @@ class AppUpdater(private val activity: Activity) {
         return target
     }
 
-    private fun showProgress(title: String, indeterminate: Boolean) {
-        val layout = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(8), dp(24), dp(8))
-        }
-        progressBar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-            isIndeterminate = indeterminate
-            max = 100
-        }
-        layout.addView(progressBar)
-        progressDialog = dialogBuilder()
-            .setTitle(title)
-            .setView(layout)
-            .setCancelable(false)
-            .create()
-            .also { it.show() }
-    }
-
     private fun updateProgress(value: Int) = activity.runOnUiThread {
-        progressBar?.progress = value.coerceIn(0, 100)
-    }
-
-    private fun dismissProgress() {
-        progressDialog?.dismiss()
-        progressDialog = null
-        progressBar = null
+        pages.show(UpdateUi.Downloading(downloadingVersion, value.coerceIn(0, 100)))
     }
 
     private fun showMessage(title: String, message: String) {
-        dialogBuilder().setTitle(title).setMessage(message).setPositiveButton("OK", null).show()
+        pages.show(UpdateUi.Message(title, message), UpdateActions(primary = "OK" to { pages.dismiss() }))
     }
-
-    private fun dialogBuilder() = MaterialAlertDialogBuilder(activity, R.style.ThemeOverlay_Aethery_AlertDialog)
 
     private fun appVersion(): String = activity.packageManager
         .getPackageInfo(activity.packageName, 0).versionName ?: "0.0.0"
-
-    private fun dp(value: Int): Int = (value * activity.resources.displayMetrics.density).toInt()
 
     private data class Release(val version: String, val assetName: String, val downloadUrl: String)
 

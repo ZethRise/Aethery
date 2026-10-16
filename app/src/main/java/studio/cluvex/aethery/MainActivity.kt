@@ -27,6 +27,7 @@ import studio.cluvex.aethery.ui.PageStack
 import studio.cluvex.aethery.ui.haloBackButton
 import studio.cluvex.aethery.ui.Motion
 import studio.cluvex.aethery.ui.Tilt
+import studio.cluvex.aethery.ui.UpdatePageController
 import studio.cluvex.aethery.ui.buildChoicePage
 import studio.cluvex.aethery.ui.buildEditorPage
 import studio.cluvex.aethery.ui.glassBackground
@@ -96,6 +97,14 @@ class MainActivity : Activity() {
     private lateinit var pageHost: FrameLayout
     private lateinit var pageStack: PageStack
     private lateinit var appUpdater: AppUpdater
+    private val updatePages: UpdatePageController by lazy {
+        UpdatePageController(
+            context = this,
+            palette = palette,
+            push = { page, canClose -> pageStack.push(page, canClose) },
+            pop = { pageStack.pop(force = true) },
+        )
+    }
     private var predictiveBackCallback: Any? = null
     private var selectedProtocol = Protocol.MASQUE
     private var pendingConfig: String? = null
@@ -221,7 +230,7 @@ class MainActivity : Activity() {
         }
         requestNotificationPermission()
         ConnectionLog.bind(File(filesDir, "connection.log"))
-        appUpdater = AppUpdater(this)
+        appUpdater = AppUpdater(this, updatePages)
 
         connectionControl = HaloOrb(this, palette).apply {
             id = View.generateViewId()

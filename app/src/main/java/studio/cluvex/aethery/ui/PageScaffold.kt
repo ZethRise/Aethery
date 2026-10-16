@@ -11,7 +11,7 @@ import android.widget.TextView
 import studio.cluvex.aethery.AppAppearance
 import kotlin.math.roundToInt
 
-class Scaffold(val page: FrameLayout, val content: LinearLayout)
+class Scaffold(val page: FrameLayout, val content: LinearLayout, val title: TextView)
 
 /**
  * A full page: glass back button top-left, a large title under it, scrolling content, and an
@@ -37,12 +37,13 @@ fun buildScaffold(
         setPadding(dp(24), dp(12), dp(24), dp(24))
     }
     content.addView(haloBackButton(context, palette, onBack), LinearLayout.LayoutParams(dp(44), dp(44)))
-    content.addView(TextView(context).apply {
+    val titleView = TextView(context).apply {
         text = title
         textSize = 28f
         setTextColor(palette.ink)
         typeface = HaloType.display(context)
-    }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+    }
+    content.addView(titleView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
         topMargin = dp(20)
     })
     if (subtitle != null) {
@@ -79,5 +80,5 @@ fun buildScaffold(
         bottomBar?.setPadding(dp(24), dp(12), dp(24), bottom + dp(16))
         insets
     }
-    return Scaffold(page, content)
+    return Scaffold(page, content, titleView)
 }
