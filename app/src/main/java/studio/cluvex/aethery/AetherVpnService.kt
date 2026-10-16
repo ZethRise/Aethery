@@ -67,6 +67,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                 val vpnMode = intent.getBooleanExtra(EXTRA_VPN_MODE, storedVpnModeFromPrefs())
                 startTunnel(configFromIntent(intent), vpnMode)
             }
+            ACTION_REGISTER -> startTunnel(configFromIntent(intent), vpnMode = true, registerOnly = true)
             ACTION_DISCONNECT -> stopTunnel()
             ACTION_RECONNECT -> {
                 ConnectionLog.record("Quick reconnect requested")
@@ -144,7 +145,13 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         }
     }
 
-    private fun startTunnel(config: String, vpnMode: Boolean) {
+    /**
+     * With [registerOnly] the identity is loaded or registered and nothing else happens: no VPN
+     * interface is created and no VPN permission is needed. Cloudflare can be unreachable without a
+     * VPN, and Android lets only one app hold the VPN permission, so a person who relies on another
+     * VPN for the one-time registration must be able to finish it before Aethery takes that over.
+     */
+    private fun startTunnel(config: String, vpnMode: Boolean, registerOnly: Boolean = false) {
         if (killSwitchHeld.get()) {
             tun?.close()
             tun = null
@@ -181,11 +188,18 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         vpnModeActive.set(false)
         startAsForeground()
         worker.execute {
+            var registered = false
             try {
                 ConnectionLog.bind(java.io.File(filesDir, "connection.log"))
                 ConnectionLog.record("Preparing $currentProtocol identity")
                 NativeCore.attach(this)
-                val result = if (vpnMode) {
+                val result = if (registerOnly) {
+                    NativeCore.prepare(config)
+                    if (stopRequested.get()) throw CancelledException()
+                    ConnectionLog.record("Identity ready")
+                    registered = true
+                    0
+                } else if (vpnMode) {
                     val addresses = NativeCore.prepare(config)
                     if (stopRequested.get()) throw CancelledException()
                     pendingAddresses = addresses
@@ -204,7 +218,9 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                     NativeCore.startProxy(config)
                 }
 
-                if (result != 0 && !stopRequested.get() && !reconnectRequested.get()) {
+                if (registered) {
+                    // Reported once the service has settled, so the next start is not turned away.
+                } else if (result != 0 && !stopRequested.get() && !reconnectRequested.get()) {
                     val detail = NativeCore.lastError().ifBlank { "Tunnel exited with code $result" }
                     ConnectionLog.record("Native tunnel exited: $detail")
                     sendStatus(STATUS_FAILED, detail)
@@ -236,7 +252,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                         startTunnel(CoreConfig.json(this), storedVpnMode)
                     }
                     getSharedPreferences("settings", MODE_PRIVATE).getBoolean("kill_switch", false)
-                        && !stopRequested.get() -> {
+                        && !stopRequested.get() && !registered -> {
                         ConnectionLog.record("Kill switch active; blocking all traffic")
                         sendStatus(STATUS_FAILED, "Kill switch active — tunnel dropped")
                         rebuildKillSwitchVpn()
@@ -245,6 +261,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                         closeTun()
                         stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf()
+                        if (registered) sendStatus(STATUS_REGISTERED)
                     }
                 }
             }
@@ -699,6 +716,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
 
     companion object {
         const val ACTION_CONNECT = "studio.cluvex.aethery.CONNECT"
+        const val ACTION_REGISTER = "studio.cluvex.aethery.REGISTER"
         const val ACTION_DISCONNECT = "studio.cluvex.aethery.DISCONNECT"
         const val ACTION_RECONNECT = "studio.cluvex.aethery.RECONNECT"
         const val ACTION_NOTIFICATION_HEALTH = "studio.cluvex.aethery.NOTIFICATION_HEALTH"
@@ -720,6 +738,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         const val EXTRA_VPN_IP = "vpn_ip"
         const val EXTRA_PROTOCOL = "protocol"
         private const val TUNNEL_WANTED = "tunnel_wanted"
+        const val STATUS_REGISTERED = "registered"
         const val STATUS_CONNECTING = "connecting"
         const val STATUS_STARTING = "starting"
         const val STATUS_SCANNING = "scanning"

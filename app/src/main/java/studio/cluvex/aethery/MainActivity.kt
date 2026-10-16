@@ -165,6 +165,7 @@ class MainActivity : Activity() {
     private lateinit var palette: AppAppearance.Palette
     private var lastNightMode = false
     @Volatile private var userDisconnecting = false
+    private var awaitingRegistration = false
     private var previewing = false
     private val CANVAS get() = palette.canvas
     private val SURFACE get() = palette.surface
@@ -212,8 +213,18 @@ class MainActivity : Activity() {
                         ?.let { assignedVpnIp = it }
                     showConnected()
                 }
-                AetherVpnService.STATUS_FAILED -> showFailure(intent.getStringExtra(AetherVpnService.EXTRA_DETAIL))
-                AetherVpnService.STATUS_DISCONNECTED -> showDisconnected()
+                AetherVpnService.STATUS_REGISTERED -> if (awaitingRegistration) {
+                    awaitingRegistration = false
+                    requestVpnPermissionThenConnect()
+                }
+                AetherVpnService.STATUS_FAILED -> {
+                    awaitingRegistration = false
+                    showFailure(intent.getStringExtra(AetherVpnService.EXTRA_DETAIL))
+                }
+                AetherVpnService.STATUS_DISCONNECTED -> {
+                    awaitingRegistration = false
+                    showDisconnected()
+                }
             }
         }
     }
@@ -2755,6 +2766,7 @@ class MainActivity : Activity() {
     private fun toggleTunnel() {
         val decision = TunnelToggle.decide(OrbState.valueOf(visualState.name), NativeCore.isRunning())
         if (decision == TunnelToggle.Decision.DISCONNECT) {
+            awaitingRegistration = false
             val cancelling = visualState == HaloOrb.State.CONNECTING
             // Only a running core has to be waited for; the status poll clears this once it stops.
             userDisconnecting = NativeCore.isRunning()
@@ -2768,8 +2780,22 @@ class MainActivity : Activity() {
             connect()
             return
         }
+        if (VpnService.prepare(this) == null) {
+            connect()
+        } else {
+            // Approving the permission hands the VPN slot to Aethery and drops whatever VPN was up,
+            // which may be the very one this device needs to reach Cloudflare. Register first.
+            awaitingRegistration = true
+            showConnecting("Registering with Cloudflare")
+            startForegroundService(Intent(this, AetherVpnService::class.java)
+                .setAction(AetherVpnService.ACTION_REGISTER))
+        }
+    }
+
+    private fun requestVpnPermissionThenConnect() {
         val permissionIntent = VpnService.prepare(this)
         if (permissionIntent == null) connect() else {
+            showConnecting("Waiting for VPN permission")
             pendingConfig = configJson()
             startActivityForResult(permissionIntent, VPN_REQUEST)
         }
