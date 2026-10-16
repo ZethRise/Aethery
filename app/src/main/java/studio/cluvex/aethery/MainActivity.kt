@@ -18,7 +18,13 @@ import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.widget.ImageView.ScaleType
+import studio.cluvex.aethery.ui.HaloColors
 import studio.cluvex.aethery.ui.HaloOrb
+import studio.cluvex.aethery.ui.HaloSky
+import studio.cluvex.aethery.ui.Motion
+import studio.cluvex.aethery.ui.Tilt
+import studio.cluvex.aethery.ui.glassBackground
+import studio.cluvex.aethery.ui.glassCircle
 import studio.cluvex.aethery.ui.HaloType
 import studio.cluvex.aethery.ui.StageText
 import android.net.ConnectivityManager
@@ -79,6 +85,8 @@ class MainActivity : Activity() {
     private lateinit var scannerSelector: LinearLayout
     private lateinit var scanValue: TextView
     private lateinit var mainRoot: FrameLayout
+    private lateinit var sky: HaloSky
+    private var tilt: Tilt? = null
     private lateinit var pageHost: FrameLayout
     private lateinit var appUpdater: AppUpdater
     private var predictiveBackCallback: Any? = null
@@ -212,58 +220,69 @@ class MainActivity : Activity() {
             id = View.generateViewId()
             setOnClickListener { toggleTunnel() }
         }
-        connectionTitle = label(textSize = 20f, color = INK, style = TypefaceStyle.MEDIUM).apply {
+        connectionTitle = pageTitle("").apply {
+            textSize = 34f
             gravity = Gravity.CENTER
         }
-        connectionDetail = label(textSize = 14f, color = MUTED).apply { gravity = Gravity.CENTER }
+        connectionDetail = label(textSize = 15f, color = MUTED).apply { gravity = Gravity.CENTER }
         latencyGraph = LatencyGraphView(this).apply {
-            isClickable = true
-            isFocusable = true
+            alpha = 0f
+            isClickable = false
+            isFocusable = false
             contentDescription = "Tap to ping"
             setColors(primary, INK, MUTED)
             setOnClickListener { pingConnection() }
             highlightOnFocus(16, Color.TRANSPARENT, DIVIDER)
         }
-        ipAddressLabel = label("PUBLIC IP", 12f, MUTED, TypefaceStyle.MEDIUM).apply {
-            letterSpacing = 0.1f
-        }
-        ipAddressValue = label("Checking…", 16f, INK, TypefaceStyle.MEDIUM, singleLine = true)
+        ipAddressLabel = sectionLabel("Your IP")
+        ipAddressValue = label("Checking…", 18f, INK, TypefaceStyle.MEDIUM, singleLine = true)
         ipAddressCard = createIpAddressCard()
         selectedProtocol = savedProtocol()
         modeValue = label(selectedProtocol.label, 16f, INK, TypefaceStyle.MEDIUM)
-        modeSelector = createModeSelector()
         connectionTypeValue = label(connectionType().label, 16f, INK, TypefaceStyle.MEDIUM)
+        modeSelector = createModeSelector()
         logSelector = createLogSelector()
         perfSelector = createPerfSelector()
         scanValue = label(scanSummary(), 14f, INK, TypefaceStyle.MEDIUM)
         scannerSelector = createScannerSelector()
 
+        sky = HaloSky(this, palette)
         mainRoot = FrameLayout(this).apply { setBackgroundColor(CANVAS) }
+        mainRoot.addView(sky, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
+        connectionControl.onWarmthTarget = { sky.animateWarmth(it) }
         val header = createHeader()
+        val console = createHaloConsole()
+        mainRoot.addView(ScrollView(this).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(console, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
         mainRoot.addView(header, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply {
-            leftMargin = dp(24)
-            rightMargin = dp(24)
+            leftMargin = dp(20)
+            rightMargin = dp(20)
             topMargin = dp(16)
         })
         mainRoot.setOnApplyWindowInsetsListener { _, insets ->
             (header.layoutParams as FrameLayout.LayoutParams).apply {
-                topMargin = insets.systemWindowInsetTop + dp(16)
+                topMargin = insets.systemWindowInsetTop + dp(12)
                 header.layoutParams = this
             }
+            console.setPadding(0, insets.systemWindowInsetTop + dp(64), 0, insets.systemWindowInsetBottom + dp(16))
             insets
         }
-        mainRoot.addView(createConnectionConsole(), FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER,
-        ).apply {
-            leftMargin = dp(24)
-            rightMargin = dp(24)
-            topMargin = dp(17)
-        })
         pageHost = FrameLayout(this).apply {
             setBackgroundColor(CANVAS)
             addView(mainRoot, FrameLayout.LayoutParams(
@@ -299,6 +318,11 @@ class MainActivity : Activity() {
         preferences().registerOnSharedPreferenceChangeListener(prefListener)
         syncSessionFromPrefs()
         connectionControl.resumeAnimation()
+        sky.resume()
+        tilt = Tilt(this) { x, y ->
+            sky.setTilt(x, y)
+            connectionControl.setTilt(x, y)
+        }.also { it.start() }
         statusHandler.removeCallbacks(statusPoll)
         statusPoll.run()
         AetherWidget.refreshAll(this)
@@ -306,6 +330,9 @@ class MainActivity : Activity() {
 
     override fun onStop() {
         connectionControl.pauseAnimation()
+        sky.pause()
+        tilt?.stop()
+        tilt = null
         statusHandler.removeCallbacks(statusPoll)
         if (receiverRegistered) {
             unregisterReceiver(statusReceiver)
@@ -351,6 +378,7 @@ class MainActivity : Activity() {
     }
 
     private fun showOpeningOverlay() {
+        if (Motion.reduced(this)) return
         val overlay = FrameLayout(this).apply {
             setBackgroundColor(CANVAS)
             isClickable = true
@@ -365,32 +393,37 @@ class MainActivity : Activity() {
         }
         overlay.addView(logo, FrameLayout.LayoutParams(dp(198), dp(276), Gravity.CENTER))
         pageHost.addView(overlay)
+        // The orb waits under the overlay until the logo has landed on it.
+        connectionControl.alpha = 0f
 
         logo.animate()
             .alpha(1f)
             .scaleX(1f)
             .scaleY(1f)
             .setDuration(500)
-            .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f))
+            .setInterpolator(motionInterpolator)
             .withEndAction {
                 if (isDestroyed || overlay.parent == null) return@withEndAction
+                val orbCenter = IntArray(2).also(connectionControl::getLocationInWindow)
+                val toOrb = (orbCenter[1] + connectionControl.height / 2f) - pageHost.height / 2f
+                connectionControl.wake()
                 logo.animate()
-                    .scaleX(1.05f)
-                    .scaleY(1.05f)
-                    .setDuration(700)
+                    .translationY(toOrb)
+                    .scaleX(0.4f)
+                    .scaleY(0.4f)
+                    .alpha(0f)
+                    .setDuration(520)
                     .setInterpolator(PathInterpolator(0.4f, 0f, 0.2f, 1f))
+                    .start()
+                overlay.animate()
+                    .alpha(0f)
+                    .setStartDelay(120)
+                    .setDuration(420)
                     .withEndAction {
-                        if (isDestroyed || overlay.parent == null) return@withEndAction
-                        overlay.animate()
-                            .alpha(0f)
-                            .setDuration(300)
-                            .withEndAction {
-                                if (!isDestroyed && overlay.parent != null) {
-                                    pageHost.removeView(overlay)
-                                    connectionControl.requestFocus()
-                                }
-                            }
-                            .start()
+                        if (!isDestroyed && overlay.parent != null) {
+                            pageHost.removeView(overlay)
+                            connectionControl.requestFocus()
+                        }
                     }
                     .start()
             }
@@ -476,81 +509,71 @@ class MainActivity : Activity() {
             contentDescription = "Settings"
             isClickable = true
             isFocusable = true
-            val p = dp(12)
+            val p = dp(11)
             setPadding(p, p, p, p)
             setColorFilter(INK)
-            val outValue = android.util.TypedValue()
-            context.theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, outValue, true)
-            setBackgroundResource(outValue.resourceId)
+            background = glassCircle(palette, 44, resources.displayMetrics.density)
             setOnClickListener { openSettingsScreen() }
-        }, LinearLayout.LayoutParams(dp(48), dp(48)))
+        }, LinearLayout.LayoutParams(dp(44), dp(44)))
     }
 
-    private fun createConnectionConsole(): LinearLayout = LinearLayout(this).apply {
+    private fun createHaloConsole(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER_HORIZONTAL
-        addView(connectionTitle, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ))
-        addView(connectionDetail, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(6) })
-        addView(connectionControl, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(16) })
-        addView(latencyGraph, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(64),
-        ).apply { topMargin = dp(6) })
-        addView(ipAddressCard, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(64),
-        ).apply { topMargin = dp(16) })
-        addView(modeSelector, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(64),
-        ).apply { topMargin = dp(16) })
-        addView(scannerSelector, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(64),
-        ).apply { topMargin = dp(12) })
+        gravity = Gravity.CENTER_HORIZONTAL or Gravity.CENTER_VERTICAL
+        val fullWidth = ViewGroup.LayoutParams.MATCH_PARENT
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        addView(connectionControl, LinearLayout.LayoutParams(fullWidth, wrap))
+        addView(connectionTitle, LinearLayout.LayoutParams(fullWidth, wrap).apply { topMargin = dp(-6) })
+        addView(connectionDetail, LinearLayout.LayoutParams(fullWidth, wrap).apply {
+            topMargin = dp(6); leftMargin = dp(32); rightMargin = dp(32)
+        })
+        addView(ipAddressCard, LinearLayout.LayoutParams(wrap, wrap).apply { topMargin = dp(14) })
+        addView(latencyGraph, LinearLayout.LayoutParams(fullWidth, dp(56)).apply {
+            topMargin = dp(6); leftMargin = dp(24); rightMargin = dp(24)
+        })
+        addView(createRoutePanel(), LinearLayout.LayoutParams(fullWidth, wrap).apply {
+            topMargin = dp(12); leftMargin = dp(24); rightMargin = dp(24)
+        })
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(logSelector, LinearLayout.LayoutParams(0, dp(64), 1f).apply { rightMargin = dp(6) })
-            addView(perfSelector, LinearLayout.LayoutParams(0, dp(64), 1f).apply { leftMargin = dp(6) })
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(12) })
+            addView(logSelector, LinearLayout.LayoutParams(0, dp(52), 1f).apply { rightMargin = dp(5) })
+            addView(perfSelector, LinearLayout.LayoutParams(0, dp(52), 1f).apply { leftMargin = dp(5) })
+        }, LinearLayout.LayoutParams(fullWidth, wrap).apply {
+            topMargin = dp(10); leftMargin = dp(24); rightMargin = dp(24)
+        })
+    }
+
+    private fun createRoutePanel(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = glassBackground(palette, 20, resources.displayMetrics.density)
+        addView(modeSelector, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        addView(View(this@MainActivity).apply {
+            setBackgroundColor(HaloColors.withAlpha(INK, 0.08f))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1).apply {
+            leftMargin = dp(20); rightMargin = dp(20)
+        })
+        addView(scannerSelector, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
     }
 
     private fun createIpAddressCard(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        setPadding(dp(20), 0, dp(18), 0)
-        background = roundedBackground(SURFACE_VARIANT, 20, DIVIDER)
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER_HORIZONTAL
+        setPadding(dp(20), dp(6), dp(20), dp(6))
         contentDescription = "Public IP address"
         isClickable = true
         isFocusable = true
-        highlightOnFocus(20, SURFACE_VARIANT, DIVIDER)
+        highlightOnFocus(16, Color.TRANSPARENT, DIVIDER)
         setOnClickListener { refreshPublicIp() }
-        val labels = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(ipAddressLabel)
-            addView(ipAddressValue, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(2) })
-        }
-        addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        ipRefreshIcon = ImageView(this@MainActivity).apply {
-            setImageResource(R.drawable.ic_refresh)
-            setColorFilter(INK)
-        }
-        addView(ipRefreshIcon, LinearLayout.LayoutParams(dp(22), dp(22)))
+        addView(ipAddressLabel)
+        addView(LinearLayout(this@MainActivity).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(ipAddressValue)
+            ipRefreshIcon = ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.ic_refresh)
+                setColorFilter(MUTED)
+            }
+            addView(ipRefreshIcon, LinearLayout.LayoutParams(dp(18), dp(18)).apply { leftMargin = dp(10) })
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(2) })
     }
 
     private fun refreshPublicIp() {
@@ -561,7 +584,7 @@ class MainActivity : Activity() {
         ipRefreshInFlight = true
         val request = ++ipRequest
         startIpRefreshAnimation()
-        ipAddressLabel.text = if (isTunnelActive()) "VPN IP" else "PUBLIC IP"
+        ipAddressLabel.text = if (isTunnelActive()) "VPN IP" else "Your IP"
         val knownIp = assignedVpnIp.takeIf { isTunnelActive() && it.isNotBlank() }
         ipAddressValue.text = knownIp ?: "Checking…"
         Thread {
@@ -579,9 +602,9 @@ class MainActivity : Activity() {
                 finishIpRefreshAnimation()
                 val (ip, country) = result.getOrElse { "IP unavailable" to "" }
                 ipAddressLabel.text = when {
-                    ip == "IP unavailable" -> "PUBLIC IP"
+                    ip == "IP unavailable" -> "Your IP"
                     isTunnelActive() -> "VPN IP"
-                    else -> "PUBLIC IP"
+                    else -> "Your IP"
                 }
                 val flag = AetherWidget.countryFlag(country)
                 ipAddressValue.text = listOf(flag, ip).filter(String::isNotBlank).joinToString(" ")
@@ -679,87 +702,66 @@ class MainActivity : Activity() {
     private fun createModeSelector(): LinearLayout = LinearLayout(this).apply {
         gravity = Gravity.CENTER_VERTICAL
         orientation = LinearLayout.HORIZONTAL
-        setPadding(dp(20), 0, dp(18), 0)
-        background = roundedBackground(SURFACE_VARIANT, 20, DIVIDER)
+        setPadding(dp(20), dp(14), dp(16), dp(14))
         contentDescription = "Connection mode, ${selectedProtocol.label}"
         isClickable = true
         isFocusable = true
-        highlightOnFocus(20, SURFACE_VARIANT, DIVIDER)
+        highlightOnFocus(20, Color.TRANSPARENT, DIVIDER)
         setOnClickListener { openModeScreen() }
 
-        addView(label("MODE", 12f, MUTED).apply { letterSpacing = 0.1f })
-        addView(modeValue, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-            leftMargin = dp(16)
-        })
-        addView(ChevronView(this@MainActivity, INK), LinearLayout.LayoutParams(dp(24), dp(24)))
+        addView(sectionLabel("Route"), LinearLayout.LayoutParams(dp(78), ViewGroup.LayoutParams.WRAP_CONTENT))
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(modeValue)
+            addView(connectionTypeValue.apply {
+                textSize = 13f
+                setTextColor(MUTED)
+            })
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        addView(ChevronView(this@MainActivity, MUTED), LinearLayout.LayoutParams(dp(24), dp(24)))
     }
 
-    private fun createLogSelector(): LinearLayout = LinearLayout(this).apply {
-        gravity = Gravity.CENTER_VERTICAL
-        orientation = LinearLayout.HORIZONTAL
-        setPadding(dp(20), 0, dp(18), 0)
-        background = roundedBackground(SURFACE_VARIANT, 20, DIVIDER)
-        contentDescription = "View connection log"
-        isClickable = true
-        isFocusable = true
-        highlightOnFocus(20, SURFACE_VARIANT, DIVIDER)
-        setOnClickListener { openLogsScreen() }
+    private fun createLogSelector(): LinearLayout =
+        createChip("Log", "Events", "View connection log") { openLogsScreen() }
 
-        addView(label("LOG", 12f, MUTED).apply { letterSpacing = 0.1f })
-        addView(label("Events", 16f, INK, TypefaceStyle.MEDIUM, singleLine = true), LinearLayout.LayoutParams(
-            0,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            1f,
-        ).apply { leftMargin = dp(16) })
-        addView(ChevronView(this@MainActivity, INK), LinearLayout.LayoutParams(dp(24), dp(24)))
-    }
+    private fun createChip(title: String, value: String, description: String, onClick: () -> Unit): LinearLayout =
+        LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(16), 0, dp(12), 0)
+            background = glassBackground(palette, 18, resources.displayMetrics.density)
+            contentDescription = description
+            isClickable = true
+            isFocusable = true
+            highlightOnFocus(18, HaloColors.withAlpha(INK, 0.06f), DIVIDER)
+            setOnClickListener { onClick() }
+            addView(sectionLabel(title))
+            addView(label(value, 15f, INK, TypefaceStyle.MEDIUM, singleLine = true), LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f,
+            ).apply { leftMargin = dp(10) })
+            addView(ChevronView(this@MainActivity, MUTED), LinearLayout.LayoutParams(dp(20), dp(20)))
+        }
 
-    private fun createPerfSelector(): LinearLayout = LinearLayout(this).apply {
-        gravity = Gravity.CENTER_VERTICAL
-        orientation = LinearLayout.HORIZONTAL
-        setPadding(dp(20), 0, dp(18), 0)
-        background = roundedBackground(SURFACE_VARIANT, 20, DIVIDER)
-        contentDescription = "Performance profile, ${perfProfile().label}"
-        isClickable = true
-        isFocusable = true
-        highlightOnFocus(20, SURFACE_VARIANT, DIVIDER)
-        setOnClickListener { choosePerfProfile() }
-
-        addView(label("PERF", 12f, MUTED).apply { letterSpacing = 0.1f })
-        addView(label(perfProfile().label, 16f, INK, TypefaceStyle.MEDIUM, singleLine = true), LinearLayout.LayoutParams(
-            0,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            1f,
-        ).apply { leftMargin = dp(16) })
-        addView(ChevronView(this@MainActivity, INK), LinearLayout.LayoutParams(dp(24), dp(24)))
-    }
+    private fun createPerfSelector(): LinearLayout =
+        createChip("Performance", perfProfile().label, "Performance profile, ${perfProfile().label}") { choosePerfProfile() }
 
     private fun createScannerSelector(): LinearLayout = LinearLayout(this).apply {
         gravity = Gravity.CENTER_VERTICAL
         orientation = LinearLayout.HORIZONTAL
-        setPadding(dp(20), 0, dp(18), 0)
-        background = roundedBackground(SURFACE_VARIANT, 20, DIVIDER)
+        setPadding(dp(20), dp(14), dp(16), dp(14))
         contentDescription = "Scanner options, ${scanSummary()}"
         isClickable = true
         isFocusable = true
-        highlightOnFocus(20, SURFACE_VARIANT, DIVIDER)
+        highlightOnFocus(20, Color.TRANSPARENT, DIVIDER)
         setOnClickListener { openScannerScreen() }
 
-        addView(label("SCAN", 12f, MUTED).apply { letterSpacing = 0.08f })
+        addView(sectionLabel("Network"), LinearLayout.LayoutParams(dp(78), ViewGroup.LayoutParams.WRAP_CONTENT))
         addView(scanValue.apply {
-            (scanValue.layoutParams as? LinearLayout.LayoutParams)?.let {
-                it.leftMargin = dp(16)
-                scanValue.layoutParams = it
-            }
-            textSize = 16f
+            textSize = 15f
             setSingleLine(true)
             ellipsize = android.text.TextUtils.TruncateAt.END
-        }, LinearLayout.LayoutParams(
-            0,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            1f,
-        ).apply { leftMargin = dp(16) })
-        addView(ChevronView(this@MainActivity, INK), LinearLayout.LayoutParams(dp(24), dp(24)))
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        addView(ChevronView(this@MainActivity, MUTED), LinearLayout.LayoutParams(dp(24), dp(24)))
     }
 
     private fun openLogsScreen() {
@@ -3017,6 +3019,7 @@ class MainActivity : Activity() {
         connectionTitle.setTextColor(primary)
         connectionTitle.text = title
         connectionDetail.text = detail
+        setLatencyVisible(false)
         setModeEnabled(false)
     }
 
@@ -3024,12 +3027,13 @@ class MainActivity : Activity() {
         visualState = HaloOrb.State.CONNECTED
         connectionControl.state = visualState
         connectionTitle.setTextColor(connected)
-        connectionTitle.text = "Connected"
+        connectionTitle.text = "Protected"
         connectionDetail.text = if (restored) "${selectedProtocol.label} tunnel recovered" else "${selectedProtocol.label} tunnel is active"
         if (!restored) {
             latencyGraph.setLabel("Tap to ping")
         }
         if (assignedVpnIp.isBlank()) assignedVpnIp = AetherWidget.currentIp(this)
+        setLatencyVisible(true)
         refreshPublicIp()
         setModeEnabled(false)
     }
@@ -3038,9 +3042,9 @@ class MainActivity : Activity() {
         if (!isTunnelActive()) return
         visualState = HaloOrb.State.DEGRADED
         connectionControl.state = visualState
-        connectionTitle.setTextColor(0xFFFFD180.toInt())
-        connectionTitle.text = "Connection degraded"
-        connectionDetail.text = "Tunnel is active; HTTP health check failed"
+        connectionTitle.setTextColor(palette.warning)
+        connectionTitle.text = "Connection unstable"
+        connectionDetail.text = "The tunnel is up but a health check failed"
         latencyGraph.setLabel("Ping unavailable")
     }
 
@@ -3051,13 +3055,14 @@ class MainActivity : Activity() {
         latencyGraph.reset()
         visualState = HaloOrb.State.FAILED
         connectionControl.state = visualState
-        connectionTitle.setTextColor(ERROR)
-        connectionTitle.text = "Connection failed"
-        connectionDetail.text = detail ?: "Check the server and try again"
+        connectionTitle.setTextColor(palette.error)
+        connectionTitle.text = "Couldn't connect"
+        connectionDetail.text = detail ?: "Check your network and try again"
+        setLatencyVisible(false)
         setModeEnabled(true)
     }
 
-    private fun showDisconnected(detail: String = "Tap the circle to connect") {
+    private fun showDisconnected(detail: String = "Tap the orb to connect") {
         assignedVpnIp = ""
         latencyRequest++
         pingInFlight = false
@@ -3065,10 +3070,19 @@ class MainActivity : Activity() {
         visualState = HaloOrb.State.DISCONNECTED
         connectionControl.state = visualState
         connectionTitle.setTextColor(INK)
-        connectionTitle.text = "Not connected"
+        connectionTitle.text = "Disconnected"
         connectionDetail.text = detail
+        setLatencyVisible(false)
         setModeEnabled(true)
         refreshPublicIp()
+    }
+
+    private fun setLatencyVisible(visible: Boolean) {
+        latencyGraph.animate().cancel()
+        latencyGraph.isClickable = visible
+        latencyGraph.isFocusable = visible
+        if (Motion.reduced(this)) latencyGraph.alpha = if (visible) 1f else 0f
+        else latencyGraph.animate().alpha(if (visible) 1f else 0f).setDuration(320).start()
     }
 
     private fun setModeEnabled(enabled: Boolean) {
@@ -3239,7 +3253,7 @@ class MainActivity : Activity() {
         defaultScan().label,
         defaultScanMode().label,
         defaultMasqueTransport().label.takeIf { selectedProtocol == Protocol.MASQUE },
-    ).joinToString(" · ")
+    ).joinToString(", ")
 
     private fun preferences() = getSharedPreferences(SETTINGS, MODE_PRIVATE)
 
@@ -3730,7 +3744,7 @@ class MainActivity : Activity() {
         const val FALLBACK_PRIMARY = 0xFFA4D8BB.toInt()
         const val FALLBACK_PRIMARY_CONTAINER = 0xFF1F4030.toInt()
         const val ERROR = 0xFFFFB4AB.toInt()
-        const val DISABLED_ALPHA = 0.48f
+        const val DISABLED_ALPHA = 0.62f
     }
 }
 

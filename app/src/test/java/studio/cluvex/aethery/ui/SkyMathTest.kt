@@ -17,7 +17,7 @@ class SkyMathTest {
 
     @Test
     fun aWarmSkyPullsTheHorizonTowardDawnMoreThanTheZenith() {
-        val expected = HaloColors.mix(top, dawn, 0.12f) to HaloColors.mix(bottom, dawn, 0.6f)
+        val expected = HaloColors.mix(top, dawn, 0.06f) to HaloColors.mix(bottom, dawn, 0.3f)
         assertEquals(expected, SkyMath.colors(1f, top, bottom, dawn))
     }
 

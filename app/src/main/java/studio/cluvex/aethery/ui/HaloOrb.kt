@@ -88,12 +88,12 @@ class HaloOrb(context: Context, private val palette: AppAppearance.Palette) : Vi
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val desired = (380 * density).roundToInt()
-        val size = min(resolveSize(desired, widthMeasureSpec), resolveSize(desired, heightMeasureSpec))
-        setMeasuredDimension(size, size)
+        val width = resolveSize(desired, widthMeasureSpec)
+        setMeasuredDimension(width, (width * 0.9f).roundToInt())
     }
 
-    // Glow, rings and the bloom ring all stay within 1.5 radii so the view's bounds never clip them.
-    private fun radius(): Float = min(width, height) * 0.33f
+    // Glow and rings stay within 1.4 radii, which is the view's half-height, so its bounds never clip them.
+    private fun radius(): Float = width * 0.33f
 
     // --- state ---------------------------------------------------------------------------
 
@@ -353,12 +353,12 @@ class HaloOrb(context: Context, private val palette: AppAppearance.Palette) : Vi
 
         // Halo glow behind everything.
         paint.shader = RadialGradient(
-            cx, cy, radius * 1.5f,
+            cx, cy, radius * 1.4f,
             intArrayOf(HaloColors.withAlpha(glowColor, 0.34f * stateAlpha), HaloColors.withAlpha(glowColor, 0f)),
             floatArrayOf(0.6f, 1f),
             Shader.TileMode.CLAMP,
         )
-        canvas.drawCircle(cx, cy, radius * 1.5f, paint)
+        canvas.drawCircle(cx, cy, radius * 1.4f, paint)
         paint.shader = null
 
         drawRings(canvas, cx, cy, radius, look.rings)
@@ -400,7 +400,7 @@ class HaloOrb(context: Context, private val palette: AppAppearance.Palette) : Vi
         }
         for (i in 0 until 3) {
             val phase = ((timeSeconds / 1.6f) + i / 3f) % 1f
-            val r = radius * (1.5f - 0.45f * phase)
+            val r = radius * (1.4f - 0.4f * phase)
             val a = sin(PI * phase).toFloat() * 0.55f
             strokePaint.color = HaloColors.withAlpha(palette.primary, a)
             canvas.drawCircle(cx, cy, r, strokePaint)

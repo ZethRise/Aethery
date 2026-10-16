@@ -7,10 +7,11 @@ object SkyMath {
 
     /**
      * Zenith and horizon colours of the sky for a warmth level (0 cold, 1 warm). Warmth pulls the
-     * horizon much further toward dawn than the zenith, like a sunrise.
+     * horizon further toward dawn than the zenith, but only part of the way: the rest of the
+     * warmth is the radial glow, so text on the lower screen keeps its contrast.
      */
     fun colors(warmth: Float, top: Int, bottom: Int, dawn: Int): Pair<Int, Int> =
-        HaloColors.mix(top, dawn, warmth * 0.12f) to HaloColors.mix(bottom, dawn, warmth * 0.6f)
+        HaloColors.mix(top, dawn, warmth * 0.06f) to HaloColors.mix(bottom, dawn, warmth * 0.3f)
 
     fun stars(seed: Long, count: Int): List<Star> {
         val random = Random(seed)
