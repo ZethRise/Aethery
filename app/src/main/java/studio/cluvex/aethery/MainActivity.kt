@@ -25,6 +25,7 @@ import studio.cluvex.aethery.ui.HaloSky
 import studio.cluvex.aethery.ui.PageMotion
 import studio.cluvex.aethery.ui.PageStack
 import studio.cluvex.aethery.ui.haloBackButton
+import studio.cluvex.aethery.ui.haloPageBackground
 import studio.cluvex.aethery.ui.Motion
 import studio.cluvex.aethery.ui.Tilt
 import studio.cluvex.aethery.ui.UpdatePageController
@@ -397,7 +398,7 @@ class MainActivity : Activity() {
     private fun showOpeningOverlay() {
         if (Motion.reduced(this)) return
         val overlay = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val logo = ImageView(this).apply {
@@ -785,14 +786,14 @@ class MainActivity : Activity() {
         showingLogs = true
         logsPage?.let(pageHost::removeView)
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeLogsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Logs", 22f, INK, TypefaceStyle.MEDIUM))
+            addView(pageTitle("Logs"))
         }
         content.addView(header)
         content.addView(label("Aether and VPN events", 14f, MUTED), LinearLayout.LayoutParams(
@@ -808,7 +809,8 @@ class MainActivity : Activity() {
             val isActive = level == currentLogLevel
             val chip = label(level.label, 14f, if (isActive) primaryContainer else INK, TypefaceStyle.MEDIUM).apply {
                 gravity = Gravity.CENTER
-                setPadding(dp(15), dp(8), dp(15), dp(8))
+                setPadding(dp(6), dp(8), dp(6), dp(8))
+                setSingleLine(true)
                 background = roundedBackground(if (isActive) primary else SURFACE_VARIANT, 14, if (isActive) primary else DIVIDER)
                 isClickable = true
                 isFocusable = true
@@ -983,7 +985,7 @@ class MainActivity : Activity() {
         scannerPage?.let(pageHost::removeView)
 
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val scroll = ScrollView(this).apply {
@@ -997,9 +999,8 @@ class MainActivity : Activity() {
 
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(CANVAS)
             addView(createHeaderBackButton { closeScannerScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Scanner options", 22f, INK, TypefaceStyle.MEDIUM).apply {
+            addView(pageTitle("Scanner options").apply {
                 setPadding(dp(4), 0, 0, 0)
             })
         }
@@ -1014,7 +1015,7 @@ class MainActivity : Activity() {
         val modeOptions = mutableMapOf<ScanMode, SelectionOption>()
         val targetOptions = mutableMapOf<ScanTarget, SelectionOption>()
 
-        options.addView(label(if (selectedProtocol == Protocol.MASQUE) "MASQUE GATEWAY DISCOVERY" else "WIREGUARD ENDPOINT DISCOVERY", 12f, MUTED).apply { letterSpacing = 0.1f })
+        options.addView(sectionLabel(if (selectedProtocol == Protocol.MASQUE) "MASQUE gateway discovery" else "WireGuard endpoint discovery"))
         EndpointDiscovery.entries.forEachIndexed { index, discovery ->
             val option = createEndpointDiscoveryOption(discovery) { chosen ->
                 getSharedPreferences(SETTINGS, MODE_PRIVATE).edit()
@@ -1030,7 +1031,7 @@ class MainActivity : Activity() {
         }
 
         if (selectedProtocol == Protocol.MASQUE) {
-            options.addView(label("MASQUE TRANSPORT", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+            options.addView(sectionLabel("MASQUE transport"), LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(20) })
@@ -1049,7 +1050,7 @@ class MainActivity : Activity() {
             }
         }
 
-        options.addView(label("SCAN MODE", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        options.addView(sectionLabel("Scan mode"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(20) })
@@ -1067,7 +1068,7 @@ class MainActivity : Activity() {
             ).apply { topMargin = if (index == 0) dp(10) else dp(8) })
         }
 
-        options.addView(label("IP VERSION", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        options.addView(sectionLabel("IP version"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(20) })
@@ -1130,7 +1131,7 @@ class MainActivity : Activity() {
     private fun createScannerOption(target: ScanTarget, onSelect: (ScanTarget) -> Unit): SelectionOption {
         val selected = target == defaultScan()
         val title = label(target.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("SELECTED", 11f, primary, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.08f }
+        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
         val row = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             orientation = LinearLayout.HORIZONTAL
@@ -1157,7 +1158,7 @@ class MainActivity : Activity() {
     ): SelectionOption {
         val selected = discovery == defaultEndpointDiscovery()
         val title = label(discovery.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("SELECTED", 11f, primary, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.08f }
+        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
         val row = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             orientation = LinearLayout.HORIZONTAL
@@ -1181,7 +1182,7 @@ class MainActivity : Activity() {
     private fun createScanModeOption(mode: ScanMode, onSelect: (ScanMode) -> Unit): SelectionOption {
         val selected = mode == defaultScanMode()
         val title = label(mode.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("SELECTED", 11f, primary, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.08f }
+        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
         val row = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             orientation = LinearLayout.HORIZONTAL
@@ -1208,7 +1209,7 @@ class MainActivity : Activity() {
     ): SelectionOption {
         val selected = transport == defaultMasqueTransport()
         val title = label(transport.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("SELECTED", 11f, primary, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.08f }
+        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
         val row = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             orientation = LinearLayout.HORIZONTAL
@@ -1259,7 +1260,7 @@ class MainActivity : Activity() {
         modePage?.let(pageHost::removeView)
 
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val content = LinearLayout(this).apply {
@@ -1270,7 +1271,7 @@ class MainActivity : Activity() {
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeModeScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Connection mode", 22f, INK, TypefaceStyle.MEDIUM).apply {
+            addView(pageTitle("Connection mode").apply {
                 setPadding(dp(4), 0, 0, 0)
             })
         }
@@ -1343,11 +1344,7 @@ class MainActivity : Activity() {
             ).apply { topMargin = dp(2) })
 
             addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            if (selected) addView(label("CURRENT", 11f, primary, TypefaceStyle.MEDIUM).apply {
-                letterSpacing = 0.08f
-            }) else if (!protocol.androidAvailable) addView(label("DESKTOP ONLY", 11f, MUTED, TypefaceStyle.MEDIUM).apply {
-                letterSpacing = 0.05f
-            })
+            if (selected) addView(label("Current", 12f, primary, TypefaceStyle.MEDIUM)) else if (!protocol.androidAvailable) addView(label("Desktop only", 12f, MUTED, TypefaceStyle.MEDIUM))
         }
     }
 
@@ -1357,7 +1354,7 @@ class MainActivity : Activity() {
         settingsPage?.let(pageHost::removeView)
 
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val scroll = ScrollView(this).apply {
@@ -1371,19 +1368,18 @@ class MainActivity : Activity() {
 
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(CANVAS)
             addView(createHeaderBackButton { closeSettingsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Settings", 22f, INK, TypefaceStyle.MEDIUM).apply {
+            addView(pageTitle("Settings").apply {
                 setPadding(dp(4), 0, 0, 0)
             })
         }
-        content.addView(label("CONNECTION TYPE", 12f, MUTED).apply { letterSpacing = 0.1f })
+        content.addView(sectionLabel("Connection type"))
         content.addView(createSettingsButton("${connectionType().label} ›") { showConnectionTypeSheet() }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             dp(56),
         ).apply { topMargin = dp(8) })
 
-        content.addView(label("KILL SWITCH", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Kill switch"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(24) })
@@ -1396,7 +1392,7 @@ class MainActivity : Activity() {
             dp(72),
         ).apply { topMargin = dp(8) })
 
-        content.addView(label("LOCAL NETWORK", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Local network"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(24) })
@@ -1427,7 +1423,7 @@ class MainActivity : Activity() {
             dp(72),
         ).apply { topMargin = dp(8) })
 
-        content.addView(label("TRAFFIC", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Traffic"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(24) })
@@ -1451,7 +1447,7 @@ class MainActivity : Activity() {
             fieldDescription = "Core HTTP CONNECT port",
         ) { applyListenPort(it, DEFAULT_HTTP_PROXY_PORT, socksPort(), "SOCKS5") }
 
-        content.addView(label("NATIVE SPLIT TUNNELING", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Native split tunneling"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(24) })
@@ -1460,7 +1456,7 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             dp(52),
         ).apply { topMargin = dp(10) })
-        content.addView(label("APPEARANCE", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Appearance"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(24) })
@@ -1468,7 +1464,7 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             dp(52),
         ).apply { topMargin = dp(10) })
-        content.addView(label("HOME SCREEN", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Home screen"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(24) })
@@ -1476,7 +1472,7 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             dp(52),
         ).apply { topMargin = dp(10) })
-        content.addView(label("CONNECTION ADVANCED", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Connection advanced"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(28) })
@@ -1542,7 +1538,7 @@ class MainActivity : Activity() {
         tunnelControlsPage?.let(pageHost::removeView)
 
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
@@ -1553,7 +1549,7 @@ class MainActivity : Activity() {
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeTunnelControlsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Tunnel controls", 22f, INK, TypefaceStyle.MEDIUM))
+            addView(pageTitle("Tunnel controls"))
         })
         content.addView(label("Applied on your next connection", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1563,7 +1559,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(56),
             ).apply { topMargin = dp(10) })
         }
-        content.addView(label("CONNECTION SHAPING", 12f, MUTED).apply { letterSpacing = 0.1f })
+        content.addView(sectionLabel("Connection shaping"))
         addControl("Obfuscation · ${obfuscationProfile().label} ›") { chooseObfuscation() }
         addControl("Advanced obfuscation · ${advancedObfuscationSummary()} ›") { editAdvancedObfuscation() }
         lateinit var retryButton: TextView
@@ -1571,12 +1567,12 @@ class MainActivity : Activity() {
             preferences().edit().putBoolean(RETRY_OBFUSCATION, !retryObfuscationProfiles()).apply()
             updateTunnelControlButton(retryButton, "WireGuard retries · ${if (retryObfuscationProfiles()) "On" else "Off"}")
         }
-        content.addView(label("ROUTING", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Routing"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(28) })
         addControl("Manual endpoint · ${manualEndpoint() ?: "Automatic"} ›") { editManualEndpoint() }
         addControl("Gateway cache · ${defaultEndpointDiscovery().label} ›") { manageGatewayCache() }
-        content.addView(label("TROUBLESHOOTING", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Troubleshooting"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(28) })
         addControl("TLS fingerprint · ${tlsCurvePreset().label} ›") { chooseTlsCurvePreset() }
@@ -1585,13 +1581,13 @@ class MainActivity : Activity() {
             preferences().edit().putBoolean(WIREGUARD_DATA_CHECK, !wireGuardDataCheck()).apply()
             updateTunnelControlButton(verificationButton, "WireGuard verification · ${if (wireGuardDataCheck()) "Strict" else "Fast"} ›")
         }
-        content.addView(label("AETHER 1.5", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("Aether 1.5"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(28) })
         addControl("DNS resolvers · ${dnsSummary()} ›") { editDnsServers() }
         addControl("Destination routing · ${routingSummary()} ›") { editRoutingRules() }
         zeroTrustControlButton = addControl("Zero Trust · ${zeroTrustSummary()} ›") { openZeroTrustScreen() }
-        content.addView(label("MASQUE", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("MASQUE"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(28) })
         lateinit var h2FallbackButton: TextView
@@ -1833,7 +1829,7 @@ class MainActivity : Activity() {
 
     private fun sentenceCase(text: String): String {
         if (text != text.uppercase()) return text
-        val keep = setOf("CIDR", "DNS", "I1", "I2", "IP")
+        val keep = setOf("CIDR", "DNS", "I1", "I2", "IP", "SOCKS", "SOCKS5", "HTTP", "MASQUE", "VPN", "JWT", "ID", "OTP")
         return text.split(' ').mapIndexed { index, word ->
             when {
                 word in keep -> word
@@ -1948,7 +1944,7 @@ class MainActivity : Activity() {
         val token = settingsField(SecureStore.getSecret(this, ZERO_TRUST_TOKEN), "Access JWT", secure = true)
         val status = label("", 13f, MUTED)
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val scroll = ScrollView(this).apply {
@@ -1962,7 +1958,7 @@ class MainActivity : Activity() {
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeZeroTrustScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Zero Trust", 22f, INK, TypefaceStyle.MEDIUM))
+            addView(pageTitle("Zero Trust"))
         })
         content.addView(label("Use email OTP, a service token, or an existing Access JWT.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1975,7 +1971,7 @@ class MainActivity : Activity() {
             "SERVICE SECRET" to clientSecret,
             "ACCESS JWT" to token,
         ).forEach { (name, field) ->
-            content.addView(label(name, 11f, MUTED).apply { letterSpacing = 0.08f }, LinearLayout.LayoutParams(
+            content.addView(sectionLabel(sentenceCase(name)), LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(10); bottomMargin = dp(6) })
             content.addView(field, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)))
@@ -2096,7 +2092,7 @@ class MainActivity : Activity() {
     private fun openWidgetControlScreen() {
         widgetControlPage?.let(pageHost::removeView)
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val scroll = ScrollView(this).apply {
@@ -2110,7 +2106,7 @@ class MainActivity : Activity() {
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeWidgetControlScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Widget control", 22f, INK, TypefaceStyle.MEDIUM).apply { setPadding(dp(4), 0, 0, 0) })
+            addView(pageTitle("Widget control").apply { setPadding(dp(4), 0, 0, 0) })
         })
         content.addView(label("Add Aethery to the home screen. The controls use the same circle, type, and colours as the app.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -2136,7 +2132,7 @@ class MainActivity : Activity() {
             kind = AetherWidget.Kind.CONSOLE,
         ))
 
-        content.addView(label("HTTP/3 AND HTTP/2", 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel("HTTP/3 and HTTP/2"), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(16) })
@@ -2209,7 +2205,7 @@ class MainActivity : Activity() {
     private fun openWidgetTransportScreen() {
         widgetTransportPage?.let(pageHost::removeView)
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
@@ -2220,12 +2216,12 @@ class MainActivity : Activity() {
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeWidgetTransportScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("HTTP/3 & HTTP/2", 22f, INK, TypefaceStyle.MEDIUM))
+            addView(pageTitle("HTTP/3 & HTTP/2"))
         })
         content.addView(label("Used by the 3×4 widget and the next MASQUE connection.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(24) })
-        content.addView(label("MASQUE", 12f, MUTED).apply { letterSpacing = 0.1f })
+        content.addView(sectionLabel("MASQUE"))
         content.addView(createSettingsButton("Transport · ${defaultMasqueTransport().label} ›") {
             chooseMasqueTransport()
         }, LinearLayout.LayoutParams(
@@ -2259,7 +2255,7 @@ class MainActivity : Activity() {
     private fun openTrafficMonitorScreen() {
         trafficMonitorPage?.let(pageHost::removeView)
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
@@ -2270,7 +2266,7 @@ class MainActivity : Activity() {
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeTrafficMonitorScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Traffic monitor", 22f, INK, TypefaceStyle.MEDIUM).apply { setPadding(dp(4), 0, 0, 0) })
+            addView(pageTitle("Traffic monitor").apply { setPadding(dp(4), 0, 0, 0) })
         })
         content.addView(label("Traffic carried by Aethery. Per-app attribution is not available from encrypted tunnel counters.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -2301,7 +2297,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(16), dp(20), dp(16))
             background = roundedBackground(SURFACE_VARIANT, 20, DIVIDER)
-            addView(label(title, 12f, MUTED, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.1f })
+            addView(sectionLabel(sentenceCase(title)))
             addView(value, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -2340,14 +2336,14 @@ class MainActivity : Activity() {
         splitTunnelDraftMode = settings.mode()
         splitTunnelDraftPackages = selected
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeSplitTunnelScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Split tunneling", 22f, INK, TypefaceStyle.MEDIUM), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(pageTitle("Split tunneling"), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(createSettingsButton("Done", backgroundOverride = primary, textColorOverride = primaryContainer) {
                 settings.save(settings.mode(), selected)
                 closeSplitTunnelScreen()
@@ -2358,7 +2354,7 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(20) })
-        content.addView(label("MODE", 12f, MUTED).apply { letterSpacing = 0.1f })
+        content.addView(sectionLabel("Mode"))
         val modeOptions = mutableMapOf<SplitTunnelSettings.Mode, SelectionOption>()
         SplitTunnelSettings.Mode.entries.forEachIndexed { index, mode ->
             val option = createSplitModeOption(mode, settings.mode()) { chosen ->
@@ -2409,7 +2405,7 @@ class MainActivity : Activity() {
         splitTunnelDraftPackages = selected
         val settings = SplitTunnelSettings(this)
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -2418,7 +2414,7 @@ class MainActivity : Activity() {
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeSplitTunnelAppsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Apps", 22f, INK, TypefaceStyle.MEDIUM), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(pageTitle("Apps"), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(createSettingsButton("Done", backgroundOverride = primary, textColorOverride = primaryContainer) {
                 settings.save(mode, selected.toHashSet())
                 closeSplitTunnelAppsScreen()
@@ -2627,7 +2623,7 @@ class MainActivity : Activity() {
         onSelect: (SplitTunnelSettings.Mode) -> Unit,
     ): SelectionOption {
         val title = label(mode.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("SELECTED", 11f, primary, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.08f }
+        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
         val row = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(18), 0, dp(18), 0)
@@ -3140,7 +3136,7 @@ class MainActivity : Activity() {
     private fun openThemeScreen() {
         themePage?.let(pageHost::removeView)
         val page = FrameLayout(this).apply {
-            setBackgroundColor(CANVAS)
+            background = haloPageBackground(palette)
             isClickable = true
         }
         val content = LinearLayout(this).apply {
@@ -3150,7 +3146,7 @@ class MainActivity : Activity() {
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(createHeaderBackButton { closeThemeScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Theme", 22f, INK, TypefaceStyle.MEDIUM))
+            addView(pageTitle("Theme"))
         })
         content.addView(label("Halo is the default. Dynamic follows the phone's light or dark theme. Your choice stays until you change it.", 14f, MUTED), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -3187,7 +3183,7 @@ class MainActivity : Activity() {
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                 ).apply { topMargin = dp(2) })
                 addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                if (selected) addView(label("CURRENT", 11f, primary, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.08f })
+                if (selected) addView(label("Current", 12f, primary, TypefaceStyle.MEDIUM))
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(76),
@@ -3317,7 +3313,7 @@ class MainActivity : Activity() {
         fieldDescription: String,
         onApply: (EditText) -> Unit,
     ) {
-        content.addView(label(heading, 12f, MUTED).apply { letterSpacing = 0.1f }, LinearLayout.LayoutParams(
+        content.addView(sectionLabel(sentenceCase(heading)), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = dp(24) })
