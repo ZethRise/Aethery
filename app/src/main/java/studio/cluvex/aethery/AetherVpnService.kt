@@ -134,6 +134,9 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
                 "log" -> {
                     val message = event.getString("message")
                     ConnectionLog.record(message)
+                    sendBroadcast(Intent(ACTION_STAGE)
+                        .setPackage(packageName)
+                        .putExtra(EXTRA_STAGE, message))
                 }
             }
         } catch (e: Exception) {
@@ -684,6 +687,8 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         const val ACTION_RECONNECT = "studio.cluvex.aethery.RECONNECT"
         const val ACTION_NOTIFICATION_HEALTH = "studio.cluvex.aethery.NOTIFICATION_HEALTH"
         const val ACTION_STATUS = "studio.cluvex.aethery.STATUS"
+        const val ACTION_STAGE = "studio.cluvex.aethery.STAGE"
+        const val EXTRA_STAGE = "stage"
         const val EXTRA_CONFIG = "config"
         const val EXTRA_VPN_MODE = "vpn_mode"
         const val EXTRA_STATUS = "status"

@@ -19,6 +19,7 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.widget.ImageView.ScaleType
 import studio.cluvex.aethery.ui.HaloType
+import studio.cluvex.aethery.ui.StageText
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -149,6 +150,15 @@ class MainActivity : Activity() {
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == AetherVpnService.ACTION_STAGE) {
+                // Stage text only describes an attempt in progress; any other state overwrites it.
+                if (visualState == ConnectionControl.State.CONNECTING) {
+                    intent.getStringExtra(AetherVpnService.EXTRA_STAGE)
+                        ?.let(StageText::plain)
+                        ?.let { connectionDetail.text = it }
+                }
+                return
+            }
             if (intent.hasExtra(AetherVpnService.EXTRA_TRAFFIC_TX)) {
                 trafficTx = intent.getLongExtra(AetherVpnService.EXTRA_TRAFFIC_TX, 0)
                 trafficRx = intent.getLongExtra(AetherVpnService.EXTRA_TRAFFIC_RX, 0)
@@ -273,7 +283,9 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        val filter = IntentFilter(AetherVpnService.ACTION_STATUS)
+        val filter = IntentFilter(AetherVpnService.ACTION_STATUS).apply {
+            addAction(AetherVpnService.ACTION_STAGE)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
