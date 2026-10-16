@@ -911,13 +911,49 @@ async fn load_or_provision_warp(config_path: &str) -> Result<account::Identity> 
     Ok(identity)
 }
 
+/// The wireguard identity a gool tunnel carries inside its masque tunnel. Start registers it
+/// through the masque tunnel when missing; preparing it here, directly, keeps that registration
+/// from happening after the tunnel has taken over from the VPN that made it reachable.
+async fn preregister_gool_inner(inner_path: &str) -> Result<account::Identity> {
+    if let Some(identity) = config::load(inner_path)? {
+        return Ok(identity);
+    }
+    crate::ffi::record_log("Registering with Cloudflare");
+    let identity =
+        account::provision_wg(consts::DEFAULT_MODEL, consts::DEFAULT_LOCALE, None).await?;
+    if let Err(error) = account::enable_warp(&identity.device_id, &identity.access_token).await {
+        log::warn!("[-] could not enable warp on the gool identity: {error}");
+    }
+    config::save(inner_path, &identity)?;
+    log::info!("[+] gool wireguard identity registered and saved to {inner_path}");
+    Ok(identity)
+}
+
+static WARP_ENABLED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Enabling warp is a Cloudflare API call that only needs to succeed once; repeating it when the
+/// tunnel starts would reach for the API again after the VPN that made it reachable has gone.
+fn warp_enable_needed(device_id: &str) -> bool {
+    !WARP_ENABLED.lock().unwrap().iter().any(|id| id == device_id)
+}
+
+fn mark_warp_enabled(device_id: &str) {
+    let mut seen = WARP_ENABLED.lock().unwrap();
+    if !seen.iter().any(|id| id == device_id) {
+        seen.push(device_id.to_string());
+    }
+}
+
 async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity> {
     let identity = load_or_enrol_masque(config_path).await?;
-    if identity.refused {
+    if identity.refused || !warp_enable_needed(&identity.device_id) {
         return Ok(identity);
     }
     match account::enable_warp(&identity.device_id, &identity.access_token).await {
-        Ok(()) => log::info!("[+] warp enabled for the masque device"),
+        Ok(()) => {
+            mark_warp_enabled(&identity.device_id);
+            log::info!("[+] warp enabled for the masque device");
+        }
         Err(error) => log::warn!(
             "[!] could not enable warp for the masque device, the edge may refuse it: {error}"
         ),
@@ -3985,17 +4021,27 @@ pub async fn prepare(options: &StartOptions) -> Result<TunnelAddresses> {
     apply_runtime_options(options);
     initialize();
 
+    // Everything that has to reach the Cloudflare API is done here, before the tunnel exists:
+    // on a network that blocks it the only way in can be another VPN, which the tunnel replaces.
+    // This must cover every identity the protocol's start will ask for.
     let identity = match options.protocol {
         Protocol::Masque => load_or_provision_masque(&masque_config_path(&options.config_path)).await?,
         Protocol::WireGuard => load_or_provision_warp(&warp_config_path(&options.config_path)).await?,
+        Protocol::WarpInWarp if !gool_classic() => {
+            let masque_path = masque_config_path(&options.config_path);
+            load_or_provision_masque(&masque_path).await?;
+            preregister_gool_inner(&derive_sibling_path(&masque_path, "gool")).await?
+        }
         Protocol::WarpInWarp => {
             let primary_path = warp_config_path(&options.config_path);
             let secondary_path = derive_sibling_path(&primary_path, "secondary");
+            load_or_provision_warp(&primary_path).await?;
             load_or_provision_warp(&secondary_path).await?
         }
         Protocol::MasqueInMasque => {
             let primary_path = masque_config_path(&options.config_path);
             let secondary_path = derive_sibling_path(&primary_path, "secondary");
+            load_or_provision_masque(&primary_path).await?;
             load_or_provision_masque(&secondary_path).await?
         }
     };
@@ -4050,6 +4096,15 @@ async fn select_ip_version() -> prober::IpScan {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn warp_is_enabled_once_per_device_and_retried_until_it_succeeds() {
+        assert!(super::warp_enable_needed("device-a-test"));
+        assert!(super::warp_enable_needed("device-a-test"), "a failed attempt must be retried");
+        super::mark_warp_enabled("device-a-test");
+        assert!(!super::warp_enable_needed("device-a-test"));
+        assert!(super::warp_enable_needed("device-b-test"));
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 
