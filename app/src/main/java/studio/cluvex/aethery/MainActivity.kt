@@ -18,6 +18,7 @@ import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.widget.ImageView.ScaleType
+import studio.cluvex.aethery.ui.EditorField
 import studio.cluvex.aethery.ui.HaloColors
 import studio.cluvex.aethery.ui.HaloOrb
 import studio.cluvex.aethery.ui.HaloSky
@@ -26,6 +27,8 @@ import studio.cluvex.aethery.ui.PageStack
 import studio.cluvex.aethery.ui.haloBackButton
 import studio.cluvex.aethery.ui.Motion
 import studio.cluvex.aethery.ui.Tilt
+import studio.cluvex.aethery.ui.buildChoicePage
+import studio.cluvex.aethery.ui.buildEditorPage
 import studio.cluvex.aethery.ui.glassBackground
 import studio.cluvex.aethery.ui.glassCircle
 import studio.cluvex.aethery.ui.HaloType
@@ -1223,73 +1226,17 @@ class MainActivity : Activity() {
             NativeCore.isRunning()
         ) return
 
-        val dialog = Dialog(this).apply {
-            requestWindowFeature(Window.FEATURE_NO_TITLE)
-            setCanceledOnTouchOutside(true)
-        }
-        val sheet = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(24), dp(24), dp(24))
-            background = roundedBackground(SURFACE, 28, SURFACE)
-        }
-        sheet.addView(label("Connection type", 22f, INK, TypefaceStyle.MEDIUM))
-        sheet.addView(label("Choose device-wide VPN or local SOCKS5 and HTTP CONNECT proxies", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(4); bottomMargin = dp(20) })
-        ConnectionType.entries.forEachIndexed { index, type ->
-            sheet.addView(createConnectionTypeOption(type, dialog), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(76),
-            ).apply { if (index > 0) topMargin = dp(10) })
-        }
-        val container = FrameLayout(this).apply {
-            setPadding(dp(16), 0, dp(16), dp(16))
-            addView(sheet, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ))
-        }
-        dialog.setContentView(container)
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            setDimAmount(0.62f)
-            setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT)
-            setGravity(Gravity.BOTTOM)
-        }
-    }
-
-    private fun createConnectionTypeOption(type: ConnectionType, dialog: Dialog): LinearLayout {
-        val selected = type == connectionType()
-        return LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(18), 0, dp(18), 0)
-            background = roundedBackground(
-                if (selected) primaryContainer else SURFACE_VARIANT,
-                18,
-                if (selected) primary else SURFACE_VARIANT,
-            )
-            contentDescription = "Use ${type.label} connection type"
-            isClickable = true
-            isFocusable = true
-            setOnClickListener {
-                preferences().edit().putString(CONNECTION_TYPE, type.name).apply()
-                connectionTypeValue.text = type.label
-                dialog.dismiss()
-                if (showingSettings) openSettingsScreen(animate = false)
-            }
-            val texts = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-            texts.addView(label(type.label, 16f, INK, TypefaceStyle.MEDIUM))
-            texts.addView(label(type.description, 13f, MUTED), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(2) })
-            addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            if (selected) addView(label("CURRENT", 11f, primary, TypefaceStyle.MEDIUM).apply {
-                letterSpacing = 0.08f
-            })
+        showChoiceSheet(
+            title = "Connection type",
+            subtitle = "Choose device-wide VPN or local SOCKS5 and HTTP CONNECT proxies",
+            options = ConnectionType.entries.toList(),
+            selected = connectionType(),
+            label = { it.label },
+            description = { it.description },
+        ) { type ->
+            preferences().edit().putString(CONNECTION_TYPE, type.name).apply()
+            connectionTypeValue.text = type.label
+            afterPageClosed { if (showingSettings) openSettingsScreen(animate = false) }
         }
     }
 
@@ -1698,61 +1645,15 @@ class MainActivity : Activity() {
             .start()
     }
 
-    private fun chooseObfuscation() {
-        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
-        val sheet = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(24), dp(24), dp(24))
-            background = roundedBackground(SURFACE, 28, SURFACE)
-        }
-        sheet.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Obfuscation", 22f, INK, TypefaceStyle.MEDIUM))
-        })
-        sheet.addView(label("Adjust traffic-shape padding for filtered networks", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-4); bottomMargin = dp(20) })
-        val options = mutableMapOf<ObfuscationProfile, SelectionOption>()
-        ObfuscationProfile.entries.forEachIndexed { index, profile ->
-            val title = label(profile.label, 16f, INK, TypefaceStyle.MEDIUM)
-            val indicator = label("SELECTED", 11f, primary, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.08f }
-            val row = LinearLayout(this).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(dp(18), 0, dp(18), 0)
-                isClickable = true
-                isFocusable = true
-                val labels = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-                labels.addView(title)
-                labels.addView(label(profile.description, 13f, MUTED), LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).apply { topMargin = dp(2) })
-                addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                addView(indicator)
-                setOnClickListener {
-                    preferences().edit().putString(OBFUSCATION_PROFILE, profile.coreName).apply()
-                    options.forEach { (item, option) -> setSelectionState(option, item == profile, animate = true) }
-                }
-            }
-            val option = SelectionOption(row, title, indicator, 18)
-            options[profile] = option
-            setSelectionState(option, profile == obfuscationProfile(), animate = false)
-            sheet.addView(row, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(72),
-            ).apply { topMargin = if (index == 0) 0 else dp(8) })
-        }
-        dialog.setContentView(FrameLayout(this).apply {
-            setPadding(dp(16), 0, dp(16), dp(16))
-            addView(sheet)
-        })
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            setDimAmount(0.62f)
-            setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT)
-            setGravity(Gravity.BOTTOM)
-        }
+    private fun chooseObfuscation() = showChoiceSheet(
+        title = "Obfuscation",
+        subtitle = "Adjust traffic-shape padding for filtered networks",
+        options = ObfuscationProfile.entries.toList(),
+        selected = obfuscationProfile(),
+        label = { it.label },
+        description = { it.description },
+    ) { chosen ->
+        preferences().edit().putString(OBFUSCATION_PROFILE, chosen.coreName).apply()
     }
 
     private fun chooseTlsCurvePreset() = showChoiceSheet(
@@ -1800,8 +1701,10 @@ class MainActivity : Activity() {
         preferences().edit().putString(DEFAULT_MASQUE_TRANSPORT, chosen.coreName).apply()
         AetherWidget.refreshAll(this)
         scanValue.text = scanSummary()
-        closeWidgetTransportScreen()
-        openWidgetTransportScreen()
+        afterPageClosed {
+            closeWidgetTransportScreen()
+            openWidgetTransportScreen()
+        }
     }
 
     private fun chooseLogLevel() = showChoiceSheet(
@@ -1838,61 +1741,32 @@ class MainActivity : Activity() {
     )
 
     private fun editManualEndpoint() {
-        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
-        val field = EditText(this).apply {
-            setText(manualEndpoint().orEmpty())
-            hint = "IP:port, blank for automatic"
-            setTextColor(INK)
-            setHintTextColor(MUTED)
-            setSingleLine(true)
-            inputType = InputType.TYPE_CLASS_TEXT
-            setPadding(dp(18), 0, dp(18), 0)
-            background = roundedBackground(SURFACE_VARIANT, 16, SURFACE_VARIANT)
-        }
-        val sheet = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(24), dp(24), dp(24))
-            background = roundedBackground(SURFACE, 28, SURFACE)
-        }
-        sheet.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label("Manual endpoint", 22f, INK, TypefaceStyle.MEDIUM))
-        })
-        sheet.addView(label("Numeric IPv4 or bracketed IPv6 address with port. Bypasses discovery.", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-4); bottomMargin = dp(20) })
-        sheet.addView(field, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)))
-        val buttons = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        buttons.addView(createSettingsButton("Clear") {
-            preferences().edit().remove(MANUAL_ENDPOINT).apply()
-            field.setText("")
-        }, LinearLayout.LayoutParams(0, dp(52), 1f))
-        buttons.addView(createSettingsButton("Save") {
-            val endpoint = field.text.toString().trim()
-            val validEndpoint = endpoint.isBlank() || Regex("^(?:\\d{1,3}(?:\\.\\d{1,3}){3}|\\[[0-9a-fA-F:]+]):([1-9]\\d{0,4})$")
-                .matchEntire(endpoint)?.groupValues?.get(1)?.toIntOrNull()?.let { it in 1..65535 } == true
-            if (!validEndpoint) {
-                field.error = "Use numeric IP:port"
-                return@createSettingsButton
-            }
-            preferences().edit().apply {
-                if (endpoint.isBlank()) remove(MANUAL_ENDPOINT) else putString(MANUAL_ENDPOINT, endpoint)
-            }.apply()
-            dialog.dismiss()
-        }, LinearLayout.LayoutParams(0, dp(52), 1f).apply { leftMargin = dp(10) })
-        sheet.addView(buttons, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply { topMargin = dp(16) })
-        dialog.setContentView(FrameLayout(this).apply {
-            setPadding(dp(16), 0, dp(16), dp(16))
-            addView(sheet)
-        })
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            setDimAmount(0.62f)
-            setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT)
-            setGravity(Gravity.BOTTOM)
-        }
+        val field = settingsField(manualEndpoint().orEmpty(), "IP:port, blank for automatic")
+        val endpointPattern = Regex("^(?:\\d{1,3}(?:\\.\\d{1,3}){3}|\\[[0-9a-fA-F:]+]):([1-9]\\d{0,4})$")
+        pageStack.push(buildEditorPage(
+            context = this,
+            palette = palette,
+            title = "Manual endpoint",
+            subtitle = "Numeric IPv4 or bracketed IPv6 address with port. Bypasses discovery.",
+            fields = listOf(EditorField("Endpoint", field)),
+            validator = { values ->
+                val endpoint = values[0]
+                val valid = endpoint.isBlank() ||
+                    endpointPattern.matchEntire(endpoint)?.groupValues?.get(1)?.toIntOrNull()?.let { it in 1..65535 } == true
+                if (valid) null else 0 to "Use numeric IP:port"
+            },
+            secondaryAction = "Clear" to {
+                preferences().edit().remove(MANUAL_ENDPOINT).apply()
+                field.setText("")
+            },
+            onBack = { pageStack.pop() },
+            onSave = { values ->
+                val endpoint = values[0]
+                preferences().edit().apply {
+                    if (endpoint.isBlank()) remove(MANUAL_ENDPOINT) else putString(MANUAL_ENDPOINT, endpoint)
+                }.apply()
+            },
+        ))
     }
 
     private fun settingsField(
@@ -1924,51 +1798,41 @@ class MainActivity : Activity() {
         validator: ((List<String>) -> Pair<Int, String>?)? = null,
         onSave: (List<String>) -> Unit,
     ) {
-        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
-        val sheet = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(24), dp(24), dp(24))
-            background = roundedBackground(SURFACE, 28, SURFACE)
-        }
-        sheet.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label(title, 22f, INK, TypefaceStyle.MEDIUM))
-        })
-        sheet.addView(label(subtitle, 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-4); bottomMargin = dp(16) })
-        fields.forEach { (name, field) ->
-            sheet.addView(label(name, 11f, MUTED).apply { letterSpacing = 0.08f }, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(10); bottomMargin = dp(6) })
-            sheet.addView(field, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                if (field.maxLines > 1) dp(104) else dp(56),
-            ))
-        }
-        sheet.addView(createSettingsButton("Save", backgroundOverride = primary, textColorOverride = primaryContainer) {
-            val values = fields.map { it.second.text.toString().trim() }
-            validator?.invoke(values)?.let { (index, message) ->
-                fields[index].second.error = message
-                return@createSettingsButton
+        pageStack.push(buildEditorPage(
+            context = this,
+            palette = palette,
+            title = title,
+            subtitle = subtitle,
+            fields = fields.map { (name, input) -> EditorField(sentenceCase(name), input) },
+            validator = validator,
+            secondaryAction = null,
+            onBack = { pageStack.pop() },
+            onSave = { values ->
+                onSave(values)
+                afterPageClosed {
+                    closeTunnelControlsScreen(false)
+                    openTunnelControlsScreen()
+                }
+            },
+        ))
+    }
+
+    /** Runs [action] once a page that is closing has finished sliding away. */
+    private fun afterPageClosed(action: () -> Unit) {
+        pageHost.postDelayed(action, 420)
+    }
+
+    private fun sentenceCase(text: String): String {
+        if (text != text.uppercase()) return text
+        val keep = setOf("CIDR", "DNS", "I1", "I2", "IP")
+        return text.split(' ').mapIndexed { index, word ->
+            when {
+                word in keep -> word
+                word.startsWith("(") -> "(" + word.drop(1).lowercase().replaceFirstChar { it.uppercase() }
+                index == 0 -> word.lowercase().replaceFirstChar { it.uppercase() }
+                else -> word.lowercase()
             }
-            onSave(values)
-            dialog.dismiss()
-            closeTunnelControlsScreen(false)
-            openTunnelControlsScreen()
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply { topMargin = dp(18) })
-        dialog.setContentView(ScrollView(this).apply {
-            setPadding(dp(16), 0, dp(16), dp(16))
-            addView(sheet)
-        })
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            setDimAmount(0.62f)
-            setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT)
-            setGravity(Gravity.BOTTOM)
-        }
+        }.joinToString(" ")
     }
 
     private fun editDnsServers() {
@@ -2201,60 +2065,18 @@ class MainActivity : Activity() {
         description: (T) -> String,
         onSelected: (T) -> Unit,
     ) {
-        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
-        val sheet = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(24), dp(24), dp(24))
-            background = roundedBackground(SURFACE, 28, SURFACE)
-        }
-        sheet.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(label(title, 22f, INK, TypefaceStyle.MEDIUM))
-        })
-        sheet.addView(label(subtitle, 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-4); bottomMargin = dp(20) })
-        val rows = mutableMapOf<T, SelectionOption>()
-        options.forEachIndexed { index, item ->
-            val optionTitle = label(label(item), 16f, INK, TypefaceStyle.MEDIUM)
-            val indicator = label("SELECTED", 11f, primary, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.08f }
-            val row = LinearLayout(this).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(dp(18), 0, dp(18), 0)
-                isClickable = true
-                isFocusable = true
-                val labels = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-                labels.addView(optionTitle)
-                labels.addView(label(description(item), 13f, MUTED), LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).apply { topMargin = dp(2) })
-                addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                addView(indicator)
-                setOnClickListener {
-                    onSelected(item)
-                    rows.forEach { (value, option) -> setSelectionState(option, value == item, animate = true) }
-                }
-            }
-            val option = SelectionOption(row, optionTitle, indicator, 18)
-            rows[item] = option
-            setSelectionState(option, item == selected, animate = false)
-            sheet.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(72)).apply {
-                topMargin = if (index == 0) 0 else dp(8)
-            })
-        }
-        dialog.setContentView(FrameLayout(this).apply {
-            setPadding(dp(16), 0, dp(16), dp(16))
-            addView(sheet)
-        })
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            setDimAmount(0.62f)
-            setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT)
-            setGravity(Gravity.BOTTOM)
-        }
+        pageStack.push(buildChoicePage(
+            context = this,
+            palette = palette,
+            title = title,
+            subtitle = subtitle,
+            options = options,
+            selected = selected,
+            label = label,
+            description = description,
+            onBack = { pageStack.pop() },
+            onSelected = onSelected,
+        ))
     }
 
     private fun closeSettingsScreen() {

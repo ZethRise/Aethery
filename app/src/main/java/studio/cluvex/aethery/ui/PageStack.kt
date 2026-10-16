@@ -76,6 +76,7 @@ class PageStack(private val host: FrameLayout) {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT,
         ))
+        page.requestApplyInsets()
         PageMotion.open(page, behind)
     }
 
