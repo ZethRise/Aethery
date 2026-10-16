@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::error::{AetherError, Result};
+use crate::fragment::{FragmentConfig, FragmentingStream};
 use crate::tls::Fingerprint;
 
 /// ALPN: HTTP/2, then HTTP/1.1, as Chrome offers them.
@@ -64,7 +65,20 @@ pub async fn send(
     ech: Option<&mut Vec<u8>>,
     timeout: Duration,
 ) -> Result<Response> {
-    tokio::time::timeout(timeout, exchange(request, fingerprint, ech))
+    send_fragmented(request, fingerprint, ech, timeout, FragmentConfig::disabled()).await
+}
+
+/// `send`, with the ClientHello written to the connection in pieces, sized and spaced as
+/// `fragment` has them, the way `--fragment` writes the one of MASQUE over HTTP/2, for networks
+/// that filter by the server name. Nothing after the hello is cut up.
+pub async fn send_fragmented(
+    request: &Request<'_>,
+    fingerprint: &Fingerprint,
+    ech: Option<&mut Vec<u8>>,
+    timeout: Duration,
+    fragment: FragmentConfig,
+) -> Result<Response> {
+    tokio::time::timeout(timeout, exchange(request, fingerprint, ech, fragment))
         .await
         .map_err(|_| {
             AetherError::Api(format!(
@@ -79,6 +93,7 @@ async fn exchange(
     request: &Request<'_>,
     fingerprint: &Fingerprint,
     mut ech: Option<&mut Vec<u8>>,
+    fragment: FragmentConfig,
 ) -> Result<Response> {
     let (address, port) = request.address.unwrap_or((request.host, request.port));
     let mut retried = false;
@@ -93,7 +108,8 @@ async fn exchange(
         }
         let tcp = dial(address, port).await?;
         let _ = tcp.set_nodelay(true);
-        match tokio_boring::connect(config, request.sni.unwrap_or(request.host), tcp).await {
+        let stream = FragmentingStream::new(tcp, fragment);
+        match tokio_boring::connect(config, request.sni.unwrap_or(request.host), stream).await {
             Ok(tls) => break tls,
             Err(e) => {
                 let message = e.to_string();

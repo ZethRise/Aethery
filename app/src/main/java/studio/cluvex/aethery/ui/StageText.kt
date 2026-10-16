@@ -3,11 +3,16 @@ package studio.cluvex.aethery.ui
 /** Turns the core's log lines into the short, plain stage text shown while connecting. */
 object StageText {
     private val started = Regex("^Native tunnel started \\((.+)\\)$")
+    private val retry = Regex("^Cloudflare did not answer; trying again \\((\\d+)/(\\d+)\\)$")
 
     fun plain(coreLine: String): String? {
         val line = coreLine.trim()
         started.matchEntire(line)?.let { return "Starting ${it.groupValues[1]}" }
+        retry.matchEntire(line)?.let {
+            return "Cloudflare did not answer, trying again (${it.groupValues[1]} of ${it.groupValues[2]})"
+        }
         return when {
+            line == "Registering with Cloudflare" -> line
             line.startsWith("Finding a verified") -> "Finding a verified gateway"
             line.startsWith("HTTP/3 scan running") -> "Scanning over HTTP/3"
             line.startsWith("HTTP/3 found no gateway") -> "HTTP/3 is blocked here, trying HTTP/2"

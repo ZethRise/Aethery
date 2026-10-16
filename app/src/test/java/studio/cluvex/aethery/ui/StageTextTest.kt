@@ -36,6 +36,15 @@ class StageTextTest {
     }
 
     @Test
+    fun explainsTheRegistrationWithCloudflare() {
+        assertEquals("Registering with Cloudflare", StageText.plain("Registering with Cloudflare"))
+        assertEquals(
+            "Cloudflare did not answer, trying again (2 of 4)",
+            StageText.plain("Cloudflare did not answer; trying again (2/4)"),
+        )
+    }
+
+    @Test
     fun staysSilentForLinesItDoesNotKnow() {
         assertNull(StageText.plain("socks5 listening on 127.0.0.1:1819"))
         assertNull(StageText.plain(""))

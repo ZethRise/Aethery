@@ -467,6 +467,7 @@ async fn api_call(
 
     let mut ech = api_ech().await?;
     let fingerprint = crate::tls::Fingerprint::configured();
+    let fragment = api_fragment();
     let headers = front_headers(bearer, jwt);
     let request = crate::https::Request {
         method,
@@ -491,10 +492,21 @@ async fn api_call(
                 API_ATTEMPTS - 1,
                 wait.as_secs_f32()
             );
+            crate::ffi::record_log(format!(
+                "Cloudflare did not answer; trying again ({attempt}/{})",
+                API_ATTEMPTS - 1
+            ));
             tokio::time::sleep(wait).await;
         }
 
-        let sent = crate::https::send(&request, &fingerprint, ech.as_mut(), API_TIMEOUT).await;
+        let sent = crate::https::send_fragmented(
+            &request,
+            &fingerprint,
+            ech.as_mut(),
+            API_TIMEOUT,
+            fragment_for_attempt(fragment, attempt),
+        )
+        .await;
         if let Some(key) = &ech {
             // A key a server handed back is the one the later calls offer.
             remember_api_ech(key.clone());
@@ -542,6 +554,54 @@ async fn api_call(
     }
 
     Err(last_error)
+}
+
+/// How the ClientHello of the calls to the WARP API is cut up, for networks that filter the name of
+/// the API: AETHER_API_FRAGMENT says on or off, and without it the HTTP/2 setting of MASQUE
+/// (`--fragment`) decides; the pieces are sized and spaced as that one has them.
+fn api_fragment() -> crate::fragment::FragmentConfig {
+    let fragment = api_fragment_of(
+        std::env::var("AETHER_API_FRAGMENT").ok().as_deref(),
+        crate::fragment::FragmentConfig::from_env(),
+    );
+    if fragment.enabled {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            log::info!(
+                "[*] the calls to the warp api send their ClientHello in pieces of {}-{} bytes, {}-{}ms apart",
+                fragment.size_min,
+                fragment.size_max,
+                fragment.delay_min_ms,
+                fragment.delay_max_ms
+            )
+        });
+    }
+    fragment
+}
+
+fn api_fragment_of(
+    flag: Option<&str>,
+    base: crate::fragment::FragmentConfig,
+) -> crate::fragment::FragmentConfig {
+    match flag.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "true" | "yes" | "on") => crate::fragment::FragmentConfig { enabled: true, ..base },
+        Some("0" | "false" | "no" | "off") => crate::fragment::FragmentConfig { enabled: false, ..base },
+        _ => base,
+    }
+}
+
+/// The fragmenting of attempt `attempt` (counting from 0) of a call: the policy's own on the first,
+/// then the whole hello and the fragmented one in turn, so a network that breaks one of the two
+/// routes still gets the other.
+fn fragment_for_attempt(
+    policy: crate::fragment::FragmentConfig,
+    attempt: u32,
+) -> crate::fragment::FragmentConfig {
+    if policy.enabled && attempt % 2 == 1 {
+        crate::fragment::FragmentConfig { enabled: false, ..policy }
+    } else {
+        policy
+    }
 }
 
 fn generate_x25519_keypair() -> ([u8; 32], String) {
@@ -934,6 +994,36 @@ impl Identity {
 
 #[cfg(test)]
 mod tests {
+    fn on() -> crate::fragment::FragmentConfig {
+        crate::fragment::FragmentConfig {
+            enabled: true,
+            ..crate::fragment::FragmentConfig::disabled()
+        }
+    }
+
+    #[test]
+    fn the_api_fragment_flag_turns_the_api_fragmenting_on_or_off_whatever_the_http2_one_says() {
+        let off = crate::fragment::FragmentConfig::disabled();
+        assert!(api_fragment_of(Some("1"), off).enabled);
+        assert!(api_fragment_of(Some(" yes "), off).enabled);
+        assert!(!api_fragment_of(Some("0"), on()).enabled);
+        assert!(!api_fragment_of(Some("off"), on()).enabled);
+        // Without the flag the API follows the HTTP/2 setting.
+        assert!(api_fragment_of(None, on()).enabled);
+        assert!(!api_fragment_of(None, off).enabled);
+    }
+
+    #[test]
+    fn api_attempts_alternate_between_the_fragmented_and_the_whole_hello() {
+        assert!(fragment_for_attempt(on(), 0).enabled);
+        assert!(!fragment_for_attempt(on(), 1).enabled);
+        assert!(fragment_for_attempt(on(), 2).enabled);
+        assert!(!fragment_for_attempt(on(), 3).enabled);
+        for attempt in 0..API_ATTEMPTS {
+            assert!(!fragment_for_attempt(crate::fragment::FragmentConfig::disabled(), attempt).enabled);
+        }
+    }
+
     use super::*;
 
     #[test]

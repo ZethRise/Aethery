@@ -4,30 +4,32 @@ import android.content.Context
 import android.graphics.Typeface
 
 /**
- * The app's type. One bundled variable family when `assets/fonts/bricolage_grotesque.ttf` is
- * present; the system sans otherwise, so a missing or broken font never breaks a layout.
+ * The app's type: Manrope, a variable font bundled in `assets/fonts` (SIL Open Font License, see
+ * OFL.txt beside it). If the file is ever missing or unreadable the system sans takes over, so a
+ * font problem never breaks a layout.
  */
 object HaloType {
-    private const val ASSET = "fonts/bricolage_grotesque.ttf"
-    private val cache = HashMap<String, Typeface?>()
+    private const val ASSET = "fonts/manrope.ttf"
+    private val cache = HashMap<Int, Typeface?>()
 
+    /** Headlines and page titles. */
     fun display(context: Context): Typeface =
-        variable(context, weight = 500, width = 92) ?: Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        weight(context, 600) ?: Typeface.create("sans-serif-medium", Typeface.NORMAL)
 
+    /** Everything else; [medium] is for labels and values that need a little more body. */
     fun body(context: Context, medium: Boolean): Typeface =
-        variable(context, weight = if (medium) 500 else 400, width = 100)
+        weight(context, if (medium) 600 else 450)
             ?: Typeface.create(if (medium) "sans-serif-medium" else "sans", Typeface.NORMAL)
 
     @Synchronized
-    private fun variable(context: Context, weight: Int, width: Int): Typeface? {
-        val key = "$weight/$width"
-        if (cache.containsKey(key)) return cache[key]
+    private fun weight(context: Context, wght: Int): Typeface? {
+        if (cache.containsKey(wght)) return cache[wght]
         val built = runCatching {
             Typeface.Builder(context.applicationContext.assets, ASSET)
-                .setFontVariationSettings("'wght' $weight, 'wdth' $width")
+                .setFontVariationSettings("'wght' $wght")
                 .build()
         }.getOrNull()
-        cache[key] = built
+        cache[wght] = built
         return built
     }
 }

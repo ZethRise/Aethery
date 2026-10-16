@@ -794,6 +794,7 @@ async fn enrol_zero_trust(base: &str) {
 }
 
 async fn provision_account() -> Result<account::Identity> {
+    crate::ffi::record_log("Registering with Cloudflare");
     match zerotrust::TeamSettings::from_env() {
         Some(settings) => {
             log::info!(
@@ -3761,6 +3762,9 @@ fn apply_runtime_options(options: &StartOptions) {
     }
 
     std::env::set_var("AETHER_CONFIG", &options.config_path);
+    // Registering is rare and a network that filters the API's name would otherwise leave the
+    // app unable to connect at all, so the API call goes out fragmented first, whole second.
+    std::env::set_var("AETHER_API_FRAGMENT", "1");
     std::env::set_var("AETHER_SOCKS", options.listen.to_string());
     match options.http_proxy {
         Some(addr) => {
