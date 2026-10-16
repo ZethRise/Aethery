@@ -2753,10 +2753,11 @@ class MainActivity : Activity() {
     }
 
     private fun toggleTunnel() {
-        val decision = TunnelToggle.decide(OrbState.valueOf(visualState.name), NativeCore.isRunning(), userDisconnecting)
+        val decision = TunnelToggle.decide(OrbState.valueOf(visualState.name), NativeCore.isRunning())
         if (decision == TunnelToggle.Decision.DISCONNECT) {
             val cancelling = visualState == HaloOrb.State.CONNECTING
-            userDisconnecting = true
+            // Only a running core has to be waited for; the status poll clears this once it stops.
+            userDisconnecting = NativeCore.isRunning()
             startService(Intent(this, AetherVpnService::class.java).setAction(AetherVpnService.ACTION_DISCONNECT))
             showDisconnected(if (cancelling) "Connection cancelled" else "Disconnecting")
             return

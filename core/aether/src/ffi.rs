@@ -42,6 +42,8 @@ static LOGS: LazyLock<Mutex<VecDeque<String>>> = LazyLock::new(|| Mutex::new(Vec
 static LOG_PATH: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 const MAX_LOG_FILE_BYTES: u64 = 512 * 1024;
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Set while an identity is being loaded or registered, which a stop can also end.
+static PREPARING: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static STOP_NOTIFY: OnceLock<Notify> = OnceLock::new();
@@ -318,6 +320,37 @@ fn stop_notify() -> &'static Notify {
     STOP_NOTIFY.get_or_init(Notify::new)
 }
 
+/// Runs `future` to its end on `runtime`, or until a stop is requested; None when the stop came
+/// first. Registering an identity can take a minute on a network that filters Cloudflare, and a
+/// person who cancels must not wait that out.
+fn run_until_stopped<T>(
+    runtime: &tokio::runtime::Runtime,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    runtime.block_on(async {
+        tokio::select! {
+            value = future => Some(value),
+            _ = wait_for_stop() => None,
+        }
+    })
+}
+
+struct PreparingGuard;
+
+impl PreparingGuard {
+    fn begin() -> Self {
+        STOP_REQUESTED.store(false, Ordering::Release);
+        PREPARING.store(true, Ordering::Release);
+        PreparingGuard
+    }
+}
+
+impl Drop for PreparingGuard {
+    fn drop(&mut self) {
+        PREPARING.store(false, Ordering::Release);
+    }
+}
+
 async fn wait_for_stop() {
     loop {
         let notified = stop_notify().notified();
@@ -433,7 +466,15 @@ pub unsafe extern "C" fn aether_prepare_json(json: *const c_char) -> i32 {
             }
         };
 
-        match runtime.block_on(crate::prepare(&options)) {
+        let _preparing = PreparingGuard::begin();
+        let prepared = match run_until_stopped(&runtime, crate::prepare(&options)) {
+            Some(prepared) => prepared,
+            None => {
+                set_last_error("Connection cancelled");
+                return -2;
+            }
+        };
+        match prepared {
             Ok(TunnelAddresses {
                 ipv4,
                 ipv6,
@@ -606,10 +647,11 @@ pub extern "C" fn aether_replace_tun_fd(tun_fd: i32) {
     crate::replace_android_tun_fd(tun_fd);
 }
 
-/// Requests shutdown of the active native tunnel. Returns 1 if running, else 0.
+/// Requests shutdown of the active native tunnel, or of the identity registration that comes
+/// before it. Returns 1 if either was in progress, else 0.
 #[no_mangle]
 pub extern "C" fn aether_stop() -> i32 {
-    if !RUNNING.load(Ordering::Acquire) {
+    if !RUNNING.load(Ordering::Acquire) && !PREPARING.load(Ordering::Acquire) {
         return 0;
     }
 
@@ -636,6 +678,35 @@ pub(crate) fn mark_ready() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stop_cancels_a_registration_in_progress_and_does_nothing_when_idle() {
+        // Idle: nothing runs and nothing is being prepared.
+        assert_eq!(aether_stop(), 0);
+
+        // Preparing: the stop ends the work, which would otherwise never finish.
+        PREPARING.store(true, Ordering::Release);
+        STOP_REQUESTED.store(false, Ordering::Release);
+        let worker = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            run_until_stopped(&runtime, std::future::pending::<()>())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(aether_stop(), 1);
+        assert_eq!(worker.join().unwrap(), None);
+        PREPARING.store(false, Ordering::Release);
+        STOP_REQUESTED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn work_that_finishes_before_any_stop_returns_its_value() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        STOP_REQUESTED.store(false, Ordering::Release);
+        assert_eq!(run_until_stopped(&runtime, async { 7 }), Some(7));
+    }
 
     #[test]
     fn parses_android_start_options() {
