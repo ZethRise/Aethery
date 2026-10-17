@@ -314,8 +314,8 @@ object AetherWidget {
             Protocol.MASQUE -> Protocol.WIREGUARD
             Protocol.WIREGUARD -> Protocol.WARP_IN_WARP
             Protocol.WARP_IN_WARP -> Protocol.WARP_IN_WARP_MASQUE
-            Protocol.WARP_IN_WARP_MASQUE -> Protocol.MASQUE_IN_MASQUE
-            Protocol.MASQUE_IN_MASQUE -> Protocol.MASQUE
+            // MASQUE-on-MASQUE only serves the local proxies, so a tap on the widget never lands on it.
+            Protocol.WARP_IN_WARP_MASQUE, Protocol.MASQUE_IN_MASQUE -> Protocol.MASQUE
         }
         prefs.edit().putString(DEFAULT_PROTOCOL, next.coreName).commit()
         if (runCatching { NativeCore.isRunning() }.getOrDefault(false)) {

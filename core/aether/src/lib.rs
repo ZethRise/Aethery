@@ -3752,6 +3752,8 @@ impl StartOptions {
                 (Protocol::WarpInWarp, _) => Some("classic".to_string()),
                 _ => None,
             }),
+            // Set again by a Tor or Psiphon carrier that starts afterwards; never carried over from one.
+            ("AETHER_UPSTREAM", None),
             ("AETHER_EXIT_LOC", self.exit_location.clone()),
             ("AETHER_ECH", self.ech.clone()),
             ("AETHER_QUIC_V2", flag(self.quic_v2, "1", "0")),
@@ -4213,6 +4215,16 @@ mod tests {
         assert_eq!(env_of(&options, "AETHER_TOR_COUNTRY").as_deref(), Some("ir"));
         assert_eq!(env_of(&options, "AETHER_PSIPHON").as_deref(), Some("chain"));
         assert_eq!(env_of(&options, "AETHER_PSIPHON_BIN").as_deref(), Some("/lib/libpsiphon.so"));
+    }
+
+    #[test]
+    fn a_start_never_inherits_the_proxy_an_earlier_carrier_left_behind() {
+        // Tor and Psiphon, when they carry the tunnel, point AETHER_UPSTREAM at their own proxy
+        // for the length of that session. The app runs every session in one process, so the next
+        // start would dial through a proxy that is gone and sit scanning for ever.
+        let options = super::StartOptions::new(super::Protocol::Masque, "aether.toml");
+        let entry = options.transport_env().into_iter().find(|(name, _)| *name == "AETHER_UPSTREAM");
+        assert_eq!(entry, Some(("AETHER_UPSTREAM", None)));
     }
 
     #[test]

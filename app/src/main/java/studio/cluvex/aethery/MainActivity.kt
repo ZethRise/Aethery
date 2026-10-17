@@ -943,6 +943,7 @@ class MainActivity : Activity() {
             preferences().edit().putString(CONNECTION_TYPE, type.name).apply()
             // Tor or Psiphon alone has no VPN, so asking for one puts the plain tunnel back.
             if (type == ConnectionType.VPN && carrier().proxyOnly) preferences().edit().putString(CARRIER, Carrier.DIRECT.storedName).apply()
+            if (type == ConnectionType.VPN && selectedProtocol.proxyOnly) updateConnectionMode(Protocol.MASQUE)
             connectionTypeValue.text = routeSummary()
             onChanged(type)
         }
@@ -1860,6 +1861,9 @@ class MainActivity : Activity() {
         if (selectedProtocol == protocol) return
         selectedProtocol = protocol
         preferences().edit().putString(DEFAULT_PROTOCOL, protocol.coreName).commit()
+        // The widgets and tile read the saved type, so a method with no VPN saves the proxy type.
+        if (protocol.proxyOnly) preferences().edit().putString(CONNECTION_TYPE, ConnectionType.PROXY.name).apply()
+        connectionTypeValue.text = routeSummary()
         modeSelector.contentDescription = "Connection mode, ${protocol.label}"
         scanValue.text = scanSummary()
         scannerSelector.contentDescription = "Scanner options, ${scanSummary()}"
@@ -2141,7 +2145,7 @@ class MainActivity : Activity() {
 
 
     private fun connectionType(): ConnectionType =
-        if (carrier().proxyOnly) ConnectionType.PROXY else preferences()
+        if (carrier().proxyOnly || selectedProtocol.proxyOnly) ConnectionType.PROXY else preferences()
             .getString(CONNECTION_TYPE, ConnectionType.VPN.name)
             ?.let { name -> ConnectionType.entries.firstOrNull { it.name == name } }
             ?: ConnectionType.VPN
@@ -2334,8 +2338,11 @@ class MainActivity : Activity() {
         WIREGUARD("WireGuard", "wireguard", "WireGuard tunnel"),
         WARP_IN_WARP("WARP-on-WARP (WireGuard)", "gool", "Two nested WireGuard tunnels"),
         WARP_IN_WARP_MASQUE("WARP-on-WARP (MASQUE)", "gool-masque", "WireGuard carried inside a MASQUE tunnel"),
-        MASQUE_IN_MASQUE("MASQUE-on-MASQUE", "mim", "Two MASQUE hops, for a different exit address"),
+        MASQUE_IN_MASQUE("MASQUE-on-MASQUE", "mim", "Two MASQUE hops, for a different exit address. Proxy mode only."),
         ;
+
+        /** The core cannot hand this method to the Android VPN; it only serves the local proxies. */
+        val proxyOnly: Boolean get() = this == MASQUE_IN_MASQUE
 
         /** Whether the MASQUE gateway scan and transport settings apply. */
         val usesMasque: Boolean get() = this != WIREGUARD && this != WARP_IN_WARP
