@@ -58,6 +58,15 @@ android {
         unitTests.isReturnDefaultValues = true
     }
 
+    packaging {
+        jniLibs {
+            // Psiphon's client is a program, not a library: it ships as libpsiphon.so and the core
+            // runs it from the install folder, so the libraries have to be unpacked on install.
+            useLegacyPackaging = true
+            keepDebugSymbols += "**/libpsiphon.so"
+        }
+    }
+
     if (releaseKeystore != null) {
         val envProps = Properties().apply {
             val envFile = rootProject.file("keystore.env")

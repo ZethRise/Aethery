@@ -254,7 +254,7 @@ class MainActivity : Activity() {
         ipAddressCard = createIpAddressCard()
         selectedProtocol = savedProtocol()
         modeValue = label(selectedProtocol.label, 16f, INK, TypefaceStyle.MEDIUM)
-        connectionTypeValue = label(connectionType().label, 16f, INK, TypefaceStyle.MEDIUM)
+        connectionTypeValue = label(routeSummary(), 16f, INK, TypefaceStyle.MEDIUM)
         modeSelector = createModeSelector()
         logSelector = createLogSelector()
         perfSelector = createPerfSelector()
@@ -941,7 +941,9 @@ class MainActivity : Activity() {
             description = { it.description },
         ) { type ->
             preferences().edit().putString(CONNECTION_TYPE, type.name).apply()
-            connectionTypeValue.text = type.label
+            // Tor or Psiphon alone has no VPN, so asking for one puts the plain tunnel back.
+            if (type == ConnectionType.VPN && carrier().proxyOnly) preferences().edit().putString(CARRIER, Carrier.DIRECT.storedName).apply()
+            connectionTypeValue.text = routeSummary()
             onChanged(type)
         }
     }
@@ -1045,9 +1047,16 @@ class MainActivity : Activity() {
     private fun openTunnelControlsScreen() {
         val page = newPage("Tunnel controls", "Applied on your next connection")
 
+        val carrierRow = valueRow("Carrier", { carrier().label }) { chooseCarrier(it) }
+        val torCountry = valueRow("Tor country", { preferences().getString(TOR_COUNTRY, "").orEmpty().ifBlank { "Any" } }) { editCarrierText(TOR_COUNTRY, "Tor country", "Two-letter code, like ir. Asks for bridges from that country.", "ir", it) }
+        val torBridges = valueRow("Tor bridges", { torBridgesSummary() }) { chooseTorBridges(it) }
+        val psiphonRegion = valueRow("Psiphon region", { preferences().getString(PSIPHON_REGION, "").orEmpty().ifBlank { "Any" } }) { editCarrierText(PSIPHON_REGION, "Psiphon region", "Two-letter code, like de. Blank lets Psiphon choose.", "de", it) }
+        page.block("Carrier", listOf(carrierRow.view, torCountry.view, torBridges.view, psiphonRegion.view), top = 4,
+            note = "Tor and Psiphon can take a minute to start. The alone modes work in proxy mode only.")
+
         val obfuscation = valueRow("Obfuscation", { obfuscationProfile().label }) { chooseObfuscation(it) }
         val advanced = valueRow("Advanced obfuscation", { advancedObfuscationSummary() }) { editAdvancedObfuscation(it) }
-        page.block("Connection shaping", listOf(obfuscation.view, advanced.view), top = 4)
+        page.block("Connection shaping", listOf(obfuscation.view, advanced.view))
 
         val endpoint = valueRow("Manual endpoint", { manualEndpoint() ?: "Automatic" }) { editManualEndpoint(it) }
         val cache = valueRow("Gateway cache", { defaultEndpointDiscovery().label }) { manageGatewayCache(it) }
@@ -1094,6 +1103,62 @@ class MainActivity : Activity() {
         val keepalive = valueRow("Keepalive", { preferences().getString(WG_KEEPALIVE, "").orEmpty().ifBlank { "Default" } }) { editKeepalive(it) }
         page.block("WireGuard", listOf(retries.view, strict.view, keepalive.view))
         showPage(page)
+    }
+
+    private fun torBridgesSummary(): String = when (preferences().getString(TOR_BRIDGES, "")) {
+        "auto" -> "Automatic"
+        "off" -> "None"
+        else -> "Default"
+    }
+
+    private fun chooseCarrier(onChanged: () -> Unit) {
+        if (!tunnelIdle()) return
+        showChoiceSheet(
+            title = "Carrier",
+            subtitle = "How Aethery reaches Cloudflare, or what replaces it",
+            options = Carrier.entries.toList(),
+            selected = carrier(),
+            label = { it.label },
+            description = { it.description },
+        ) { chosen ->
+            preferences().edit().apply {
+                putString(CARRIER, chosen.storedName)
+                // Tor or Psiphon alone has no VPN; the widgets and tile read this setting too.
+                if (chosen.proxyOnly) putString(CONNECTION_TYPE, ConnectionType.PROXY.name)
+            }.apply()
+            connectionTypeValue.text = routeSummary()
+            onChanged()
+        }
+    }
+
+    private fun chooseTorBridges(onChanged: () -> Unit) = showChoiceSheet(
+        title = "Tor bridges",
+        subtitle = "Bridges help where Tor is blocked",
+        options = listOf("", "auto", "off"),
+        selected = preferences().getString(TOR_BRIDGES, "") ?: "",
+        label = { when (it) { "auto" -> "Automatic"; "off" -> "None"; else -> "Default" } },
+        description = {
+            when (it) {
+                "auto" -> "Try Tor directly, then fetch bridges when that fails"
+                "off" -> "Never use bridges"
+                else -> "Let the core decide"
+            }
+        },
+    ) { chosen ->
+        preferences().edit().putString(TOR_BRIDGES, chosen).apply()
+        onChanged()
+    }
+
+    private fun editCarrierText(key: String, title: String, hint: String, example: String, onChanged: () -> Unit) {
+        val field = settingsField(preferences().getString(key, "").orEmpty(), example)
+        showTextSettingsSheet(
+            title, hint,
+            listOf("Code" to field),
+            validator = { values ->
+                if (values[0].isBlank() || (values[0].length == 2 && values[0].all(Char::isLetter))) null else 0 to "Use a two-letter code"
+            },
+            onSaved = onChanged,
+        ) { values -> preferences().edit().putString(key, values[0].lowercase()).apply() }
     }
 
     private fun exitLocationSummary(): String =
@@ -2075,10 +2140,23 @@ class MainActivity : Activity() {
     }
 
 
-    private fun connectionType(): ConnectionType = preferences()
-        .getString(CONNECTION_TYPE, ConnectionType.VPN.name)
-        ?.let { name -> ConnectionType.entries.firstOrNull { it.name == name } }
-        ?: ConnectionType.VPN
+    private fun connectionType(): ConnectionType =
+        if (carrier().proxyOnly) ConnectionType.PROXY else preferences()
+            .getString(CONNECTION_TYPE, ConnectionType.VPN.name)
+            ?.let { name -> ConnectionType.entries.firstOrNull { it.name == name } }
+            ?: ConnectionType.VPN
+
+    private fun carrier(): Carrier = Carrier.fromName(preferences().getString(CARRIER, null))
+
+    /** "VPN", or "VPN through Tor" and so on, for the line under the method. */
+    private fun routeSummary(): String {
+        val carrier = carrier()
+        return when {
+            carrier == Carrier.DIRECT -> connectionType().label
+            carrier.proxyOnly -> carrier.label
+            else -> "${connectionType().label}, ${carrier.label.replaceFirstChar { it.lowercase() }}"
+        }
+    }
 
     private fun defaultScan(): ScanTarget {
         val name = getSharedPreferences(SETTINGS, MODE_PRIVATE).getString(DEFAULT_SCAN, ScanTarget.IPV4.coreName)
@@ -2401,6 +2479,10 @@ class MainActivity : Activity() {
         const val ZERO_TRUST_CLIENT_SECRET = "zero_trust_client_secret"
         const val ZERO_TRUST_TOKEN = "zero_trust_token"
         const val ZERO_TRUST_GATEWAY = "zero_trust_gateway"
+        const val CARRIER = "carrier"
+        const val TOR_COUNTRY = "tor_country"
+        const val TOR_BRIDGES = "tor_bridges"
+        const val PSIPHON_REGION = "psiphon_region"
         const val EXIT_LOCATION = "exit_location"
         const val ECH = "ech"
         const val QUIC_V2 = "quic_v2"

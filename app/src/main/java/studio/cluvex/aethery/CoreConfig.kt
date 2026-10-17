@@ -65,6 +65,21 @@ object CoreConfig {
             putOpt("fragment_size", text("fragment_size").ifBlank { null })
             putOpt("fragment_delay", text("fragment_delay").ifBlank { null })
             text("wg_keepalive").toIntOrNull()?.takeIf { it > 0 }?.let { put("keepalive", it) }
+            val carrier = Carrier.fromName(text("carrier", "direct"))
+            // Tor's and Psiphon's second proxies must not sit on the HTTP CONNECT port (1820).
+            carrier.tor?.let {
+                put("tor", it)
+                if (it != "only") put("tor_bind", "127.0.0.1:1822")
+                putOpt("tor_country", text("tor_country").ifBlank { null })
+                putOpt("tor_bridges", text("tor_bridges").ifBlank { null })
+            }
+            carrier.psiphon?.let {
+                put("psiphon", it)
+                if (it != "only") put("psiphon_bind", "127.0.0.1:1821")
+                putOpt("psiphon_region", text("psiphon_region").ifBlank { null })
+                // The client is shipped as a native library so it can be run from the app's install folder.
+                put("psiphon_bin", File(context.applicationInfo.nativeLibraryDir, "libpsiphon.so").absolutePath)
+            }
         }.toString()
     }
 

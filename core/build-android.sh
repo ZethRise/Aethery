@@ -59,6 +59,9 @@ if [[ -z "$SDK" ]]; then
   SDK="$HOME/Android/Sdk"
 fi
 
+# Tor is built in by default; AETHER_CARGO_FEATURES= (empty) leaves it out.
+FEATURES="${AETHER_CARGO_FEATURES-tor}"
+
 NDK_VERSION="26.3.11579264"
 NDK="$SDK/ndk/$NDK_VERSION"
 if [[ ! -d "$NDK" ]]; then
@@ -100,7 +103,7 @@ fi
 set +e
 (
   cd "$CRATE"
-  cargo ndk -t "$ABI" --platform "$API" build --release --lib
+  cargo ndk -t "$ABI" --platform "$API" build --release --lib ${FEATURES:+--features "$FEATURES"}
 )
 BOOTSTRAP_EXIT=$?
 set -e
@@ -143,7 +146,7 @@ export "BINDGEN_EXTRA_CLANG_ARGS_${RUST_TARGET_SUFFIX}=--target=${CLANG_PREFIX}$
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-soname,libaether.so -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
 
 cd "$CRATE"
-cargo build --release --lib --target "$TARGET_TRIPLE"
+cargo build --release --lib --target "$TARGET_TRIPLE" ${FEATURES:+--features "$FEATURES"}
 
 LIBRARY="$TARGET/$TARGET_TRIPLE/release/libaether.so"
 for DESTINATION in "$ROOT/core/android-libs/$ABI" "$ROOT/app/src/main/jniLibs/$ABI"; do
