@@ -3717,6 +3717,16 @@ pub struct StartOptions {
     pub http_proxy: Option<SocketAddr>,
     pub proxy_user: Option<String>,
     pub proxy_pass: Option<String>,
+    /// `masque` carries gool's inner WireGuard through a MASQUE tunnel; anything else is nested WireGuard.
+    pub gool_mode: Option<String>,
+    pub exit_location: Option<String>,
+    pub ech: Option<String>,
+    pub quic_v2: Option<bool>,
+    pub quick_reconnect: Option<bool>,
+    pub disable_grease: bool,
+    pub fragment_size: Option<String>,
+    pub fragment_delay: Option<String>,
+    pub keepalive: Option<u32>,
 }
 
 impl StartOptions {
@@ -3756,7 +3766,37 @@ impl StartOptions {
             http_proxy: None,
             proxy_user: None,
             proxy_pass: None,
+            gool_mode: None,
+            exit_location: None,
+            ech: None,
+            quic_v2: None,
+            quick_reconnect: None,
+            disable_grease: false,
+            fragment_size: None,
+            fragment_delay: None,
+            keepalive: None,
         }
+    }
+
+    /// The environment these options set (None removes the variable), kept apart from setting it
+    /// so it can be checked without touching the process.
+    fn transport_env(&self) -> Vec<(&'static str, Option<String>)> {
+        let flag = |value: Option<bool>, on: &str, off: &str| value.map(|v| if v { on } else { off }.to_string());
+        vec![
+            ("AETHER_GOOL_MODE", match (self.protocol, self.gool_mode.as_deref()) {
+                (Protocol::WarpInWarp, Some("masque")) => None,
+                (Protocol::WarpInWarp, _) => Some("classic".to_string()),
+                _ => None,
+            }),
+            ("AETHER_EXIT_LOC", self.exit_location.clone()),
+            ("AETHER_ECH", self.ech.clone()),
+            ("AETHER_QUIC_V2", flag(self.quic_v2, "1", "0")),
+            ("AETHER_QUICK_RECONNECT", flag(self.quick_reconnect, "1", "0")),
+            ("AETHER_DISABLE_GREASE", self.disable_grease.then(|| "1".to_string())),
+            ("AETHER_MASQUE_H2_FRAGMENT_SIZE", self.fragment_size.clone()),
+            ("AETHER_MASQUE_H2_FRAGMENT_DELAY", self.fragment_delay.clone()),
+            ("AETHER_WG_KEEPALIVE", self.keepalive.map(|seconds| seconds.to_string())),
+        ]
     }
 
     fn masque_profile(&self) -> &str {
@@ -3817,12 +3857,13 @@ fn apply_runtime_options(options: &StartOptions) {
         Protocol::WarpInWarp => "gool",
         Protocol::MasqueInMasque => "mim",
     });
-    // Aethery's WARP-on-WARP is nested WireGuard. Upstream's default gool carries the inner
-    // WireGuard through a MASQUE tunnel instead, which the Android app does not offer.
-    if options.protocol == Protocol::WarpInWarp {
-        std::env::set_var("AETHER_GOOL_MODE", "classic");
-    } else {
-        std::env::remove_var("AETHER_GOOL_MODE");
+    // WARP-on-WARP is nested WireGuard unless the app asks for upstream's default, which carries
+    // the inner WireGuard through a MASQUE tunnel.
+    for (key, value) in options.transport_env() {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
     std::env::set_var("AETHER_SCAN", options.scan_mode.label());
     std::env::set_var("AETHER_IP", options.ip_scan.label());
@@ -4096,6 +4137,36 @@ async fn select_ip_version() -> prober::IpScan {
 
 #[cfg(test)]
 mod tests {
+    fn env_of(options: &super::StartOptions, key: &str) -> Option<String> {
+        options.transport_env().into_iter().find(|(name, _)| *name == key).unwrap().1
+    }
+
+    #[test]
+    fn gool_is_nested_wireguard_unless_masque_carriage_is_asked_for() {
+        let mut options = super::StartOptions::new(super::Protocol::WarpInWarp, "aether.toml");
+        assert_eq!(env_of(&options, "AETHER_GOOL_MODE").as_deref(), Some("classic"));
+        options.gool_mode = Some("masque".into());
+        assert_eq!(env_of(&options, "AETHER_GOOL_MODE"), None);
+        let masque = super::StartOptions::new(super::Protocol::Masque, "aether.toml");
+        assert_eq!(env_of(&masque, "AETHER_GOOL_MODE"), None);
+    }
+
+    #[test]
+    fn unset_transport_options_remove_their_variables() {
+        let mut options = super::StartOptions::new(super::Protocol::Masque, "aether.toml");
+        assert!(options.transport_env().iter().all(|(_, value)| value.is_none()));
+        options.quic_v2 = Some(false);
+        options.quick_reconnect = Some(true);
+        options.disable_grease = true;
+        options.keepalive = Some(15);
+        options.exit_location = Some("de".into());
+        assert_eq!(env_of(&options, "AETHER_QUIC_V2").as_deref(), Some("0"));
+        assert_eq!(env_of(&options, "AETHER_QUICK_RECONNECT").as_deref(), Some("1"));
+        assert_eq!(env_of(&options, "AETHER_DISABLE_GREASE").as_deref(), Some("1"));
+        assert_eq!(env_of(&options, "AETHER_WG_KEEPALIVE").as_deref(), Some("15"));
+        assert_eq!(env_of(&options, "AETHER_EXIT_LOC").as_deref(), Some("de"));
+    }
+
     #[test]
     fn warp_is_enabled_once_per_device_and_retried_until_it_succeeds() {
         assert!(super::warp_enable_needed("device-a-test"));

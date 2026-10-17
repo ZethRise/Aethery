@@ -111,6 +111,15 @@ struct NativeStartOptions {
     http_proxy: Option<String>,
     proxy_user: Option<String>,
     proxy_pass: Option<String>,
+    gool_mode: Option<String>,
+    exit_location: Option<String>,
+    ech: Option<String>,
+    quic_v2: Option<bool>,
+    quick_reconnect: Option<bool>,
+    disable_grease: bool,
+    fragment_size: Option<String>,
+    fragment_delay: Option<String>,
+    keepalive: Option<u32>,
 }
 
 impl Default for NativeStartOptions {
@@ -149,6 +158,15 @@ impl Default for NativeStartOptions {
             http_proxy: None,
             proxy_user: None,
             proxy_pass: None,
+            gool_mode: None,
+            exit_location: None,
+            ech: None,
+            quic_v2: None,
+            quick_reconnect: None,
+            disable_grease: false,
+            fragment_size: None,
+            fragment_delay: None,
+            keepalive: None,
         }
     }
 }
@@ -214,6 +232,16 @@ impl TryFrom<NativeStartOptions> for StartOptions {
         };
         options.proxy_user = value.proxy_user.filter(|value| !value.trim().is_empty());
         options.proxy_pass = value.proxy_pass.filter(|value| !value.trim().is_empty());
+        let text = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
+        options.gool_mode = text(value.gool_mode);
+        options.exit_location = text(value.exit_location);
+        options.ech = text(value.ech);
+        options.quic_v2 = value.quic_v2;
+        options.quick_reconnect = value.quick_reconnect;
+        options.disable_grease = value.disable_grease;
+        options.fragment_size = text(value.fragment_size);
+        options.fragment_delay = text(value.fragment_delay);
+        options.keepalive = value.keepalive.filter(|seconds| *seconds > 0);
         Ok(options)
     }
 }
@@ -742,6 +770,26 @@ mod tests {
         assert_eq!(options.team.as_deref(), Some("acme"));
         assert!(options.gateway);
         assert!(options.h2_fallback.is_none());
+    }
+
+    #[test]
+    fn parses_the_transport_and_exit_options() {
+        let native: NativeStartOptions = serde_json::from_str(
+            r#"{"config_path":"aether.toml","protocol":"mim","gool_mode":"masque","exit_location":"de,nl","ech":"auto","quic_v2":false,"quick_reconnect":true,"disable_grease":true,"fragment_size":"8-16","fragment_delay":" ","keepalive":0}"#,
+        )
+        .unwrap();
+        let options = StartOptions::try_from(native).unwrap();
+
+        assert_eq!(options.protocol, Protocol::MasqueInMasque);
+        assert_eq!(options.gool_mode.as_deref(), Some("masque"));
+        assert_eq!(options.exit_location.as_deref(), Some("de,nl"));
+        assert_eq!(options.ech.as_deref(), Some("auto"));
+        assert_eq!(options.quic_v2, Some(false));
+        assert_eq!(options.quick_reconnect, Some(true));
+        assert!(options.disable_grease);
+        assert_eq!(options.fragment_size.as_deref(), Some("8-16"));
+        assert!(options.fragment_delay.is_none(), "blank means unset");
+        assert!(options.keepalive.is_none(), "0 means the default");
     }
 
     #[test]
