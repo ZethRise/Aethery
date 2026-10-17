@@ -203,61 +203,7 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
         );
     }
 
-    match tor::mode() {
-        tor::Mode::Chain => {
-            let through = listen;
-            let state = tor::state_dir(&base_config);
-            tokio::spawn(async move {
-                if let Err(e) = tor::run_chain(through, state).await {
-                    log::error!("[-] tor: {e}");
-                }
-            });
-        }
-        tor::Mode::Reverse => {
-            if matches!(protocol, Protocol::WireGuard | Protocol::WarpInWarp) {
-                return Err(AetherError::Other(format!(
-                    "tor carries tcp only and warp's wireguard endpoints answer on udp alone, so \
-                     {} can never be reached through tor; use --masque, which this mode runs over \
-                     http/2, or put tor inside the tunnel instead with --tor",
-                    protocol.label()
-                )));
-            }
-
-            let socks = tor::start_reverse(tor::state_dir(&base_config)).await?;
-            std::env::set_var("AETHER_UPSTREAM", format!("socks5://{socks}"));
-            std::env::set_var("AETHER_MASQUE_HTTP2", "1");
-            log::info!("[+] the tunnel is dialled through tor on the http/2 carrier");
-        }
-        tor::Mode::Only | tor::Mode::Off => {}
-    }
-
-    match psiphon::mode() {
-        psiphon::Mode::Chain => {
-            let through = listen;
-            let state = psiphon::state_dir(&base_config);
-            tokio::spawn(async move {
-                if let Err(e) = psiphon::run_chain(through, state).await {
-                    log::error!("[-] psiphon: {e}");
-                }
-            });
-        }
-        psiphon::Mode::Reverse => {
-            if matches!(protocol, Protocol::WireGuard | Protocol::WarpInWarp) {
-                return Err(AetherError::Other(format!(
-                    "psiphon carries tcp only and warp's wireguard endpoints answer on udp alone, \
-                     so {} can never be reached through psiphon; use --masque, which this mode \
-                     runs over http/2, or put psiphon inside the tunnel instead with --psiphon",
-                    protocol.label()
-                )));
-            }
-
-            let socks = psiphon::start_reverse(psiphon::state_dir(&base_config)).await?;
-            std::env::set_var("AETHER_UPSTREAM", format!("socks5://{socks}"));
-            std::env::set_var("AETHER_MASQUE_HTTP2", "1");
-            log::info!("[+] the tunnel is dialled through psiphon on the http/2 carrier");
-        }
-        psiphon::Mode::Only | psiphon::Mode::Off => {}
-    }
+    start_carriers(protocol, listen, &base_config).await?;
 
     match protocol {
         Protocol::Masque => {
@@ -3727,6 +3673,15 @@ pub struct StartOptions {
     pub fragment_size: Option<String>,
     pub fragment_delay: Option<String>,
     pub keepalive: Option<u32>,
+    pub tor: Option<String>,
+    pub tor_bridges: Option<String>,
+    pub tor_country: Option<String>,
+    pub tor_relays: Option<String>,
+    pub tor_bind: Option<String>,
+    pub psiphon: Option<String>,
+    pub psiphon_bin: Option<String>,
+    pub psiphon_region: Option<String>,
+    pub psiphon_bind: Option<String>,
 }
 
 impl StartOptions {
@@ -3775,6 +3730,15 @@ impl StartOptions {
             fragment_size: None,
             fragment_delay: None,
             keepalive: None,
+            tor: None,
+            tor_bridges: None,
+            tor_country: None,
+            tor_relays: None,
+            tor_bind: None,
+            psiphon: None,
+            psiphon_bin: None,
+            psiphon_region: None,
+            psiphon_bind: None,
         }
     }
 
@@ -3796,6 +3760,15 @@ impl StartOptions {
             ("AETHER_MASQUE_H2_FRAGMENT_SIZE", self.fragment_size.clone()),
             ("AETHER_MASQUE_H2_FRAGMENT_DELAY", self.fragment_delay.clone()),
             ("AETHER_WG_KEEPALIVE", self.keepalive.map(|seconds| seconds.to_string())),
+            ("AETHER_TOR", self.tor.clone()),
+            ("AETHER_TOR_BRIDGES", self.tor_bridges.clone()),
+            ("AETHER_TOR_COUNTRY", self.tor_country.clone()),
+            ("AETHER_TOR_RELAYS", self.tor_relays.clone()),
+            ("AETHER_TOR_BIND", self.tor_bind.clone()),
+            ("AETHER_PSIPHON", self.psiphon.clone()),
+            ("AETHER_PSIPHON_BIN", self.psiphon_bin.clone()),
+            ("AETHER_PSIPHON_REGION", self.psiphon_region.clone()),
+            ("AETHER_PSIPHON_BIND", self.psiphon_bind.clone()),
         ]
     }
 
@@ -3985,6 +3958,68 @@ pub fn initialize() {
     });
 }
 
+/// Starts the Tor and Psiphon helpers the environment asks for: a second proxy beside the tunnel
+/// (chain), or a carrier the tunnel itself is dialled through (reverse). "Only" is not handled
+/// here: it replaces the tunnel, so callers run it instead of one.
+async fn start_carriers(protocol: Protocol, listen: SocketAddr, base_config: &str) -> Result<()> {
+    match tor::mode() {
+        tor::Mode::Chain => {
+            let through = listen;
+            let state = tor::state_dir(base_config);
+            tokio::spawn(async move {
+                if let Err(e) = tor::run_chain(through, state).await {
+                    log::error!("[-] tor: {e}");
+                }
+            });
+        }
+        tor::Mode::Reverse => {
+            if matches!(protocol, Protocol::WireGuard | Protocol::WarpInWarp) {
+                return Err(AetherError::Other(format!(
+                    "tor carries tcp only and warp's wireguard endpoints answer on udp alone, so \
+                     {} can never be reached through tor; use --masque, which this mode runs over \
+                     http/2, or put tor inside the tunnel instead with --tor",
+                    protocol.label()
+                )));
+            }
+
+            let socks = tor::start_reverse(tor::state_dir(base_config)).await?;
+            std::env::set_var("AETHER_UPSTREAM", format!("socks5://{socks}"));
+            std::env::set_var("AETHER_MASQUE_HTTP2", "1");
+            log::info!("[+] the tunnel is dialled through tor on the http/2 carrier");
+        }
+        tor::Mode::Only | tor::Mode::Off => {}
+    }
+
+    match psiphon::mode() {
+        psiphon::Mode::Chain => {
+            let through = listen;
+            let state = psiphon::state_dir(base_config);
+            tokio::spawn(async move {
+                if let Err(e) = psiphon::run_chain(through, state).await {
+                    log::error!("[-] psiphon: {e}");
+                }
+            });
+        }
+        psiphon::Mode::Reverse => {
+            if matches!(protocol, Protocol::WireGuard | Protocol::WarpInWarp) {
+                return Err(AetherError::Other(format!(
+                    "psiphon carries tcp only and warp's wireguard endpoints answer on udp alone, \
+                     so {} can never be reached through psiphon; use --masque, which this mode \
+                     runs over http/2, or put psiphon inside the tunnel instead with --psiphon",
+                    protocol.label()
+                )));
+            }
+
+            let socks = psiphon::start_reverse(psiphon::state_dir(base_config)).await?;
+            std::env::set_var("AETHER_UPSTREAM", format!("socks5://{socks}"));
+            std::env::set_var("AETHER_MASQUE_HTTP2", "1");
+            log::info!("[+] the tunnel is dialled through psiphon on the http/2 carrier");
+        }
+        psiphon::Mode::Only | psiphon::Mode::Off => {}
+    }
+    Ok(())
+}
+
 pub async fn start(options: StartOptions) -> Result<()> {
     apply_runtime_options(&options);
     initialize();
@@ -3999,6 +4034,20 @@ pub async fn start(options: StartOptions) -> Result<()> {
         "Native tunnel started ({})",
         options.protocol.label()
     ));
+
+    // Tor or Psiphon alone is the whole tunnel: a proxy and nothing under it.
+    if tor::mode() == tor::Mode::Only {
+        return tor::run_only(options.listen, tor::state_dir(&options.config_path)).await;
+    }
+    if psiphon::mode() == psiphon::Mode::Only {
+        return psiphon::run_only(options.listen, psiphon::state_dir(&options.config_path)).await;
+    }
+    if tor::mode() == tor::Mode::Reverse && psiphon::mode() == psiphon::Mode::Reverse {
+        return Err(AetherError::Other(
+            "Tor and Psiphon both want to carry the tunnel; pick one, or put the other inside it".into(),
+        ));
+    }
+    start_carriers(options.protocol, options.listen, &options.config_path).await?;
 
     match options.protocol {
         Protocol::Masque => {
@@ -4149,6 +4198,21 @@ mod tests {
         assert_eq!(env_of(&options, "AETHER_GOOL_MODE"), None);
         let masque = super::StartOptions::new(super::Protocol::Masque, "aether.toml");
         assert_eq!(env_of(&masque, "AETHER_GOOL_MODE"), None);
+    }
+
+    #[test]
+    fn tor_and_psiphon_options_set_their_variables_and_unset_ones_clear_them() {
+        let mut options = super::StartOptions::new(super::Protocol::Masque, "aether.toml");
+        assert_eq!(env_of(&options, "AETHER_TOR"), None);
+        assert_eq!(env_of(&options, "AETHER_PSIPHON"), None);
+        options.tor = Some("reverse".into());
+        options.tor_country = Some("ir".into());
+        options.psiphon = Some("chain".into());
+        options.psiphon_bin = Some("/lib/libpsiphon.so".into());
+        assert_eq!(env_of(&options, "AETHER_TOR").as_deref(), Some("reverse"));
+        assert_eq!(env_of(&options, "AETHER_TOR_COUNTRY").as_deref(), Some("ir"));
+        assert_eq!(env_of(&options, "AETHER_PSIPHON").as_deref(), Some("chain"));
+        assert_eq!(env_of(&options, "AETHER_PSIPHON_BIN").as_deref(), Some("/lib/libpsiphon.so"));
     }
 
     #[test]

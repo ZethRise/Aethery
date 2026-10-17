@@ -877,6 +877,7 @@ mod with_tor {
         let client = establish(&state, None, FOREVER).await?;
         log::info!("[+] tor is ready; {listen} leaves through tor");
         announce_exit(listen, "tor");
+        crate::ffi::mark_ready();
 
         serve(listener, client, "tor socks5").await
     }

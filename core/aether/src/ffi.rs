@@ -120,6 +120,15 @@ struct NativeStartOptions {
     fragment_size: Option<String>,
     fragment_delay: Option<String>,
     keepalive: Option<u32>,
+    tor: Option<String>,
+    tor_bridges: Option<String>,
+    tor_country: Option<String>,
+    tor_relays: Option<String>,
+    tor_bind: Option<String>,
+    psiphon: Option<String>,
+    psiphon_bin: Option<String>,
+    psiphon_region: Option<String>,
+    psiphon_bind: Option<String>,
 }
 
 impl Default for NativeStartOptions {
@@ -167,6 +176,15 @@ impl Default for NativeStartOptions {
             fragment_size: None,
             fragment_delay: None,
             keepalive: None,
+            tor: None,
+            tor_bridges: None,
+            tor_country: None,
+            tor_relays: None,
+            tor_bind: None,
+            psiphon: None,
+            psiphon_bin: None,
+            psiphon_region: None,
+            psiphon_bind: None,
         }
     }
 }
@@ -242,6 +260,15 @@ impl TryFrom<NativeStartOptions> for StartOptions {
         options.fragment_size = text(value.fragment_size);
         options.fragment_delay = text(value.fragment_delay);
         options.keepalive = value.keepalive.filter(|seconds| *seconds > 0);
+        options.tor = text(value.tor);
+        options.tor_bridges = text(value.tor_bridges);
+        options.tor_country = text(value.tor_country);
+        options.tor_relays = text(value.tor_relays);
+        options.tor_bind = text(value.tor_bind);
+        options.psiphon = text(value.psiphon);
+        options.psiphon_bin = text(value.psiphon_bin);
+        options.psiphon_region = text(value.psiphon_region);
+        options.psiphon_bind = text(value.psiphon_bind);
         Ok(options)
     }
 }
@@ -790,6 +817,24 @@ mod tests {
         assert_eq!(options.fragment_size.as_deref(), Some("8-16"));
         assert!(options.fragment_delay.is_none(), "blank means unset");
         assert!(options.keepalive.is_none(), "0 means the default");
+    }
+
+    #[test]
+    fn parses_the_tor_and_psiphon_options() {
+        let native: NativeStartOptions = serde_json::from_str(
+            r#"{"config_path":"aether.toml","tor":"reverse","tor_bridges":"auto","tor_country":"ir","tor_bind":"127.0.0.1:1822","psiphon":"only","psiphon_bin":"/lib/libpsiphon.so","psiphon_region":"DE","psiphon_bind":" "}"#,
+        )
+        .unwrap();
+        let options = StartOptions::try_from(native).unwrap();
+
+        assert_eq!(options.tor.as_deref(), Some("reverse"));
+        assert_eq!(options.tor_bridges.as_deref(), Some("auto"));
+        assert_eq!(options.tor_country.as_deref(), Some("ir"));
+        assert_eq!(options.tor_bind.as_deref(), Some("127.0.0.1:1822"));
+        assert_eq!(options.psiphon.as_deref(), Some("only"));
+        assert_eq!(options.psiphon_bin.as_deref(), Some("/lib/libpsiphon.so"));
+        assert_eq!(options.psiphon_region.as_deref(), Some("DE"));
+        assert!(options.psiphon_bind.is_none(), "blank means unset");
     }
 
     #[test]

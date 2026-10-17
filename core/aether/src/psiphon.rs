@@ -888,6 +888,7 @@ pub async fn run_only(listen: SocketAddr, state: PathBuf) -> Result<()> {
         log::info!("[+] psiphon http proxy on {address}");
     }
     announce(running.socks, "psiphon");
+    crate::ffi::mark_ready();
 
     running.wait().await
 }
