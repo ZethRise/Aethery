@@ -207,7 +207,9 @@ class AetherTileService : TileService() {
         ) {
             MASQUE("MASQUE", "masque", "HTTP/3 tunnel"),
             WIREGUARD("WireGuard", "wireguard", "WireGuard tunnel"),
-            WARP_IN_WARP("WARP-on-WARP", "gool", "Double-layer tunnel"),
+            WARP_IN_WARP("WARP-on-WARP (WireGuard)", "gool", "Two nested WireGuard tunnels"),
+            WARP_IN_WARP_MASQUE("WARP-on-WARP (MASQUE)", "gool-masque", "WireGuard carried inside a MASQUE tunnel"),
+            MASQUE_IN_MASQUE("MASQUE-on-MASQUE", "mim", "Two MASQUE hops"),
         }
 
         enum class ScanTarget(

@@ -22,7 +22,11 @@ object CoreConfig {
         val listenHost = if (proxy && lan) "0.0.0.0" else "127.0.0.1"
         return JSONObject().apply {
             put("config_path", File(context.filesDir, "aether.toml").absolutePath)
-            put("protocol", protocol ?: text("default_protocol", "masque"))
+            val method = protocol ?: text("default_protocol", "masque")
+            // "gool-masque" is the app's name for upstream's default gool: the core knows it as gool
+            // with its inner WireGuard carried through MASQUE.
+            put("protocol", if (method == "gool-masque") "gool" else method)
+            if (method == "gool-masque") put("gool_mode", "masque")
             put("listen", "$listenHost:${prefs.getInt("default_socks_port", 1819)}")
             put("http_proxy", "$listenHost:${prefs.getInt("default_http_proxy_port", 1820)}")
             if (proxy && lan) {
@@ -53,6 +57,14 @@ object CoreConfig {
             putOpt("access_token", SecureStore.getSecret(context, "zero_trust_token").ifBlank { null })
             putOpt("access_email", SecureStore.getSecret(context, "zero_trust_email").ifBlank { null })
             put("gateway", prefs.getBoolean("zero_trust_gateway", false))
+            putOpt("exit_location", text("exit_location").ifBlank { null })
+            putOpt("ech", text("ech", "off").takeIf { it != "off" && it.isNotBlank() })
+            if (!prefs.getBoolean("quic_v2", true)) put("quic_v2", false)
+            if (prefs.getBoolean("quick_reconnect", false)) put("quick_reconnect", true)
+            if (prefs.getBoolean("disable_grease", false)) put("disable_grease", true)
+            putOpt("fragment_size", text("fragment_size").ifBlank { null })
+            putOpt("fragment_delay", text("fragment_delay").ifBlank { null })
+            text("wg_keepalive").toIntOrNull()?.takeIf { it > 0 }?.let { put("keepalive", it) }
         }.toString()
     }
 

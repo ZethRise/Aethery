@@ -67,13 +67,15 @@ object PageMotion {
 class PageStack(private val host: FrameLayout) {
     private val model = PageStackModel<View>()
     private val guards = HashMap<View, () -> Boolean>()
+    private val closedHooks = HashMap<View, () -> Unit>()
 
     val isEmpty: Boolean get() = model.size == 0
 
     /** [canClose] is asked before a back press may close [page]; a page doing work says no. */
-    fun push(page: View, canClose: () -> Boolean = { true }) {
+    fun push(page: View, canClose: () -> Boolean = { true }, onClosed: (() -> Unit)? = null) {
         val behind = host.getChildAt(host.childCount - 1)
         guards[page] = canClose
+        onClosed?.let { closedHooks[page] = it }
         model.push(page)
         host.addView(page, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -92,6 +94,7 @@ class PageStack(private val host: FrameLayout) {
         if (!force && guards[top]?.invoke() == false) return true
         val page = model.pop() ?: return false
         guards.remove(page)
+        closedHooks.remove(page)?.invoke()
         val index = host.indexOfChild(page)
         val behind = if (index > 0) host.getChildAt(index - 1) else page
         PageMotion.close(page, behind) { host.removeView(page) }

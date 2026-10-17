@@ -167,7 +167,10 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         val gen = session.incrementAndGet()
         storedConfig = config
         storedVpnMode = vpnMode
-        currentProtocol = config.substringAfter("\"protocol\":\"").substringBefore('\"').uppercase()
+        // The app's own name for the method, which tells apart modes the core calls by one name.
+        currentProtocol = getSharedPreferences("settings", MODE_PRIVATE)
+            .getString("default_protocol", null)?.uppercase()
+            ?: config.substringAfter("\"protocol\":\"").substringBefore('\"').uppercase()
         currentVpnIp = ""
         currentPing = ""
         currentTx = 0

@@ -39,25 +39,12 @@ fun buildEditorPage(
     fun dp(value: Int) = (value * density).roundToInt()
     val reduced = Motion.reduced(context)
 
-    fun button(text: String, filled: Boolean, onClick: () -> Unit) = TextView(context).apply {
-        this.text = text
-        textSize = 15f
-        gravity = Gravity.CENTER
-        setTextColor(if (filled) palette.canvas else palette.ink)
-        typeface = HaloType.body(context, medium = true)
-        background = if (filled) {
-            android.graphics.drawable.GradientDrawable().apply {
-                setColor(palette.primary)
-                cornerRadius = dp(16).toFloat()
-            }
-        } else {
-            glassBackground(palette, 16, density)
-        }
-        isClickable = true
-        isFocusable = true
-        contentDescription = text
-        setOnClickListener { onClick() }
-    }
+    val kit = HaloKit(context, palette)
+    fun button(text: String, filled: Boolean, onClick: () -> Unit) = kit.button(
+        text,
+        if (filled) HaloKit.ButtonKind.PRIMARY else HaloKit.ButtonKind.SECONDARY,
+        onClick = onClick,
+    )
 
     val errors = ArrayList<TextView>()
     lateinit var saveBar: LinearLayout

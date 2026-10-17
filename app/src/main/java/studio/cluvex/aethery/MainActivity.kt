@@ -20,7 +20,11 @@ import android.graphics.drawable.GradientDrawable
 import android.widget.ImageView.ScaleType
 import studio.cluvex.aethery.ui.EditorField
 import studio.cluvex.aethery.ui.HaloColors
+import studio.cluvex.aethery.ui.HaloKit
+import studio.cluvex.aethery.ui.Scaffold
+import studio.cluvex.aethery.ui.buildScaffold
 import studio.cluvex.aethery.ui.HaloOrb
+import studio.cluvex.aethery.ui.IpAddresses
 import studio.cluvex.aethery.ui.HaloSky
 import studio.cluvex.aethery.ui.OrbState
 import studio.cluvex.aethery.ui.PageMotion
@@ -114,27 +118,7 @@ class MainActivity : Activity() {
     private var pendingConfig: String? = null
     private var visualState = HaloOrb.State.DISCONNECTED
     private var receiverRegistered = false
-    private var showingSettings = false
-    private var showingLogs = false
-    private var showingScanner = false
-    private var showingMode = false
-    private var settingsPage: View? = null
-    private var tunnelControlsPage: View? = null
-    private var zeroTrustPage: View? = null
-    private var zeroTrustControlButton: TextView? = null
-    private var logsPage: View? = null
-    private var scannerPage: View? = null
-    private var modePage: View? = null
-    private var splitTunnelPage: View? = null
-    private var splitTunnelAppsPage: View? = null
-    private var splitTunnelSummaryButton: TextView? = null
-    private var splitTunnelDraftMode: SplitTunnelSettings.Mode? = null
-    private var splitTunnelDraftPackages: MutableSet<String>? = null
     private var headerLogo: ImageView? = null
-    private var themePage: View? = null
-    private var widgetControlPage: View? = null
-    private var widgetTransportPage: View? = null
-    private var trafficMonitorPage: View? = null
     private var trafficSpeedValue: TextView? = null
     private var trafficSessionValue: TextView? = null
     private var trafficMonthValue: TextView? = null
@@ -617,8 +601,9 @@ class MainActivity : Activity() {
         val request = ++ipRequest
         startIpRefreshAnimation()
         ipAddressLabel.text = if (isTunnelActive()) "VPN IP" else "Your IP"
-        val knownIp = assignedVpnIp.takeIf { isTunnelActive() && it.isNotBlank() }
-        ipAddressValue.text = knownIp ?: "Checking…"
+        // assignedVpnIp starts as the tunnel's own address, which is not the exit; only a public one is worth showing.
+        val knownIp = assignedVpnIp.takeIf { isTunnelActive() && it.isNotBlank() && !IpAddresses.isInternal(it) }
+        ipAddressValue.text = knownIp ?: "Detecting…"
         Thread {
             val result = runCatching {
                 fetchPublicIp()
@@ -679,7 +664,7 @@ class MainActivity : Activity() {
                 failure = error
             }
         }
-        assignedVpnIp.takeIf { it.isNotBlank() }?.let { return it to "" }
+        assignedVpnIp.takeIf { it.isNotBlank() && !IpAddresses.isInternal(it) }?.let { return it to "" }
         throw failure ?: IllegalStateException("IP unavailable")
     }
 
@@ -800,460 +785,153 @@ class MainActivity : Activity() {
         addView(ChevronView(this@MainActivity, MUTED), LinearLayout.LayoutParams(dp(24), dp(24)))
     }
 
-    private fun openLogsScreen() {
-        showingLogs = true
-        logsPage?.let(pageHost::removeView)
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
+    // ---- Pages ----------------------------------------------------------------------------
+    // Every page after the main screen is a Scaffold built from the Halo kit and pushed on the
+    // page stack, so the back button, the spring transition and the staggered entrance are the
+    // same everywhere.
+
+    private val kit by lazy { HaloKit(this, palette) }
+
+    private fun newPage(
+        title: String,
+        subtitle: String? = null,
+        scrollable: Boolean = true,
+        bottomBar: View? = null,
+    ): Scaffold = buildScaffold(this, palette, title, subtitle, onBack = { pageStack.pop() }, bottomBar = bottomBar, scrollable = scrollable)
+
+    private fun showPage(page: Scaffold, canClose: () -> Boolean = { true }, onClosed: (() -> Unit)? = null) {
+        pageStack.push(page.page, canClose, onClosed)
+        kit.stagger(page.content)
+    }
+
+    /** A heading, a glass group of rows and an optional note under it. */
+    private fun Scaffold.block(heading: String?, rows: List<View>, note: String? = null, top: Int = 24) {
+        if (heading != null) content.addView(kit.section(heading), kit.matchWidth(top))
+        content.addView(kit.group(rows), kit.matchWidth(if (heading != null) 8 else top))
+        if (note != null) content.addView(kit.note(note), kit.matchWidth(8))
+    }
+
+    /** Option cards with one selected; picking applies at once and the others let go. */
+    private fun <T> Scaffold.choices(
+        heading: String?,
+        options: List<T>,
+        selected: T,
+        label: (T) -> String,
+        description: (T) -> String,
+        top: Int = 24,
+        onPick: (T) -> Unit,
+    ) {
+        if (heading != null) content.addView(kit.section(heading), kit.matchWidth(top))
+        val cards = ArrayList<Pair<T, HaloKit.OptionCard>>()
+        options.forEachIndexed { index, item ->
+            val card = kit.optionCard(label(item), description(item), item == selected) {
+                cards.forEach { (value, other) -> other.setSelected(value == item) }
+                onPick(item)
+            }
+            cards.add(item to card)
+            content.addView(card.view, kit.matchWidth(if (index == 0) (if (heading != null) 8 else top) else 10))
         }
-        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val header = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeLogsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Logs"))
+    }
+
+    private fun tunnelIdle(): Boolean =
+        visualState != HaloOrb.State.CONNECTING && visualState != HaloOrb.State.CONNECTED && !NativeCore.isRunning()
+
+    private fun valueRow(title: String, current: () -> String, subtitle: String? = null, open: (() -> Unit) -> Unit): HaloKit.Row {
+        lateinit var row: HaloKit.Row
+        row = kit.row(title, subtitle, current()) { open { row.setValue(current()) } }
+        return row
+    }
+
+    private fun openSettingsScreen() {
+        val page = newPage("Settings")
+        lateinit var typeRow: HaloKit.Row
+        typeRow = kit.row("Connection type", value = connectionType().label) {
+            showConnectionTypeSheet { typeRow.setValue(it.label) }
         }
-        content.addView(header)
-        content.addView(label("Aether and VPN events", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(16) })
-        val logLevelRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        val killSwitch = kit.switchRow("Kill switch", "Block all traffic if the tunnel drops", killSwitchEnabled()) {
+            preferences().edit().putBoolean(KILL_SWITCH, it).apply()
         }
-        val currentLogLevel = logLevel()
-        LogLevel.entries.forEach { level ->
-            val isActive = level == currentLogLevel
-            val chip = label(level.label, 14f, if (isActive) primaryContainer else INK, TypefaceStyle.MEDIUM).apply {
-                gravity = Gravity.CENTER
-                setPadding(dp(6), dp(8), dp(6), dp(8))
-                setSingleLine(true)
-                background = roundedBackground(if (isActive) primary else SURFACE_VARIANT, 14, if (isActive) primary else DIVIDER)
-                isClickable = true
-                isFocusable = true
-                setOnClickListener {
-                    preferences().edit().putString(LOG_LEVEL, level.coreName).apply()
-                    for (i in 0 until logLevelRow.childCount) {
-                        val child = logLevelRow.getChildAt(i) as TextView
-                        val childLevel = LogLevel.entries[i]
-                        val selected = childLevel == level
-                        child.setTextColor(if (selected) primaryContainer else INK)
-                        child.background = roundedBackground(if (selected) primary else SURFACE_VARIANT, 12, if (selected) primary else DIVIDER)
-                    }
+        page.block("Connection", listOf(typeRow.view, killSwitch.view), top = 4)
+
+        lateinit var lanShare: HaloKit.Row
+        lanShare = kit.switchRow("Share on LAN", lanSharingSummary(), lanSharingEnabled()) {
+            preferences().edit().putBoolean(LAN_SHARING, it).apply()
+            if (it) CoreConfig.lanProxyPassword(preferences())
+            lanShare.setSubtitle(lanSharingSummary())
+        }
+        val lanBypass = kit.switchRow("Bypass LAN", "Keep local network devices reachable while the VPN is connected", lanBypassEnabled()) {
+            preferences().edit().putBoolean(LAN_BYPASS, it).apply()
+        }
+        page.block("Local network", listOf(lanShare.view, lanBypass.view))
+
+        lateinit var socksRow: HaloKit.Row
+        lateinit var httpRow: HaloKit.Row
+        socksRow = kit.row("SOCKS5 port", "For apps that speak SOCKS", socksPort().toString()) {
+            editPort("SOCKS5 port", DEFAULT_SOCKS_PORT, socksPort(), { httpProxyPort() }, "HTTP CONNECT") { socksRow.setValue(it.toString()) }
+        }
+        httpRow = kit.row("HTTP CONNECT port", "For Psiphon and other HTTP-proxy clients", httpProxyPort().toString()) {
+            editPort("HTTP CONNECT port", DEFAULT_HTTP_PROXY_PORT, httpProxyPort(), { socksPort() }, "SOCKS5") { httpRow.setValue(it.toString()) }
+        }
+        page.block("Core ports", listOf(socksRow.view, httpRow.view), note = "Both take effect on the next connection.")
+
+        lateinit var splitRow: HaloKit.Row
+        splitRow = kit.row("Split tunneling", value = splitTunnelSummary()) {
+            openSplitTunnelScreen { splitRow.setValue(splitTunnelSummary()) }
+        }
+        val traffic = kit.row("Traffic monitor") { openTrafficMonitorScreen() }
+        page.block("Apps and traffic", listOf(splitRow.view, traffic.view))
+
+        val theme = valueRow("Theme", { AppAppearance.current(this).label }) { openThemeScreen() }
+        val widgets = kit.row("Widgets") { openWidgetControlScreen() }
+        page.block("Look and home screen", listOf(theme.view, widgets.view))
+
+        val tunnel = kit.row("Tunnel controls", "Obfuscation, routing, DNS and handshake options") { openTunnelControlsScreen() }
+        page.block("Advanced", listOf(tunnel.view))
+
+        page.content.addView(kit.text("Version ${appVersion()}", 14f, MUTED).apply { gravity = Gravity.CENTER_HORIZONTAL },
+            kit.matchWidth(32))
+        page.content.addView(kit.button("Check for updates") { appUpdater.checkForUpdate() }, kit.matchWidth(14))
+        page.content.addView(kit.button("Aethery on GitHub", iconRes = R.drawable.ic_github, tintIcon = false) {
+            openLink("https://github.com/ZethRise/Aethery")
+        }, kit.matchWidth(10))
+        showPage(page)
+    }
+
+    private fun editPort(
+        title: String,
+        key: String,
+        current: Int,
+        otherPort: () -> Int,
+        otherName: String,
+        onSaved: (Int) -> Unit,
+    ) {
+        val field = kit.field(current.toString(), "1 to 65535").apply { inputType = InputType.TYPE_CLASS_NUMBER }
+        pageStack.push(buildEditorPage(
+            context = this,
+            palette = palette,
+            title = title,
+            subtitle = "Takes effect on the next connection.",
+            fields = listOf(EditorField("Port", field)),
+            validator = { values ->
+                val port = values[0].toIntOrNull()
+                when {
+                    port == null || port !in 1..65535 -> 0 to "Enter a port from 1 to 65535"
+                    port == otherPort() -> 0 to "Use a different port from $otherName"
+                    else -> null
                 }
-            }
-            logLevelRow.addView(chip, LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f,
-            ).apply { rightMargin = dp(4) })
-        }
-        content.addView(logLevelRow, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(0); rightMargin = dp(0); bottomMargin = dp(12) })
-        val logTabs = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        var selectedLogTab = LogTab.ALL
-        val tabViews = mutableMapOf<LogTab, TextView>()
-        LogTab.entries.forEach { tab ->
-            val tabView = label(tab.label, 13f, INK, TypefaceStyle.MEDIUM).apply {
-                gravity = Gravity.CENTER
-                setPadding(dp(12), dp(8), dp(12), dp(8))
-                isClickable = true
-                isFocusable = true
-                setOnClickListener {
-                    selectedLogTab = tab
-                    tabViews.forEach { (item, view) ->
-                        val active = item == tab
-                        view.setTextColor(if (active) primaryContainer else INK)
-                        view.background = roundedBackground(if (active) primary else SURFACE_VARIANT, 14, if (active) primary else DIVIDER)
-                    }
-                }
-            }
-            tabViews[tab] = tabView
-            logTabs.addView(tabView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                rightMargin = dp(4)
-            })
-        }
-        tabViews.forEach { (tab, view) ->
-            val active = tab == selectedLogTab
-            view.setTextColor(if (active) primaryContainer else INK)
-            view.background = roundedBackground(if (active) primary else SURFACE_VARIANT, 14, if (active) primary else DIVIDER)
-        }
-        content.addView(logTabs, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(12) })
-        val events = label(textSize = 13f, color = INK).apply {
-            typeface = android.graphics.Typeface.MONOSPACE
-            setTextIsSelectable(true)
-        }
-        var followLatest = true
-        val scroll = ScrollView(this).apply {
-            addView(events)
-            setOnScrollChangeListener { _, _, scrollY, _, _ ->
-                val contentHeight = getChildAt(0)?.height ?: 0
-                followLatest = scrollY >= contentHeight - height - dp(8)
-            }
-        }
-        content.addView(scroll, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            0,
-            1f,
+            },
+            secondaryAction = null,
+            onBack = { pageStack.pop() },
+            onSave = { values ->
+                val port = values[0].toInt()
+                getSharedPreferences(SETTINGS, MODE_PRIVATE).edit().putInt(key, port).apply()
+                onSaved(port)
+            },
         ))
-        page.addView(content, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ).apply {
-            leftMargin = dp(24)
-            rightMargin = dp(24)
-            topMargin = dp(16)
-            bottomMargin = dp(16)
-        })
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            (content.layoutParams as FrameLayout.LayoutParams).apply {
-                topMargin = insets.systemWindowInsetTop + dp(16)
-                bottomMargin = insets.systemWindowInsetBottom + dp(16)
-                content.layoutParams = this
-            }
-            insets
-        }
-        val refreshHandler = Handler(Looper.getMainLooper())
-        var renderedLogs: String? = null
-        val refresh = object : Runnable {
-            override fun run() {
-                val updatedLogs = connectionLogText(selectedLogTab)
-                if (updatedLogs != renderedLogs) {
-                    val keepAtBottom = followLatest || renderedLogs == null
-                    events.text = updatedLogs
-                    renderedLogs = updatedLogs
-                    if (keepAtBottom) {
-                        scroll.post {
-                            scroll.scrollTo(0, (scroll.getChildAt(0)?.height ?: 0) - scroll.height)
-                        }
-                    }
-                }
-                if (showingLogs) refreshHandler.postDelayed(this, LOG_REFRESH_MS)
-            }
-        }
-        page.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
-            override fun onViewAttachedToWindow(view: View) = refresh.run()
-            override fun onViewDetachedFromWindow(view: View) = refreshHandler.removeCallbacks(refresh)
-        })
-        logsPage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        animatePageOpen(page)
     }
 
-    private fun closeLogsScreen() {
-        showingLogs = false
-        logsPage?.let { animatePageClose(it) { logsPage = null } }
-    }
-
-    private fun animatePageOpen(page: View) {
-        val behind = if (pageHost.childCount > 1) pageHost.getChildAt(pageHost.childCount - 2) else mainRoot
-        PageMotion.open(page, behind)
-    }
-
-    private fun animatePageClose(page: View, onEnd: () -> Unit) {
-        val index = pageHost.indexOfChild(page)
-        val behind = if (index > 0) pageHost.getChildAt(index - 1) else mainRoot
-        PageMotion.close(page, behind) {
-            if (page.parent == pageHost) pageHost.removeView(page)
-            onEnd()
-        }
-    }
-
-    private fun staggerListItems(container: ViewGroup) {
-        for (i in 0 until container.childCount) {
-            val child = container.getChildAt(i)
-            child.alpha = 0f
-            child.translationY = dp(12).toFloat()
-            child.animate()
-                .alpha(1f)
-                .translationY(0f)
-                .setDuration(PAGE_ANIMATION_MS)
-                .setStartDelay(80L + i * 32L)
-                .setInterpolator(motionInterpolator)
-                .start()
-        }
-    }
-
-    private fun connectionLogText(tab: LogTab = LogTab.ALL): String {
-        val appEvents = ConnectionLog.snapshot()
-        val coreEvents = NativeCore.lastLog().lineSequence().filter(String::isNotBlank).toList()
-        val events = when (tab) {
-            LogTab.ALL -> appEvents + coreEvents
-            LogTab.APP -> appEvents
-            LogTab.CORE -> coreEvents
-        }
-        return events.joinToString("\n").ifBlank { "No connection events yet" }
-    }
-
-    private fun openScannerScreen(animate: Boolean = true) {
-        if (visualState == HaloOrb.State.CONNECTING ||
-            visualState == HaloOrb.State.CONNECTED ||
-            NativeCore.isRunning()
-        ) return
-
-        showingScanner = true
-        scannerPage?.let(pageHost::removeView)
-
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
-        }
-        val scroll = ScrollView(this).apply {
-            isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(16), dp(24), dp(24))
-        }
-
-        val header = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeScannerScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Scanner options").apply {
-                setPadding(dp(4), 0, 0, 0)
-            })
-        }
-        content.addView(label("Choose Aether's endpoint-discovery budget and address families", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(4); bottomMargin = dp(24) })
-
-        val options = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val discoveryOptions = mutableMapOf<EndpointDiscovery, SelectionOption>()
-        val transportOptions = mutableMapOf<MasqueTransport, SelectionOption>()
-        val modeOptions = mutableMapOf<ScanMode, SelectionOption>()
-        val targetOptions = mutableMapOf<ScanTarget, SelectionOption>()
-
-        options.addView(sectionLabel(if (selectedProtocol == Protocol.MASQUE) "MASQUE gateway discovery" else "WireGuard endpoint discovery"))
-        EndpointDiscovery.entries.forEachIndexed { index, discovery ->
-            val option = createEndpointDiscoveryOption(discovery) { chosen ->
-                getSharedPreferences(SETTINGS, MODE_PRIVATE).edit()
-                    .putString(ENDPOINT_DISCOVERY, chosen.coreName)
-                    .apply()
-                discoveryOptions.forEach { (item, view) -> setSelectionState(view, item == chosen, animate = true) }
-            }
-            discoveryOptions[discovery] = option
-            options.addView(option.row, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(68),
-            ).apply { topMargin = if (index == 0) dp(10) else dp(8) })
-        }
-
-        if (selectedProtocol == Protocol.MASQUE) {
-            options.addView(sectionLabel("MASQUE transport"), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(20) })
-            MasqueTransport.entries.forEachIndexed { index, transport ->
-                val option = createMasqueTransportOption(transport) { chosen ->
-                    getSharedPreferences(SETTINGS, MODE_PRIVATE).edit().putString(DEFAULT_MASQUE_TRANSPORT, chosen.coreName).apply()
-                    scanValue.text = scanSummary()
-                    scannerSelector.contentDescription = "Scanner options, ${scanSummary()}"
-                    transportOptions.forEach { (item, view) -> setSelectionState(view, item == chosen, animate = true) }
-                }
-                transportOptions[transport] = option
-                options.addView(option.row, LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(68),
-                ).apply { topMargin = if (index == 0) dp(10) else dp(8) })
-            }
-        }
-
-        options.addView(sectionLabel("Scan mode"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(20) })
-        ScanMode.entries.forEachIndexed { index, mode ->
-            val option = createScanModeOption(mode) { chosen ->
-                getSharedPreferences(SETTINGS, MODE_PRIVATE).edit().putString(DEFAULT_SCAN_MODE, chosen.coreName).apply()
-                scanValue.text = scanSummary()
-                scannerSelector.contentDescription = "Scanner options, ${scanSummary()}"
-                modeOptions.forEach { (item, view) -> setSelectionState(view, item == chosen, animate = true) }
-            }
-            modeOptions[mode] = option
-            options.addView(option.row, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(68),
-            ).apply { topMargin = if (index == 0) dp(10) else dp(8) })
-        }
-
-        options.addView(sectionLabel("IP version"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(20) })
-        ScanTarget.entries.forEachIndexed { index, target ->
-            val option = createScannerOption(target) { chosen ->
-                getSharedPreferences(SETTINGS, MODE_PRIVATE).edit().putString(DEFAULT_SCAN, chosen.coreName).apply()
-                scanValue.text = scanSummary()
-                scannerSelector.contentDescription = "Scanner options, ${scanSummary()}"
-                targetOptions.forEach { (item, view) -> setSelectionState(view, item == chosen, animate = true) }
-            }
-            targetOptions[target] = option
-            options.addView(option.row, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(68),
-            ).apply { topMargin = if (index == 0) dp(10) else dp(8) })
-        }
-
-        content.addView(options)
-        scroll.addView(content)
-        page.addView(scroll, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ).apply { topMargin = dp(56) })
-        page.addView(header, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(48),
-            Gravity.TOP,
-        ).apply { leftMargin = dp(24); rightMargin = dp(24); topMargin = dp(8) })
-
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            (scroll.layoutParams as FrameLayout.LayoutParams).apply {
-                topMargin = insets.systemWindowInsetTop + dp(56)
-                bottomMargin = insets.systemWindowInsetBottom
-                scroll.layoutParams = this
-            }
-            (header.layoutParams as FrameLayout.LayoutParams).apply {
-                topMargin = insets.systemWindowInsetTop + dp(8)
-                header.layoutParams = this
-            }
-            insets
-        }
-
-        scannerPage = page
-        pageHost.addView(page, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-        page.requestApplyInsets()
-        if (animate) {
-            animatePageOpen(page)
-            staggerListItems(options)
-        }
-    }
-
-    private fun closeScannerScreen() {
-        showingScanner = false
-        scannerPage?.let { animatePageClose(it) { scannerPage = null } }
-    }
-
-    private fun createScannerOption(target: ScanTarget, onSelect: (ScanTarget) -> Unit): SelectionOption {
-        val selected = target == defaultScan()
-        val title = label(target.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
-        val row = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(18), 0, dp(18), 0)
-            contentDescription = "Scan ${target.label} endpoints"
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { onSelect(target) }
-            val labels = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-            labels.addView(title)
-            labels.addView(label(target.description, 13f, MUTED), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(2) })
-            addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(indicator)
-        }
-        return SelectionOption(row, title, indicator, 18).also { setSelectionState(it, selected, animate = false) }
-    }
-
-    private fun createEndpointDiscoveryOption(
-        discovery: EndpointDiscovery,
-        onSelect: (EndpointDiscovery) -> Unit,
-    ): SelectionOption {
-        val selected = discovery == defaultEndpointDiscovery()
-        val title = label(discovery.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
-        val row = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(18), 0, dp(18), 0)
-            contentDescription = "Use ${discovery.label} MASQUE gateway discovery"
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { onSelect(discovery) }
-            val labels = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-            labels.addView(title)
-            labels.addView(label(discovery.description, 13f, MUTED), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(2) })
-            addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(indicator)
-        }
-        return SelectionOption(row, title, indicator, 18).also { setSelectionState(it, selected, animate = false) }
-    }
-
-    private fun createScanModeOption(mode: ScanMode, onSelect: (ScanMode) -> Unit): SelectionOption {
-        val selected = mode == defaultScanMode()
-        val title = label(mode.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
-        val row = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(18), 0, dp(18), 0)
-            contentDescription = "Use ${mode.label} scan mode"
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { onSelect(mode) }
-            val labels = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-            labels.addView(title)
-            labels.addView(label(mode.description, 13f, MUTED), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(2) })
-            addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(indicator)
-        }
-        return SelectionOption(row, title, indicator, 18).also { setSelectionState(it, selected, animate = false) }
-    }
-
-    private fun createMasqueTransportOption(
-        transport: MasqueTransport,
-        onSelect: (MasqueTransport) -> Unit,
-    ): SelectionOption {
-        val selected = transport == defaultMasqueTransport()
-        val title = label(transport.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
-        val row = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(18), 0, dp(18), 0)
-            contentDescription = "Use ${transport.label} for MASQUE scanning"
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { onSelect(transport) }
-            val labels = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-            labels.addView(title)
-            labels.addView(label(transport.description, 13f, MUTED), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(2) })
-            addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(indicator)
-        }
-        return SelectionOption(row, title, indicator, 18).also { setSelectionState(it, selected, animate = false) }
-    }
-
-    private fun showConnectionTypeSheet() {
-        if (visualState == HaloOrb.State.CONNECTING ||
-            visualState == HaloOrb.State.CONNECTED ||
-            NativeCore.isRunning()
-        ) return
-
+    private fun showConnectionTypeSheet(onChanged: (ConnectionType) -> Unit = {}) {
+        if (!tunnelIdle()) return
         showChoiceSheet(
             title = "Connection type",
             subtitle = "Choose device-wide VPN or local SOCKS5 and HTTP CONNECT proxies",
@@ -1264,411 +942,218 @@ class MainActivity : Activity() {
         ) { type ->
             preferences().edit().putString(CONNECTION_TYPE, type.name).apply()
             connectionTypeValue.text = type.label
-            afterPageClosed { if (showingSettings) openSettingsScreen(animate = false) }
+            onChanged(type)
         }
     }
 
     private fun openModeScreen() {
-        if (visualState == HaloOrb.State.CONNECTING ||
-            visualState == HaloOrb.State.CONNECTED ||
-            NativeCore.isRunning()
-        ) return
-
-        showingMode = true
-        modePage?.let(pageHost::removeView)
-
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(16), dp(24), dp(24))
-        }
-
-        val header = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeModeScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Connection mode").apply {
-                setPadding(dp(4), 0, 0, 0)
-            })
-        }
-        content.addView(header, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(8) })
-
-        content.addView(label("Choose how Aethery connects", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(4); bottomMargin = dp(24) })
-
-        val options = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        Protocol.entries.forEachIndexed { index, protocol ->
-            options.addView(createModeOption(protocol), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(76),
-            ).apply { if (index > 0) topMargin = dp(12) })
-        }
-
-        content.addView(options)
-        page.addView(content, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
-            insets
-        }
-
-        modePage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        animatePageOpen(page)
-        staggerListItems(options)
+        if (!tunnelIdle()) return
+        showChoiceSheet(
+            title = "Connection mode",
+            subtitle = "Choose how Aethery connects",
+            options = Protocol.entries.filter { it.androidAvailable },
+            selected = selectedProtocol,
+            label = { it.label },
+            description = { it.description },
+        ) { protocol -> if (protocol != selectedProtocol) updateConnectionMode(protocol) }
     }
 
-    private fun closeModeScreen() {
-        showingMode = false
-        modePage?.let { animatePageClose(it) { modePage = null } }
-    }
-
-    private fun createModeOption(protocol: Protocol): LinearLayout {
-        val selected = protocol == selectedProtocol
-        return LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(20), 0, dp(20), 0)
-            background = roundedBackground(
-                if (selected) primaryContainer else SURFACE_VARIANT,
-                20,
-                if (selected) primary else SURFACE_VARIANT,
-            )
-            isClickable = protocol.androidAvailable
-            isFocusable = protocol.androidAvailable
-            alpha = if (protocol.androidAvailable) 1f else DISABLED_ALPHA
-            setOnClickListener {
-                if (!protocol.androidAvailable) return@setOnClickListener
-                if (protocol != selectedProtocol) updateConnectionMode(protocol)
-                closeModeScreen()
+    private fun openScannerScreen() {
+        if (!tunnelIdle()) return
+        val page = newPage("Scanner options", "How Aethery looks for an endpoint, and which addresses it tries")
+        fun summaryChanged() {
+            scanValue.text = scanSummary()
+            scannerSelector.contentDescription = "Scanner options, ${scanSummary()}"
+        }
+        page.choices(
+            if (selectedProtocol.usesMasque) "MASQUE gateway discovery" else "WireGuard endpoint discovery",
+            EndpointDiscovery.entries.toList(), defaultEndpointDiscovery(), { it.label }, { it.description }, top = 4,
+        ) { preferences().edit().putString(ENDPOINT_DISCOVERY, it.coreName).apply() }
+        if (selectedProtocol.usesMasque) {
+            page.choices("MASQUE transport", MasqueTransport.entries.toList(), defaultMasqueTransport(), { it.label }, { it.description }) {
+                preferences().edit().putString(DEFAULT_MASQUE_TRANSPORT, it.coreName).apply()
+                summaryChanged()
             }
-
-            val texts = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-            texts.addView(label(protocol.label, 16f, INK, TypefaceStyle.MEDIUM))
-            texts.addView(label(protocol.description, 13f, MUTED), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(2) })
-
-            addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            if (selected) addView(label("Current", 12f, primary, TypefaceStyle.MEDIUM)) else if (!protocol.androidAvailable) addView(label("Desktop only", 12f, MUTED, TypefaceStyle.MEDIUM))
         }
+        page.choices("Scan mode", ScanMode.entries.toList(), defaultScanMode(), { it.label }, { it.description }) {
+            preferences().edit().putString(DEFAULT_SCAN_MODE, it.coreName).apply()
+            summaryChanged()
+        }
+        page.choices("IP version", ScanTarget.entries.toList(), defaultScan(), { it.label }, { it.description }) {
+            preferences().edit().putString(DEFAULT_SCAN, it.coreName).apply()
+            summaryChanged()
+        }
+        showPage(page)
     }
 
-
-    private fun openSettingsScreen(animate: Boolean = true) {
-        showingSettings = true
-        settingsPage?.let(pageHost::removeView)
-
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
+    private fun openLogsScreen() {
+        val page = newPage("Logs", "Aether and VPN events", scrollable = false)
+        var tab = LogTab.ALL
+        var renderedLogs: String? = null
+        val events = kit.text("", 12f, INK).apply {
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(kit.dp(14), kit.dp(12), kit.dp(14), kit.dp(12))
         }
+        var followLatest = true
         val scroll = ScrollView(this).apply {
             isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(events)
+            setOnScrollChangeListener { _, _, scrollY, _, _ ->
+                val contentHeight = getChildAt(0)?.height ?: 0
+                followLatest = scrollY >= contentHeight - height - dp(8)
+            }
         }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(16), dp(24), dp(24))
+        val handler = Handler(Looper.getMainLooper())
+        fun render(force: Boolean) {
+            val updated = connectionLogText(tab)
+            if (!force && updated == renderedLogs) return
+            val keepAtBottom = followLatest || renderedLogs == null || force
+            events.text = updated
+            renderedLogs = updated
+            if (keepAtBottom) scroll.post { scroll.scrollTo(0, (scroll.getChildAt(0)?.height ?: 0) - scroll.height) }
         }
-
-        val header = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeSettingsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Settings").apply {
-                setPadding(dp(4), 0, 0, 0)
-            })
+        val tick = object : Runnable {
+            override fun run() {
+                render(force = false)
+                if (page.page.isAttachedToWindow) handler.postDelayed(this, LOG_REFRESH_MS)
+            }
         }
-        content.addView(sectionLabel("Connection type"))
-        content.addView(createSettingsButton("${connectionType().label} ›") { showConnectionTypeSheet() }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(56),
-        ).apply { topMargin = dp(8) })
-
-        content.addView(sectionLabel("Kill switch"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(24) })
-        lateinit var killSwitchRow: LinearLayout
-        killSwitchRow = createToggleRow("Kill switch", "Block all traffic if the tunnel drops", killSwitchEnabled()) {
-            preferences().edit().putBoolean(KILL_SWITCH, it).apply()
+        val levels = kit.segmented(LogLevel.entries.map { it.label }, LogLevel.entries.indexOf(logLevel())) {
+            preferences().edit().putString(LOG_LEVEL, LogLevel.entries[it].coreName).apply()
         }
-        content.addView(killSwitchRow, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(72),
-        ).apply { topMargin = dp(8) })
-
-        content.addView(sectionLabel("Local network"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(24) })
-        lateinit var lanShareRow: LinearLayout
-        lanShareRow = createToggleRow(
-            "Share on LAN",
-            lanSharingSummary(),
-            lanSharingEnabled(),
-        ) {
-            preferences().edit().putBoolean(LAN_SHARING, it).apply()
-            if (it) CoreConfig.lanProxyPassword(preferences())
-            val subtitle = (lanShareRow.getChildAt(0) as LinearLayout).getChildAt(1) as TextView
-            subtitle.text = lanSharingSummary()
+        val tabs = kit.segmented(LogTab.entries.map { it.label }, 0) {
+            tab = LogTab.entries[it]
+            render(force = true)
         }
-        content.addView(lanShareRow, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(72),
-        ).apply { topMargin = dp(8) })
-        val lanBypassRow = createToggleRow(
-            "Bypass LAN",
-            "Keep local network devices reachable while VPN is connected",
-            lanBypassEnabled(),
-        ) {
-            preferences().edit().putBoolean(LAN_BYPASS, it).apply()
-        }
-        content.addView(lanBypassRow, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(72),
-        ).apply { topMargin = dp(8) })
-
-        content.addView(sectionLabel("Traffic"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(24) })
-        content.addView(createSettingsButton("Traffic monitor ›") { openTrafficMonitorScreen() }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(52),
-        ).apply { topMargin = dp(10) })
-
-        addCorePortField(
-            content,
-            heading = "CORE SOCKS PORT",
-            currentPort = socksPort(),
-            hint = "Local SOCKS5 for apps that speak SOCKS. Takes effect on the next connection.",
-            fieldDescription = "Core SOCKS port",
-        ) { applyListenPort(it, DEFAULT_SOCKS_PORT, httpProxyPort(), "HTTP CONNECT") }
-        addCorePortField(
-            content,
-            heading = "CORE HTTP PORT",
-            currentPort = httpProxyPort(),
-            hint = "Local HTTP CONNECT for Psiphon and other HTTP-proxy clients. Takes effect on the next connection.",
-            fieldDescription = "Core HTTP CONNECT port",
-        ) { applyListenPort(it, DEFAULT_HTTP_PROXY_PORT, socksPort(), "SOCKS5") }
-
-        content.addView(sectionLabel("Native split tunneling"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(24) })
-        splitTunnelSummaryButton = createSettingsButton("${splitTunnelSummary()} ›") { openSplitTunnelScreen() }
-        content.addView(splitTunnelSummaryButton, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(52),
-        ).apply { topMargin = dp(10) })
-        content.addView(sectionLabel("Appearance"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(24) })
-        content.addView(createSettingsButton("Theme · ${AppAppearance.current(this).label} ›") { openThemeScreen() }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(52),
-        ).apply { topMargin = dp(10) })
-        content.addView(sectionLabel("Home screen"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(24) })
-        content.addView(createSettingsButton("Widget control ›") { openWidgetControlScreen() }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(52),
-        ).apply { topMargin = dp(10) })
-        content.addView(sectionLabel("Connection advanced"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(28) })
-        content.addView(createSettingsButton("Tunnel controls ›") { openTunnelControlsScreen() }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(52),
-        ).apply { topMargin = dp(10) })
-
-        content.addView(label("Version ${appVersion()}", 14f, MUTED).apply {
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(0, dp(32), 0, 0)
+        page.content.addView(kit.section("Core log level"), kit.matchWidth(0))
+        page.content.addView(levels, kit.matchWidth(8))
+        page.content.addView(tabs, kit.matchWidth(12))
+        page.content.addView(FrameLayout(this).apply {
+            background = glassBackground(palette, 20, resources.displayMetrics.density)
+            clipToOutline = true
+            outlineProvider = android.view.ViewOutlineProvider.BACKGROUND
+            addView(scroll, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(12) })
+        page.page.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) = tick.run()
+            override fun onViewDetachedFromWindow(view: View) = handler.removeCallbacks(tick)
         })
-        content.addView(createSettingsButton("Check for updates") {
-            appUpdater.checkForUpdate()
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(56),
-        ).apply { topMargin = dp(12) })
-        content.addView(createSettingsButton("Aethery on GitHub", R.drawable.ic_github, tintIcon = false) {
-            openLink("https://github.com/ZethRise/Aethery")
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(56),
-        ).apply { topMargin = dp(10) })
-
-        scroll.addView(content)
-        page.addView(scroll, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ).apply { topMargin = dp(56) })
-        page.addView(header, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(48),
-            Gravity.TOP,
-        ).apply { leftMargin = dp(24); rightMargin = dp(24); topMargin = dp(8) })
-
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            (scroll.layoutParams as FrameLayout.LayoutParams).apply {
-                topMargin = insets.systemWindowInsetTop + dp(56)
-                bottomMargin = insets.systemWindowInsetBottom
-                scroll.layoutParams = this
-            }
-            (header.layoutParams as FrameLayout.LayoutParams).apply {
-                topMargin = insets.systemWindowInsetTop + dp(8)
-                header.layoutParams = this
-            }
-            insets
-        }
-
-        settingsPage = page
-        pageHost.addView(page, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-        page.requestApplyInsets()
-        if (animate) {
-            animatePageOpen(page)
-            staggerListItems(content)
-        }
+        showPage(page)
     }
 
     private fun openTunnelControlsScreen() {
-        tunnelControlsPage?.let(pageHost::removeView)
+        val page = newPage("Tunnel controls", "Applied on your next connection")
 
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
+        val obfuscation = valueRow("Obfuscation", { obfuscationProfile().label }) { chooseObfuscation(it) }
+        val advanced = valueRow("Advanced obfuscation", { advancedObfuscationSummary() }) { editAdvancedObfuscation(it) }
+        page.block("Connection shaping", listOf(obfuscation.view, advanced.view), top = 4)
+
+        val endpoint = valueRow("Manual endpoint", { manualEndpoint() ?: "Automatic" }) { editManualEndpoint(it) }
+        val cache = valueRow("Gateway cache", { defaultEndpointDiscovery().label }) { manageGatewayCache(it) }
+        val exit = valueRow("Exit country", { exitLocationSummary() }) { editExitLocation(it) }
+        page.block("Routing", listOf(endpoint.view, cache.view, exit.view),
+            note = "An exit country keeps looking until the tunnel comes out there. Use codes like de, nl, or !ir to avoid one.")
+
+        val dns = valueRow("DNS resolvers", { dnsSummary() }) { editDnsServers(it) }
+        val routing = valueRow("Destination routing", { routingSummary() }) { editRoutingRules(it) }
+        lateinit var zeroTrust: HaloKit.Row
+        zeroTrust = kit.row("Zero Trust", value = zeroTrustSummary()) {
+            openZeroTrustScreen { zeroTrust.setValue(zeroTrustSummary()) }
         }
-        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(16), dp(24), dp(24))
+        page.block("Network", listOf(dns.view, routing.view, zeroTrust.view))
+
+        val tls = valueRow("TLS fingerprint", { tlsCurvePreset().label }) { chooseTlsCurvePreset(it) }
+        val ech = valueRow("Encrypted Client Hello", { echSummary() }) { chooseEch(it) }
+        val grease = kit.switchRow("Leave out GREASE", "Drop the random padding values browsers add to a handshake", preferences().getBoolean(DISABLE_GREASE, false)) {
+            preferences().edit().putBoolean(DISABLE_GREASE, it).apply()
         }
-        content.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeTunnelControlsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Tunnel controls"))
-        })
-        content.addView(label("Applied on your next connection", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(24) })
-        fun addControl(text: String, action: () -> Unit): TextView = createSettingsButton(text, onClick = action).also { button ->
-            content.addView(button, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(56),
-            ).apply { topMargin = dp(10) })
-        }
-        content.addView(sectionLabel("Connection shaping"))
-        addControl("Obfuscation · ${obfuscationProfile().label} ›") { chooseObfuscation() }
-        addControl("Advanced obfuscation · ${advancedObfuscationSummary()} ›") { editAdvancedObfuscation() }
-        lateinit var retryButton: TextView
-        retryButton = addControl("WireGuard retries · ${if (retryObfuscationProfiles()) "On" else "Off"}") {
-            preferences().edit().putBoolean(RETRY_OBFUSCATION, !retryObfuscationProfiles()).apply()
-            updateTunnelControlButton(retryButton, "WireGuard retries · ${if (retryObfuscationProfiles()) "On" else "Off"}")
-        }
-        content.addView(sectionLabel("Routing"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(28) })
-        addControl("Manual endpoint · ${manualEndpoint() ?: "Automatic"} ›") { editManualEndpoint() }
-        addControl("Gateway cache · ${defaultEndpointDiscovery().label} ›") { manageGatewayCache() }
-        content.addView(sectionLabel("Troubleshooting"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(28) })
-        addControl("TLS fingerprint · ${tlsCurvePreset().label} ›") { chooseTlsCurvePreset() }
-        lateinit var verificationButton: TextView
-        verificationButton = addControl("WireGuard verification · ${if (wireGuardDataCheck()) "Strict" else "Fast"} ›") {
-            preferences().edit().putBoolean(WIREGUARD_DATA_CHECK, !wireGuardDataCheck()).apply()
-            updateTunnelControlButton(verificationButton, "WireGuard verification · ${if (wireGuardDataCheck()) "Strict" else "Fast"} ›")
-        }
-        content.addView(sectionLabel("Aether 1.5"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(28) })
-        addControl("DNS resolvers · ${dnsSummary()} ›") { editDnsServers() }
-        addControl("Destination routing · ${routingSummary()} ›") { editRoutingRules() }
-        zeroTrustControlButton = addControl("Zero Trust · ${zeroTrustSummary()} ›") { openZeroTrustScreen() }
-        content.addView(sectionLabel("MASQUE"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(28) })
-        lateinit var h2FallbackButton: TextView
-        h2FallbackButton = addControl("HTTP/3 → HTTP/2 fallback · ${if (h3H2Fallback()) "On" else "Off"}") {
-            preferences().edit().putBoolean(H3_H2_FALLBACK, !h3H2Fallback()).apply()
-            updateTunnelControlButton(
-                h2FallbackButton,
-                "HTTP/3 → HTTP/2 fallback · ${if (h3H2Fallback()) "On" else "Off"}",
-            )
+        page.block("Handshake", listOf(tls.view, ech.view, grease.view))
+
+        val fallback = kit.switchRow("HTTP/3 to HTTP/2 fallback", "Fall back when QUIC is blocked", h3H2Fallback()) {
+            preferences().edit().putBoolean(H3_H2_FALLBACK, it).apply()
             AetherWidget.refreshAll(this)
         }
-        addControl("TLS fragmentation · ${if (h2Fragmentation() == H2Fragmentation.ON) "On" else "Off"} ›") {
-            chooseH2Fragmentation()
+        val quicV2 = kit.switchRow("QUIC v2 opener", "Opens a path for HTTP/3 where QUIC v1 is blocked", preferences().getBoolean(QUIC_V2, true)) {
+            preferences().edit().putBoolean(QUIC_V2, it).apply()
         }
-        scroll.addView(content)
-        page.addView(scroll)
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
-            insets
+        val fragmentation = valueRow("TLS fragmentation", { h2Fragmentation().label }) { chooseH2Fragmentation(it) }
+        val fragmentSize = valueRow("Fragment size", { preferences().getString(FRAGMENT_SIZE, "").orEmpty().ifBlank { "Default" } }) { editFragment(FRAGMENT_SIZE, "Fragment size", "Bytes, like 20 or a range like 16-32", it) }
+        val fragmentDelay = valueRow("Fragment delay", { preferences().getString(FRAGMENT_DELAY, "").orEmpty().ifBlank { "Default" } }) { editFragment(FRAGMENT_DELAY, "Fragment delay", "Milliseconds, like 5 or a range like 2-10", it) }
+        val quick = kit.switchRow("Quick reconnect", "Resume faster after a short drop", preferences().getBoolean(QUICK_RECONNECT, false)) {
+            preferences().edit().putBoolean(QUICK_RECONNECT, it).apply()
         }
-        tunnelControlsPage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        content.alpha = 0f
-        content.translationY = dp(12).toFloat()
-        page.alpha = 0f
-        page.translationX = dp(20).toFloat()
-        page.animate().alpha(1f).translationX(0f).setDuration(PAGE_ANIMATION_MS)
-            .setInterpolator(motionInterpolator)
-            .start()
-        content.animate().alpha(1f).translationY(0f).setStartDelay(70)
-            .setDuration(PAGE_ANIMATION_MS)
-            .setInterpolator(motionInterpolator)
-            .start()
+        page.block("MASQUE", listOf(fallback.view, quicV2.view, fragmentation.view, fragmentSize.view, fragmentDelay.view, quick.view))
+
+        val retries = kit.switchRow("Retry other profiles", "Try other obfuscation profiles while scanning", retryObfuscationProfiles()) {
+            preferences().edit().putBoolean(RETRY_OBFUSCATION, it).apply()
+        }
+        val strict = kit.switchRow("Strict verification", "Check that data really flows before trusting an endpoint", wireGuardDataCheck()) {
+            preferences().edit().putBoolean(WIREGUARD_DATA_CHECK, it).apply()
+        }
+        val keepalive = valueRow("Keepalive", { preferences().getString(WG_KEEPALIVE, "").orEmpty().ifBlank { "Default" } }) { editKeepalive(it) }
+        page.block("WireGuard", listOf(retries.view, strict.view, keepalive.view))
+        showPage(page)
     }
 
-    private fun updateTunnelControlButton(button: TextView, value: String) {
-        button.animate().cancel()
-        button.animate().alpha(0f).scaleX(0.97f).scaleY(0.97f).setDuration(80)
-            .withEndAction {
-                button.text = value
-                button.animate().alpha(1f).scaleX(1f).scaleY(1f)
-                    .setDuration(160).setInterpolator(DecelerateInterpolator()).start()
-            }
-            .start()
+    private fun exitLocationSummary(): String =
+        preferences().getString(EXIT_LOCATION, "").orEmpty().ifBlank { "Any" }
+
+    private fun echSummary(): String = if (preferences().getString(ECH, "off") == "auto") "Automatic" else "Off"
+
+    private fun chooseEch(onChanged: () -> Unit) = showChoiceSheet(
+        title = "Encrypted Client Hello",
+        subtitle = "Hide the server name in MASQUE handshakes and registration",
+        options = listOf("off", "auto"),
+        selected = preferences().getString(ECH, "off") ?: "off",
+        label = { if (it == "auto") "Automatic" else "Off" },
+        description = { if (it == "auto") "Look up the key and use it; never send the name in the clear" else "Send the server name as usual" },
+    ) { chosen ->
+        preferences().edit().putString(ECH, chosen).apply()
+        onChanged()
     }
 
-    private fun closeTunnelControlsScreen(animate: Boolean = true) {
-        val page = tunnelControlsPage ?: return
-        tunnelControlsPage = null
-        zeroTrustControlButton = null
-        if (!animate) {
-            pageHost.removeView(page)
-            return
-        }
-        page.animate().alpha(0f).translationX(dp(20).toFloat())
-            .setDuration(LOG_CLOSE_ANIMATION_MS)
-            .setInterpolator(DecelerateInterpolator())
-            .withEndAction { if (page.parent == pageHost) pageHost.removeView(page) }
-            .start()
+    private fun editExitLocation(onChanged: () -> Unit) {
+        val field = settingsField(preferences().getString(EXIT_LOCATION, "").orEmpty(), "de, nl")
+        showTextSettingsSheet(
+            "Exit country",
+            "Two-letter country codes, separated by commas. Start with ! to avoid them instead. Blank means any.",
+            listOf("Countries" to field),
+            validator = { values ->
+                val body = values[0].trimStart('!', '=')
+                if (body.isBlank() || body.split(',').all { it.trim().length == 2 && it.trim().all(Char::isLetter) }) null
+                else 0 to "Use two-letter codes like de, nl"
+            },
+            onSaved = onChanged,
+        ) { values -> preferences().edit().putString(EXIT_LOCATION, values[0]).apply() }
     }
 
-    private fun chooseObfuscation() = showChoiceSheet(
+    private fun editFragment(key: String, title: String, hint: String, onChanged: () -> Unit) {
+        val field = settingsField(preferences().getString(key, "").orEmpty(), "16-32")
+        showTextSettingsSheet(
+            title, "$hint. Blank uses the default. Only applies to MASQUE over HTTP/2.",
+            listOf("Value" to field),
+            validator = { values ->
+                if (values[0].isBlank() || values[0].matches(Regex("\\d{1,4}(-\\d{1,4})?"))) null
+                else 0 to "Use a number or a range like 16-32"
+            },
+            onSaved = onChanged,
+        ) { values -> preferences().edit().putString(key, values[0]).apply() }
+    }
+
+    private fun editKeepalive(onChanged: () -> Unit) {
+        val field = settingsField(preferences().getString(WG_KEEPALIVE, "").orEmpty(), "5").apply { inputType = InputType.TYPE_CLASS_NUMBER }
+        showTextSettingsSheet(
+            "Keepalive", "Seconds between WireGuard keepalive packets. Blank uses the default of 5.",
+            listOf("Seconds" to field),
+            validator = { values ->
+                if (values[0].isBlank() || values[0].toIntOrNull()?.let { it in 1..600 } == true) null else 0 to "Use 1 to 600"
+            },
+            onSaved = onChanged,
+        ) { values -> preferences().edit().putString(WG_KEEPALIVE, values[0]).apply() }
+    }
+
+    private fun chooseObfuscation(onChanged: () -> Unit) = showChoiceSheet(
         title = "Obfuscation",
         subtitle = "Adjust traffic-shape padding for filtered networks",
         options = ObfuscationProfile.entries.toList(),
@@ -1677,9 +1162,10 @@ class MainActivity : Activity() {
         description = { it.description },
     ) { chosen ->
         preferences().edit().putString(OBFUSCATION_PROFILE, chosen.coreName).apply()
+        onChanged()
     }
 
-    private fun chooseTlsCurvePreset() = showChoiceSheet(
+    private fun chooseTlsCurvePreset(onChanged: () -> Unit) = showChoiceSheet(
         title = "TLS fingerprint",
         subtitle = "Choose TLS curve ordering for QUIC connections",
         options = TlsCurvePreset.entries.toList(),
@@ -1688,6 +1174,7 @@ class MainActivity : Activity() {
         description = { it.description },
     ) { chosen ->
         preferences().edit().putString(TLS_CURVE_PRESET, chosen.coreName).apply()
+        onChanged()
     }
 
     private fun choosePerfProfile() = showChoiceSheet(
@@ -1702,7 +1189,7 @@ class MainActivity : Activity() {
         (perfSelector.tag as? TextView)?.text = chosen.label
     }
 
-    private fun chooseH2Fragmentation() = showChoiceSheet(
+    private fun chooseH2Fragmentation(onChanged: () -> Unit) = showChoiceSheet(
         title = "TLS fragmentation",
         subtitle = "Fragment the TLS ClientHello to look like ordinary HTTPS traffic",
         options = H2Fragmentation.entries.toList(),
@@ -1711,11 +1198,12 @@ class MainActivity : Activity() {
         description = { it.description },
     ) { chosen ->
         preferences().edit().putString(H2_FRAGMENTATION, chosen.coreName).apply()
+        onChanged()
     }
 
-    private fun chooseMasqueTransport() = showChoiceSheet(
-        title = "HTTP/3 & HTTP/2",
-        subtitle = "MASQUE transport for the 3×4 widget and the next connection",
+    private fun chooseMasqueTransport(onChanged: () -> Unit) = showChoiceSheet(
+        title = "HTTP/3 and HTTP/2",
+        subtitle = "MASQUE transport for the large widget and the next connection",
         options = MasqueTransport.entries.toList(),
         selected = defaultMasqueTransport(),
         label = { it.label },
@@ -1724,10 +1212,7 @@ class MainActivity : Activity() {
         preferences().edit().putString(DEFAULT_MASQUE_TRANSPORT, chosen.coreName).apply()
         AetherWidget.refreshAll(this)
         scanValue.text = scanSummary()
-        afterPageClosed {
-            closeWidgetTransportScreen()
-            openWidgetTransportScreen()
-        }
+        onChanged()
     }
 
     private fun chooseLogLevel() = showChoiceSheet(
@@ -1737,11 +1222,9 @@ class MainActivity : Activity() {
         selected = logLevel(),
         label = { it.label },
         description = { it.description },
-    ) { chosen ->
-        preferences().edit().putString(LOG_LEVEL, chosen.coreName).apply()
-    }
+    ) { chosen -> preferences().edit().putString(LOG_LEVEL, chosen.coreName).apply() }
 
-    private fun manageGatewayCache() = showChoiceSheet(
+    private fun manageGatewayCache(onChanged: () -> Unit) = showChoiceSheet(
         title = "Gateway cache",
         subtitle = "Control saved MASQUE gateway discovery data",
         options = listOf("Cache & refresh", "Fresh scan next time", "Clear saved gateways"),
@@ -1760,10 +1243,11 @@ class MainActivity : Activity() {
                 "Fresh scan next time" -> preferences().edit().putString(ENDPOINT_DISCOVERY, EndpointDiscovery.FRESH.coreName).apply()
                 else -> File(filesDir, "masque-gateway-cache.json").delete()
             }
-        }
+            onChanged()
+        },
     )
 
-    private fun editManualEndpoint() {
+    private fun editManualEndpoint(onChanged: () -> Unit) {
         val field = settingsField(manualEndpoint().orEmpty(), "IP:port, blank for automatic")
         val endpointPattern = Regex("^(?:\\d{1,3}(?:\\.\\d{1,3}){3}|\\[[0-9a-fA-F:]+]):([1-9]\\d{0,4})$")
         pageStack.push(buildEditorPage(
@@ -1788,6 +1272,7 @@ class MainActivity : Activity() {
                 preferences().edit().apply {
                     if (endpoint.isBlank()) remove(MANUAL_ENDPOINT) else putString(MANUAL_ENDPOINT, endpoint)
                 }.apply()
+                onChanged()
             },
         ))
     }
@@ -1797,28 +1282,14 @@ class MainActivity : Activity() {
         hintText: String,
         secure: Boolean = false,
         multiline: Boolean = false,
-    ) = EditText(this).apply {
-        setText(value)
-        hint = hintText
-        setTextColor(INK)
-        setHintTextColor(MUTED)
-        textSize = 15f
-        inputType = when {
-            secure -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            multiline -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            else -> InputType.TYPE_CLASS_TEXT
-        }
-        setSingleLine(!multiline)
-        gravity = if (multiline) Gravity.TOP else Gravity.CENTER_VERTICAL
-        setPadding(dp(18), if (multiline) dp(14) else 0, dp(18), if (multiline) dp(14) else 0)
-        background = roundedBackground(SURFACE_VARIANT, 16, SURFACE_VARIANT)
-    }
+    ) = kit.field(value, hintText, secure, multiline)
 
     private fun showTextSettingsSheet(
         title: String,
         subtitle: String,
         fields: List<Pair<String, EditText>>,
         validator: ((List<String>) -> Pair<Int, String>?)? = null,
+        onSaved: () -> Unit = {},
         onSave: (List<String>) -> Unit,
     ) {
         pageStack.push(buildEditorPage(
@@ -1832,19 +1303,378 @@ class MainActivity : Activity() {
             onBack = { pageStack.pop() },
             onSave = { values ->
                 onSave(values)
-                afterPageClosed {
-                    closeTunnelControlsScreen(false)
-                    openTunnelControlsScreen()
-                }
+                onSaved()
             },
         ))
     }
 
-    /** Runs [action] once a page that is closing has finished sliding away. */
-    private fun afterPageClosed(action: () -> Unit) {
-        pageHost.postDelayed(action, 420)
+    private fun openZeroTrustScreen(onSaved: () -> Unit) {
+        val team = settingsField(SecureStore.getSecret(this, ZERO_TRUST_TEAM), "team name")
+        val email = settingsField(SecureStore.getSecret(this, ZERO_TRUST_EMAIL), "you@example.com")
+        val code = settingsField("", "email code")
+        val clientId = settingsField(SecureStore.getSecret(this, ZERO_TRUST_CLIENT_ID), "service token client ID")
+        val clientSecret = settingsField(SecureStore.getSecret(this, ZERO_TRUST_CLIENT_SECRET), "service token secret", secure = true)
+        val token = settingsField(SecureStore.getSecret(this, ZERO_TRUST_TOKEN), "Access JWT", secure = true)
+        val status = kit.text("", 13f, MUTED).apply { setPadding(kit.dp(6), 0, kit.dp(6), 0) }
+
+        fun save(): Boolean {
+            if (team.text.toString().isBlank()) {
+                team.error = "Team is required"
+                return false
+            }
+            SecureStore.putSecret(this, ZERO_TRUST_TEAM, team.text.toString().trim())
+            SecureStore.putSecret(this, ZERO_TRUST_EMAIL, email.text.toString().trim())
+            SecureStore.putSecret(this, ZERO_TRUST_CLIENT_ID, clientId.text.toString().trim())
+            SecureStore.putSecret(this, ZERO_TRUST_CLIENT_SECRET, clientSecret.text.toString().trim())
+            SecureStore.putSecret(this, ZERO_TRUST_TOKEN, token.text.toString().trim())
+            return true
+        }
+
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        bar.addView(kit.button("Clear", HaloKit.ButtonKind.DANGER) {
+            SecureStore.removeSecret(this, ZERO_TRUST_TEAM)
+            SecureStore.removeSecret(this, ZERO_TRUST_EMAIL)
+            SecureStore.removeSecret(this, ZERO_TRUST_CLIENT_ID)
+            SecureStore.removeSecret(this, ZERO_TRUST_CLIENT_SECRET)
+            SecureStore.removeSecret(this, ZERO_TRUST_TOKEN)
+            preferences().edit().remove(ZERO_TRUST_GATEWAY).apply()
+            onSaved()
+            pageStack.pop()
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(10) })
+        bar.addView(kit.button("Save", HaloKit.ButtonKind.PRIMARY) {
+            if (save()) {
+                onSaved()
+                pageStack.pop()
+            }
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val page = newPage("Zero Trust", "Use an email code, a service token, or an Access token you already have.", bottomBar = bar)
+        fun labelled(name: String, field: EditText): View = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(12))
+            addView(kit.section(name), kit.matchWidth(0))
+            addView(field, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, if (field.maxLines > 1) dp(112) else dp(54)).apply { topMargin = dp(6) })
+        }
+        page.content.addView(labelled("Team", team))
+        page.content.addView(labelled("Email", email))
+        page.content.addView(labelled("One-time code", code))
+        val send = kit.button("Send code") {
+            SecureStore.putSecret(this, ZERO_TRUST_TEAM, team.text.toString().trim())
+            SecureStore.putSecret(this, ZERO_TRUST_EMAIL, email.text.toString().trim())
+            status.text = "Requesting code…"
+            Thread {
+                val result = runCatching { NativeCore.requestEmailCode(team.text.toString(), email.text.toString()) }
+                runOnUiThread {
+                    status.setTextColor(if (result.isSuccess) connected else palette.error)
+                    status.text = result.fold({ "Code sent. Check your email." }, { it.message ?: "Could not send code" })
+                }
+            }.start()
+        }
+        val verify = kit.button("Verify") {
+            status.text = "Verifying…"
+            Thread {
+                val result = runCatching { NativeCore.confirmEmailCode(code.text.toString()) }
+                runOnUiThread {
+                    result.onSuccess {
+                        token.setText(it)
+                        SecureStore.putSecret(this, ZERO_TRUST_TOKEN, it)
+                    }
+                    status.setTextColor(if (result.isSuccess) connected else palette.error)
+                    status.text = result.fold({ "Verified. Access token saved." }, { it.message ?: "Code rejected" })
+                }
+            }.start()
+        }
+        page.content.addView(LinearLayout(this).apply {
+            addView(send, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(10) })
+            addView(verify, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }, kit.matchWidth(0))
+        page.content.addView(status, kit.matchWidth(10))
+        page.content.addView(labelled("Service client ID", clientId), kit.matchWidth(14))
+        page.content.addView(labelled("Service secret", clientSecret))
+        page.content.addView(labelled("Access token", token))
+        page.content.addView(kit.group(listOf(
+            kit.switchRow("Gateway filtering", "Send HTTP and HTTPS through the organization gateway", preferences().getBoolean(ZERO_TRUST_GATEWAY, false)) {
+                preferences().edit().putBoolean(ZERO_TRUST_GATEWAY, it).apply()
+            }.view,
+        )), kit.matchWidth(6))
+        showPage(page)
     }
 
+    private fun <T> showChoiceSheet(
+        title: String,
+        subtitle: String,
+        options: List<T>,
+        selected: T,
+        label: (T) -> String,
+        description: (T) -> String,
+        onSelected: (T) -> Unit,
+    ) {
+        pageStack.push(buildChoicePage(
+            context = this,
+            palette = palette,
+            title = title,
+            subtitle = subtitle,
+            options = options,
+            selected = selected,
+            label = label,
+            description = description,
+            onBack = { pageStack.pop() },
+            onSelected = onSelected,
+        ))
+    }
+
+    private fun openWidgetControlScreen() {
+        val page = newPage("Widgets", "Add Aethery to the home screen. The controls use the same orb, type and colours as the app.")
+        page.content.addView(widgetCard("1 × 1", "Connect", "Only the orb. Tap to connect or disconnect.", AetherWidget.Kind.CONNECT), kit.matchWidth(4))
+        page.content.addView(widgetCard("2 × 2", "Connect and method", "The orb plus the current method. Tap the method to cycle through them.", AetherWidget.Kind.METHOD), kit.matchWidth(12))
+        page.content.addView(widgetCard("3 × 4", "Console", "Connect, method, live speed, and HTTP/3 or HTTP/2. Fallback is the same setting as in Tunnel controls.", AetherWidget.Kind.CONSOLE), kit.matchWidth(12))
+        lateinit var transport: HaloKit.Row
+        transport = kit.row("HTTP/3 and HTTP/2", value = defaultMasqueTransport().label) {
+            openWidgetTransportScreen { transport.setValue(defaultMasqueTransport().label) }
+        }
+        page.block("Transport", listOf(transport.view))
+        showPage(page)
+    }
+
+    private fun widgetCard(size: String, title: String, detail: String, kind: AetherWidget.Kind): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(18), dp(16), dp(18), dp(16))
+        background = glassBackground(palette, 20, resources.displayMetrics.density)
+        addView(LinearLayout(this@MainActivity).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(ImageView(this@MainActivity).apply {
+                setImageBitmap(AetherWidget.connectMark(
+                    dp(64),
+                    if (NativeCore.isReady()) AetherWidget.State.CONNECTED else AetherWidget.State.DISCONNECTED,
+                    palette,
+                ))
+                contentDescription = title
+            }, LinearLayout.LayoutParams(dp(64), dp(64)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(kit.text(size, 13f, MUTED, medium = true))
+                addView(kit.text(title, 17f, INK, medium = true), kit.matchWidth(2))
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(14) })
+        })
+        addView(kit.text(detail, 13f, MUTED).apply { setLineSpacing(0f, 1.15f) }, kit.matchWidth(12))
+        addView(kit.button("Add to home screen") { AetherWidget.pin(this@MainActivity, kind) }, kit.matchWidth(14))
+    }
+
+    private fun openWidgetTransportScreen(onClosed: () -> Unit) {
+        val page = newPage("HTTP/3 and HTTP/2", "Used by the large widget and the next MASQUE connection.")
+        lateinit var transport: HaloKit.Row
+        transport = kit.row("Transport", value = defaultMasqueTransport().label) {
+            chooseMasqueTransport { transport.setValue(defaultMasqueTransport().label) }
+        }
+        val fallback = kit.switchRow("HTTP/3 to HTTP/2 fallback", "Fall back when QUIC is blocked", h3H2Fallback()) {
+            preferences().edit().putBoolean(H3_H2_FALLBACK, it).apply()
+            AetherWidget.refreshAll(this)
+        }
+        page.block("MASQUE", listOf(transport.view, fallback.view), top = 4)
+        showPage(page, onClosed = onClosed)
+    }
+
+    private fun openTrafficMonitorScreen() {
+        val page = newPage("Traffic monitor", "Traffic carried by Aethery. Per-app figures are not available from encrypted tunnel counters.")
+        fun metric(title: String): TextView {
+            val value = kit.text("Waiting for tunnel traffic", 20f, INK, medium = true).apply { typeface = HaloType.display(this@MainActivity) }
+            page.content.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(20), dp(16), dp(20), dp(18))
+                background = glassBackground(palette, 20, resources.displayMetrics.density)
+                addView(kit.section(title).apply { setPadding(0, 0, 0, 0) })
+                addView(value, kit.matchWidth(8))
+            }, kit.matchWidth(if (page.content.childCount <= 3) 4 else 12))
+            return value
+        }
+        trafficSpeedValue = metric("Live speed")
+        trafficSessionValue = metric("This session")
+        trafficMonthValue = metric("This month")
+        renderTrafficMonitor()
+        showPage(page, onClosed = {
+            trafficSpeedValue = null
+            trafficSessionValue = null
+            trafficMonthValue = null
+        })
+    }
+
+    private fun renderTrafficMonitor() {
+        trafficSpeedValue?.text = "↓ ${formatTraffic(trafficSpeedRx)}/s   ↑ ${formatTraffic(trafficSpeedTx)}/s"
+        trafficSessionValue?.text = "↓ ${formatTraffic(trafficRx)}   ↑ ${formatTraffic(trafficTx)}"
+        trafficMonthValue?.text = "↓ ${formatTraffic(trafficMonthRx)}   ↑ ${formatTraffic(trafficMonthTx)}"
+    }
+
+    private fun formatTraffic(bytes: Long): String = when {
+        bytes < 1_024 -> "$bytes B"
+        bytes < 1_048_576 -> "${bytes / 1_024} KB"
+        bytes < 1_073_741_824 -> "${bytes / 1_048_576} MB"
+        else -> String.format(java.util.Locale.US, "%.2f GB", bytes / 1_073_741_824.0)
+    }
+
+    private fun openSplitTunnelScreen(onClosed: () -> Unit) {
+        val settings = SplitTunnelSettings(this)
+        val page = newPage("Split tunneling", "Choose which apps use Aethery. Changes apply on the next connection.")
+        page.choices(
+            null, SplitTunnelSettings.Mode.entries.toList(), settings.mode(), { it.label },
+            {
+                when (it) {
+                    SplitTunnelSettings.Mode.ALL -> "Every app goes through Aethery"
+                    SplitTunnelSettings.Mode.INCLUDE -> "Only the apps you pick use Aethery"
+                    SplitTunnelSettings.Mode.EXCLUDE -> "Everything except the apps you pick uses Aethery"
+                }
+            },
+            top = 4,
+        ) { chosen ->
+            val selected = settings.packages().toMutableSet()
+            settings.save(chosen, selected)
+            if (chosen == SplitTunnelSettings.Mode.ALL) {
+                pageHost.postDelayed({ pageStack.pop() }, 220)
+            } else {
+                pageHost.postDelayed({ openSplitTunnelAppsScreen(chosen, selected) }, 220)
+            }
+        }
+        showPage(page, onClosed = onClosed)
+    }
+
+    private fun openSplitTunnelAppsScreen(mode: SplitTunnelSettings.Mode, selected: MutableSet<String>) {
+        val settings = SplitTunnelSettings(this)
+        val done = kit.button("Done", HaloKit.ButtonKind.PRIMARY) {
+            settings.save(mode, selected.toHashSet())
+            pageStack.pop()
+            pageStack.pop()
+        }
+        val verb = if (mode == SplitTunnelSettings.Mode.INCLUDE) "include" else "exclude"
+        val doneBar = LinearLayout(this).apply { addView(done, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)) }
+        val page = newPage("Apps", "Select the apps to $verb", scrollable = false, bottomBar = doneBar)
+        val search = kit.field("", "Search apps")
+        val appList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val loading = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(ProgressBar(this@MainActivity).apply {
+                isIndeterminate = true
+                indeterminateDrawable?.setTint(primary)
+            }, LinearLayout.LayoutParams(dp(44), dp(44)))
+            addView(kit.text("Scanning installed apps…", 14f, MUTED).apply { setPadding(0, dp(16), 0, 0) })
+        }
+        val listScroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            alpha = 0f
+            visibility = View.INVISIBLE
+            addView(appList)
+        }
+        page.content.addView(search, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply { bottomMargin = dp(12) })
+        page.content.addView(FrameLayout(this).apply {
+            addView(loading, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+            addView(listScroll, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        showPage(page, onClosed = { settings.save(mode, selected.toHashSet()) })
+        loadUserApps { apps ->
+            if (!page.page.isAttachedToWindow) return@loadUserApps
+            settings.cleanup(apps.map { it.packageName }.toSet())
+            selected.clear()
+            selected.addAll(settings.packages())
+            val sorted = apps.sortedWith(compareByDescending<ApplicationInfo> { it.packageName in selected }
+                .thenBy { packageManager.getApplicationLabel(it).toString().lowercase() })
+            sorted.forEach { app ->
+                val name = packageManager.getApplicationLabel(app).toString()
+                lateinit var card: HaloKit.OptionCard
+                card = kit.optionCard(
+                    name, app.packageName, app.packageName in selected,
+                    leading = ImageView(this).apply {
+                        setImageDrawable(app.loadIcon(packageManager))
+                        scaleType = ImageView.ScaleType.CENTER_INSIDE
+                    },
+                ) {
+                    val nowSelected = app.packageName !in selected
+                    if (nowSelected) selected += app.packageName else selected -= app.packageName
+                    settings.save(mode, selected.toHashSet())
+                    card.setSelected(nowSelected)
+                }
+                card.view.tag = "${name.lowercase()}|${app.packageName.lowercase()}"
+                appList.addView(card.view, kit.matchWidth(if (appList.childCount == 0) 0 else 8))
+            }
+            loading.animate().alpha(0f).setDuration(180).withEndAction {
+                loading.visibility = View.GONE
+                listScroll.visibility = View.VISIBLE
+                listScroll.animate().alpha(1f).setDuration(220).start()
+                kit.stagger(appList, startDelayMs = 0)
+            }.start()
+            search.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    val query = s?.toString()?.trim()?.lowercase().orEmpty()
+                    for (i in 0 until appList.childCount) {
+                        val row = appList.getChildAt(i)
+                        row.visibility = if (query.isEmpty() || (row.tag as? String).orEmpty().contains(query)) View.VISIBLE else View.GONE
+                    }
+                }
+                override fun afterTextChanged(s: android.text.Editable?) = Unit
+            })
+        }
+    }
+
+    private fun loadUserApps(onLoaded: (List<ApplicationInfo>) -> Unit) {
+        Thread {
+            val apps = installedUserApps()
+            cachedUserApps = apps
+            runOnUiThread { onLoaded(apps) }
+        }.start()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun installedUserApps(): List<ApplicationInfo> = packageManager.queryIntentActivities(
+        Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER),
+        0,
+    )
+        .asSequence()
+        .map { it.activityInfo.applicationInfo }
+        .filter { it.packageName != packageName }
+        .distinctBy { it.packageName }
+        .sortedBy { packageManager.getApplicationLabel(it).toString().lowercase() }
+        .toList()
+
+    private fun openThemeScreen() {
+        val page = newPage("Theme", "Halo is the default. Dynamic follows the phone's light or dark theme. Your choice stays until you change it.")
+        val current = AppAppearance.current(this)
+        page.content.addView(kit.section("Themes"), kit.matchWidth(4))
+        val cards = ArrayList<Pair<AppAppearance.Theme, HaloKit.OptionCard>>()
+        AppAppearance.Theme.entries.forEachIndexed { index, theme ->
+            val top = if (theme.followsSystem) palette.surface else (if (theme.skyTop != 0L) theme.skyTop else theme.canvas).toInt()
+            val bottom = if (theme.followsSystem) palette.primary else theme.primary.toInt()
+            val swatch = View(this).apply {
+                background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(top, bottom)).apply {
+                    shape = GradientDrawable.OVAL
+                    setStroke(dp(1), HaloColors.withAlpha(INK, 0.2f))
+                }
+            }
+            val card = kit.optionCard(theme.label, theme.description, theme == current, leading = swatch) {
+                cards.forEach { (value, other) -> other.setSelected(value == theme) }
+                if (theme != current) {
+                    AppAppearance.save(this, theme)
+                    AetherWidget.refreshAll(this)
+                    pageHost.postDelayed({ recreate() }, 260)
+                }
+            }
+            cards.add(theme to card)
+            page.content.addView(card.view, kit.matchWidth(if (index == 0) 8 else 10))
+        }
+        showPage(page)
+    }
+
+    private fun connectionLogText(tab: LogTab = LogTab.ALL): String {
+        val appEvents = ConnectionLog.snapshot()
+        val coreEvents = NativeCore.lastLog().lineSequence().filter(String::isNotBlank).toList()
+        val events = when (tab) {
+            LogTab.ALL -> appEvents + coreEvents
+            LogTab.APP -> appEvents
+            LogTab.CORE -> coreEvents
+        }
+        return events.joinToString("\n").ifBlank { "No connection events yet" }
+    }
+
+
+    /** Runs [action] once a page that is closing has finished sliding away. */
     private fun sentenceCase(text: String): String {
         if (text != text.uppercase()) return text
         val keep = setOf("CIDR", "DNS", "I1", "I2", "IP", "SOCKS", "SOCKS5", "HTTP", "MASQUE", "VPN", "JWT", "ID", "OTP")
@@ -1858,7 +1688,7 @@ class MainActivity : Activity() {
         }.joinToString(" ")
     }
 
-    private fun editDnsServers() {
+    private fun editDnsServers(onChanged: () -> Unit = {}) {
         val field = settingsField(
             preferences().getString(DNS_SERVERS, "").orEmpty(),
             "1.1.1.1, 9.9.9.9",
@@ -1867,12 +1697,13 @@ class MainActivity : Activity() {
             "DNS resolvers",
             "IP addresses, optionally with ports. Blank uses Cloudflare defaults.",
             listOf("RESOLVERS" to field),
+            onSaved = onChanged,
         ) { values ->
             preferences().edit().putString(DNS_SERVERS, values[0]).apply()
         }
     }
 
-    private fun editRoutingRules() {
+    private fun editRoutingRules(onChanged: () -> Unit = {}) {
         val block = settingsField(
             preferences().getString(ROUTE_BLOCK, "").orEmpty(),
             "ads.example\nkeyword:tracker\nport:25",
@@ -1890,6 +1721,7 @@ class MainActivity : Activity() {
             validator = { values ->
                 values.mapIndexedNotNull { index, rules -> invalidCidrRule(rules)?.let { index to it } }.firstOrNull()
             },
+            onSaved = onChanged,
         ) { values ->
             preferences().edit()
                 .putString(ROUTE_BLOCK, values[0])
@@ -1898,7 +1730,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun editAdvancedObfuscation() {
+    private fun editAdvancedObfuscation(onChanged: () -> Unit = {}) {
         val jc = settingsField(preferences().getString(OBFUSCATION_JC, "").orEmpty(), "0–10").apply {
             inputType = InputType.TYPE_CLASS_NUMBER
         }
@@ -1926,6 +1758,7 @@ class MainActivity : Activity() {
                     else -> null
                 }
             },
+            onSaved = onChanged,
         ) { values ->
             preferences().edit().apply {
                 listOf(OBFUSCATION_JC, OBFUSCATION_JMIN, OBFUSCATION_JMAX, OBFUSCATION_I1, OBFUSCATION_I2)
@@ -1952,794 +1785,11 @@ class MainActivity : Activity() {
         }
         ?.let { "Invalid CIDR: $it" }
 
-    private fun openZeroTrustScreen() {
-        zeroTrustPage?.let(pageHost::removeView)
-        val team = settingsField(SecureStore.getSecret(this, ZERO_TRUST_TEAM), "team name")
-        val email = settingsField(SecureStore.getSecret(this, ZERO_TRUST_EMAIL), "you@example.com")
-        val code = settingsField("", "email code")
-        val clientId = settingsField(SecureStore.getSecret(this, ZERO_TRUST_CLIENT_ID), "service token client ID")
-        val clientSecret = settingsField(SecureStore.getSecret(this, ZERO_TRUST_CLIENT_SECRET), "service token secret", secure = true)
-        val token = settingsField(SecureStore.getSecret(this, ZERO_TRUST_TOKEN), "Access JWT", secure = true)
-        val status = label("", 13f, MUTED)
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
-        }
-        val scroll = ScrollView(this).apply {
-            isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(16), dp(24), dp(24))
-        }
-        content.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeZeroTrustScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Zero Trust"))
-        })
-        content.addView(label("Use email OTP, a service token, or an existing Access JWT.", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(12) })
-        listOf(
-            "TEAM" to team,
-            "EMAIL" to email,
-            "ONE-TIME CODE" to code,
-            "SERVICE CLIENT ID" to clientId,
-            "SERVICE SECRET" to clientSecret,
-            "ACCESS JWT" to token,
-        ).forEach { (name, field) ->
-            content.addView(sectionLabel(sentenceCase(name)), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(10); bottomMargin = dp(6) })
-            content.addView(field, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)))
-        }
-        content.addView(createToggleRow(
-            "Gateway filtering",
-            "Route HTTP/S through the organization gateway in VPN and Proxy modes",
-            preferences().getBoolean(ZERO_TRUST_GATEWAY, false),
-        ) { preferences().edit().putBoolean(ZERO_TRUST_GATEWAY, it).apply() }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(72),
-        ).apply { topMargin = dp(14) })
-        content.addView(status, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(12) })
-        val authButtons = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        authButtons.addView(createSettingsButton("Send code") {
-            SecureStore.putSecret(this, ZERO_TRUST_TEAM, team.text.toString().trim())
-            SecureStore.putSecret(this, ZERO_TRUST_EMAIL, email.text.toString().trim())
-            status.text = "Requesting code\u2026"
-            Thread {
-                val result = runCatching { NativeCore.requestEmailCode(team.text.toString(), email.text.toString()) }
-                runOnUiThread {
-                    status.setTextColor(if (result.isSuccess) connected else ERROR)
-                    status.text = result.fold({ "Code sent. Check your email." }, { it.message ?: "Could not send code" })
-                }
-            }.start()
-        }, LinearLayout.LayoutParams(0, dp(52), 1f))
-        authButtons.addView(createSettingsButton("Verify") {
-            status.text = "Verifying\u2026"
-            Thread {
-                val result = runCatching { NativeCore.confirmEmailCode(code.text.toString()) }
-                runOnUiThread {
-                    result.onSuccess {
-                        token.setText(it)
-                        SecureStore.putSecret(this, ZERO_TRUST_TOKEN, it)
-                    }
-                    status.setTextColor(if (result.isSuccess) connected else ERROR)
-                    status.text = result.fold({ "Verified. Access token saved." }, { it.message ?: "Code rejected" })
-                }
-            }.start()
-        }, LinearLayout.LayoutParams(0, dp(52), 1f).apply { leftMargin = dp(10) })
-        content.addView(authButtons, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply { topMargin = dp(12) })
-        val saveButtons = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        saveButtons.addView(createSettingsButton("Clear") {
-            SecureStore.removeSecret(this, ZERO_TRUST_TEAM)
-            SecureStore.removeSecret(this, ZERO_TRUST_EMAIL)
-            SecureStore.removeSecret(this, ZERO_TRUST_CLIENT_ID)
-            SecureStore.removeSecret(this, ZERO_TRUST_CLIENT_SECRET)
-            SecureStore.removeSecret(this, ZERO_TRUST_TOKEN)
-            preferences().edit().remove(ZERO_TRUST_GATEWAY).apply()
-            zeroTrustControlButton?.text = "Zero Trust · ${zeroTrustSummary()} ›"
-            closeZeroTrustScreen()
-        }, LinearLayout.LayoutParams(0, dp(52), 1f))
-        saveButtons.addView(createSettingsButton("Save", backgroundOverride = primary, textColorOverride = primaryContainer) {
-            if (team.text.toString().isBlank()) {
-                team.error = "Team is required"
-                return@createSettingsButton
-            }
-            SecureStore.putSecret(this, ZERO_TRUST_TEAM, team.text.toString().trim())
-            SecureStore.putSecret(this, ZERO_TRUST_EMAIL, email.text.toString().trim())
-            SecureStore.putSecret(this, ZERO_TRUST_CLIENT_ID, clientId.text.toString().trim())
-            SecureStore.putSecret(this, ZERO_TRUST_CLIENT_SECRET, clientSecret.text.toString().trim())
-            SecureStore.putSecret(this, ZERO_TRUST_TOKEN, token.text.toString().trim())
-            zeroTrustControlButton?.text = "Zero Trust · ${zeroTrustSummary()} ›"
-            closeZeroTrustScreen()
-        }, LinearLayout.LayoutParams(0, dp(52), 1f).apply { leftMargin = dp(10) })
-        content.addView(saveButtons, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply {
-            topMargin = dp(10)
-            bottomMargin = dp(8)
-        })
-        scroll.addView(content)
-        page.addView(scroll, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
-            insets
-        }
-        zeroTrustPage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        animatePageOpen(page)
-    }
-
-    private fun closeZeroTrustScreen() {
-        zeroTrustPage?.let { animatePageClose(it) { zeroTrustPage = null } }
-    }
-
-    private fun <T> showChoiceSheet(
-        title: String,
-        subtitle: String,
-        options: List<T>,
-        selected: T,
-        label: (T) -> String,
-        description: (T) -> String,
-        onSelected: (T) -> Unit,
-    ) {
-        pageStack.push(buildChoicePage(
-            context = this,
-            palette = palette,
-            title = title,
-            subtitle = subtitle,
-            options = options,
-            selected = selected,
-            label = label,
-            description = description,
-            onBack = { pageStack.pop() },
-            onSelected = onSelected,
-        ))
-    }
-
-    private fun closeSettingsScreen() {
-        showingSettings = false
-        settingsPage?.let { animatePageClose(it) { settingsPage = null } }
-    }
-
-    private fun openWidgetControlScreen() {
-        widgetControlPage?.let(pageHost::removeView)
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
-        }
-        val scroll = ScrollView(this).apply {
-            isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(16), dp(24), dp(24))
-        }
-        content.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeWidgetControlScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Widget control").apply { setPadding(dp(4), 0, 0, 0) })
-        })
-        content.addView(label("Add Aethery to the home screen. The controls use the same circle, type, and colours as the app.", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(4); bottomMargin = dp(20) })
-
-        content.addView(widgetCard(
-            size = "1×1",
-            title = "Connect",
-            detail = "Only the circular control. Tap to connect or disconnect.",
-            kind = AetherWidget.Kind.CONNECT,
-        ))
-        content.addView(widgetCard(
-            size = "2×2",
-            title = "Connect + method",
-            detail = "The control plus the current method. Tap the method to cycle MASQUE, WireGuard, and WARP-on-WARP.",
-            kind = AetherWidget.Kind.METHOD,
-        ))
-        content.addView(widgetCard(
-            size = "3×4",
-            title = "Console",
-            detail = "Connect, method, live speed, and HTTP/3 / HTTP/2. Fallback is the same setting as Tunnel controls.",
-            kind = AetherWidget.Kind.CONSOLE,
-        ))
-
-        content.addView(sectionLabel("HTTP/3 and HTTP/2"), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(16) })
-        content.addView(createSettingsButton("HTTP/3 & HTTP/2 ›") { openWidgetTransportScreen() }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(52),
-        ).apply { topMargin = dp(10) })
-
-        scroll.addView(content)
-        page.addView(scroll)
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
-            insets
-        }
-        widgetControlPage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        animatePageOpen(page)
-    }
-
-    private fun widgetCard(
-        size: String,
-        title: String,
-        detail: String,
-        kind: AetherWidget.Kind,
-    ): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(dp(18), dp(16), dp(18), dp(16))
-        background = roundedBackground(SURFACE_VARIANT, 20, DIVIDER)
-        val mark = ImageView(this@MainActivity).apply {
-            setImageBitmap(
-                AetherWidget.connectMark(
-                    dp(64),
-                    if (NativeCore.isReady()) AetherWidget.State.CONNECTED else AetherWidget.State.DISCONNECTED,
-                    palette,
-                ),
-            )
-            contentDescription = title
-        }
-        addView(LinearLayout(this@MainActivity).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(mark, LinearLayout.LayoutParams(dp(64), dp(64)))
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(label(size, 12f, MUTED, TypefaceStyle.MEDIUM).apply { letterSpacing = 0.1f })
-                addView(label(title, 16f, INK, TypefaceStyle.MEDIUM), LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).apply { topMargin = dp(2) })
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(12) })
-        })
-        addView(label(detail, 13f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(10) })
-        addView(createSettingsButton("Add to home screen") { AetherWidget.pin(this@MainActivity, kind) }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(48),
-        ).apply { topMargin = dp(12) })
-        layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(12) }
-    }
-
-    private fun closeWidgetControlScreen() {
-        widgetControlPage?.let { animatePageClose(it) { widgetControlPage = null } }
-    }
-
-    private fun openWidgetTransportScreen() {
-        widgetTransportPage?.let(pageHost::removeView)
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
-        }
-        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(16), dp(24), dp(24))
-        }
-        content.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeWidgetTransportScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("HTTP/3 & HTTP/2"))
-        })
-        content.addView(label("Used by the 3×4 widget and the next MASQUE connection.", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(24) })
-        content.addView(sectionLabel("MASQUE"))
-        content.addView(createSettingsButton("Transport · ${defaultMasqueTransport().label} ›") {
-            chooseMasqueTransport()
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(56),
-        ).apply { topMargin = dp(10) })
-        lateinit var fallbackButton: TextView
-        fallbackButton = createSettingsButton("HTTP/3 → HTTP/2 fallback · ${if (h3H2Fallback()) "On" else "Off"}") {
-            preferences().edit().putBoolean(H3_H2_FALLBACK, !h3H2Fallback()).apply()
-            fallbackButton.text = "HTTP/3 → HTTP/2 fallback · ${if (h3H2Fallback()) "On" else "Off"}"
-            AetherWidget.refreshAll(this)
-        }
-        content.addView(fallbackButton, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(56),
-        ).apply { topMargin = dp(10) })
-        scroll.addView(content)
-        page.addView(scroll)
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
-            insets
-        }
-        widgetTransportPage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        animatePageOpen(page)
-    }
-
-    private fun closeWidgetTransportScreen() {
-        widgetTransportPage?.let { animatePageClose(it) { widgetTransportPage = null } }
-    }
-
-    private fun openTrafficMonitorScreen() {
-        trafficMonitorPage?.let(pageHost::removeView)
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
-        }
-        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(16), dp(24), dp(24))
-        }
-        content.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeTrafficMonitorScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Traffic monitor").apply { setPadding(dp(4), 0, 0, 0) })
-        })
-        content.addView(label("Traffic carried by Aethery. Per-app attribution is not available from encrypted tunnel counters.", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(4); bottomMargin = dp(24) })
-        trafficSpeedValue = addTrafficMetric(content, "LIVE SPEED")
-        trafficSessionValue = addTrafficMetric(content, "THIS SESSION")
-        trafficMonthValue = addTrafficMetric(content, "THIS MONTH")
-        scroll.addView(content)
-        page.addView(scroll, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
-            insets
-        }
-        trafficMonitorPage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        renderTrafficMonitor()
-        animatePageOpen(page)
-    }
-
-    private fun addTrafficMetric(parent: LinearLayout, title: String): TextView {
-        val value = label("Waiting for tunnel traffic", 18f, INK, TypefaceStyle.MEDIUM)
-        parent.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(16), dp(20), dp(16))
-            background = roundedBackground(SURFACE_VARIANT, 20, DIVIDER)
-            addView(sectionLabel(sentenceCase(title)))
-            addView(value, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(6) })
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(84),
-        ).apply { bottomMargin = dp(12) })
-        return value
-    }
-
-    private fun closeTrafficMonitorScreen() {
-        trafficMonitorPage?.let { animatePageClose(it) { trafficMonitorPage = null } }
-        trafficSpeedValue = null
-        trafficSessionValue = null
-        trafficMonthValue = null
-    }
-
-    private fun renderTrafficMonitor() {
-        trafficSpeedValue?.text = "↓ ${formatTraffic(trafficSpeedRx)}/s   ↑ ${formatTraffic(trafficSpeedTx)}/s"
-        trafficSessionValue?.text = "↓ ${formatTraffic(trafficRx)}   ↑ ${formatTraffic(trafficTx)}"
-        trafficMonthValue?.text = "↓ ${formatTraffic(trafficMonthRx)}   ↑ ${formatTraffic(trafficMonthTx)}"
-    }
-
-    private fun formatTraffic(bytes: Long): String = when {
-        bytes < 1_024 -> "$bytes B"
-        bytes < 1_048_576 -> "${bytes / 1_024} KB"
-        bytes < 1_073_741_824 -> "${bytes / 1_048_576} MB"
-        else -> String.format(java.util.Locale.US, "%.2f GB", bytes / 1_073_741_824.0)
-    }
-
-    private fun openSplitTunnelScreen() {
-        splitTunnelPage?.let(pageHost::removeView)
-        val settings = SplitTunnelSettings(this)
-        val selected = settings.packages().toMutableSet()
-        splitTunnelDraftMode = settings.mode()
-        splitTunnelDraftPackages = selected
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
-        }
-        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val header = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeSplitTunnelScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Split tunneling"), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(createSettingsButton("Done", backgroundOverride = primary, textColorOverride = primaryContainer) {
-                settings.save(settings.mode(), selected)
-                closeSplitTunnelScreen()
-            }, LinearLayout.LayoutParams(dp(88), dp(40)).apply { marginEnd = dp(4) })
-        }
-        content.addView(header)
-        content.addView(label("Choose which apps use Aethery. Changes apply next connection.", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(20) })
-        content.addView(sectionLabel("Mode"))
-        val modeOptions = mutableMapOf<SplitTunnelSettings.Mode, SelectionOption>()
-        SplitTunnelSettings.Mode.entries.forEachIndexed { index, mode ->
-            val option = createSplitModeOption(mode, settings.mode()) { chosen ->
-                modeOptions.forEach { (m, opt) -> setSelectionState(opt, m == chosen, animate = true) }
-                splitTunnelDraftMode = chosen
-                splitTunnelDraftPackages = selected
-                settings.save(chosen, selected.toHashSet())
-                if (chosen == SplitTunnelSettings.Mode.ALL) {
-                    closeSplitTunnelScreen()
-                } else {
-                    openSplitTunnelAppsScreen(chosen, selected)
-                }
-            }
-            modeOptions[mode] = option
-            content.addView(option.row, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(58),
-            ).apply { topMargin = if (index == 0) dp(10) else dp(8) })
-        }
-
-        page.addView(content, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ).apply {
-            leftMargin = dp(24)
-            rightMargin = dp(24)
-            topMargin = dp(16)
-            bottomMargin = dp(16)
-        })
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            (content.layoutParams as FrameLayout.LayoutParams).apply {
-                topMargin = insets.systemWindowInsetTop + dp(16)
-                bottomMargin = insets.systemWindowInsetBottom + dp(16)
-                content.layoutParams = this
-            }
-            insets
-        }
-        splitTunnelPage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        animatePageOpen(page)
-        staggerListItems(content)
-    }
-
-    private fun openSplitTunnelAppsScreen(mode: SplitTunnelSettings.Mode, selected: MutableSet<String>) {
-        splitTunnelAppsPage?.let(pageHost::removeView)
-        splitTunnelDraftMode = mode
-        splitTunnelDraftPackages = selected
-        val settings = SplitTunnelSettings(this)
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
-        }
-        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val appList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-
-        content.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeSplitTunnelAppsScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Apps"), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(createSettingsButton("Done", backgroundOverride = primary, textColorOverride = primaryContainer) {
-                settings.save(mode, selected.toHashSet())
-                closeSplitTunnelAppsScreen()
-                closeSplitTunnelScreen()
-            }, LinearLayout.LayoutParams(dp(88), dp(40)).apply { marginEnd = dp(4) })
-        })
-        content.addView(label("Select apps to ${if (mode == SplitTunnelSettings.Mode.INCLUDE) "include" else "exclude"}", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(16) })
-
-        val searchField = EditText(this).apply {
-            hint = "Search apps…"
-            setHintTextColor(MUTED)
-            setTextColor(INK)
-            textSize = 15f
-            setSingleLine(true)
-            background = roundedBackground(SURFACE_VARIANT, 12, DIVIDER)
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            val searchIcon = getDrawable(android.R.drawable.ic_menu_search)?.apply {
-                setTint(MUTED)
-                setBounds(0, 0, dp(20), dp(20))
-            }
-            setCompoundDrawablesRelativeWithIntrinsicBounds(searchIcon, null, null, null)
-            compoundDrawablePadding = dp(10)
-        }
-        content.addView(searchField, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(16); leftMargin = dp(4); rightMargin = dp(4) })
-
-        val progressBar = ProgressBar(this).apply {
-            isIndeterminate = true
-            indeterminateDrawable?.setTint(primary)
-        }
-        val loading = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            addView(progressBar, LinearLayout.LayoutParams(dp(44), dp(44)))
-            addView(label("Scanning installed apps…", 14f, MUTED).apply {
-                gravity = Gravity.CENTER
-                setPadding(0, dp(16), 0, 0)
-            })
-        }
-        val listScroll = ScrollView(this).apply {
-            alpha = 0f
-            visibility = View.INVISIBLE
-            addView(appList)
-        }
-        content.addView(FrameLayout(this).apply {
-            addView(loading, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER,
-            ))
-            addView(listScroll, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            ))
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            0,
-            1f,
-        ))
-        page.addView(content, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ).apply {
-            leftMargin = dp(24)
-            rightMargin = dp(24)
-            topMargin = dp(16)
-            bottomMargin = dp(16)
-        })
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            (content.layoutParams as FrameLayout.LayoutParams).apply {
-                topMargin = insets.systemWindowInsetTop + dp(16)
-                bottomMargin = insets.systemWindowInsetBottom + dp(16)
-                content.layoutParams = this
-            }
-            insets
-        }
-        splitTunnelAppsPage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        page.alpha = 0f
-        page.translationX = dp(20).toFloat()
-        page.animate().alpha(1f).translationX(0f)
-            .setDuration(PAGE_ANIMATION_MS)
-            .setInterpolator(motionInterpolator)
-            .start()
-        loadUserApps { apps ->
-            if (splitTunnelAppsPage !== page) return@loadUserApps
-            
-            settings.cleanup(apps.map { it.packageName }.toSet())
-            selected.clear()
-            selected.addAll(settings.packages())
-
-            val sortedApps = apps.sortedWith(compareByDescending<ApplicationInfo> { it.packageName in selected }
-                .thenBy { packageManager.getApplicationLabel(it).toString().lowercase() })
-
-            sortedApps.forEach { app ->
-                appList.addView(createSplitTunnelAppOption(app, mode, selected, settings), LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(72),
-                ).apply { bottomMargin = dp(8) })
-            }
-            loading.animate().alpha(0f).scaleX(0.9f).scaleY(0.9f).setDuration(220)
-                .setInterpolator(motionInterpolator)
-                .withEndAction {
-                    loading.visibility = View.GONE
-                    listScroll.visibility = View.VISIBLE
-                    listScroll.animate().alpha(1f).setDuration(250).start()
-                    staggerListItems(appList)
-                }.start()
-
-            searchField.addTextChangedListener(object : android.text.TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                    val query = s?.toString()?.lowercase() ?: ""
-                    for (i in 0 until appList.childCount) {
-                        val row = appList.getChildAt(i)
-                        val name = (row.tag as? String)?.lowercase() ?: ""
-                        val pkg = (row.contentDescription as? String)?.lowercase() ?: ""
-                        row.visibility = if (query.isEmpty() || name.contains(query) || pkg.contains(query)) View.VISIBLE else View.GONE
-                    }
-                }
-                override fun afterTextChanged(s: android.text.Editable?) {}
-            })
-        }
-    }
-
-    private fun createSplitTunnelAppOption(
-        app: ApplicationInfo,
-        mode: SplitTunnelSettings.Mode,
-        selected: MutableSet<String>,
-        settings: SplitTunnelSettings,
-    ): LinearLayout {
-        val packageName = app.packageName
-        val appLabel = packageManager.getApplicationLabel(app).toString()
-        lateinit var row: LinearLayout
-        fun updateSelection(checked: Boolean, animate: Boolean) {
-            row.background = roundedBackground(
-                if (checked) primaryContainer else SURFACE_VARIANT,
-                16,
-                if (checked) primary else SURFACE_VARIANT,
-            )
-            if (animate) {
-                row.animate().cancel()
-                row.animate().scaleX(0.98f).scaleY(0.98f)
-                    .setDuration(80)
-                    .setInterpolator(DecelerateInterpolator())
-                    .withEndAction {
-                        row.animate().scaleX(1f).scaleY(1f)
-                            .setDuration(160)
-                            .setInterpolator(DecelerateInterpolator())
-                            .start()
-                    }
-                    .start()
-            }
-        }
-        val checkbox = CheckBox(this).apply {
-            id = View.generateViewId()
-            isClickable = false
-            isFocusable = false
-            isChecked = selected.contains(packageName)
-            contentDescription = "Select $appLabel"
-            setOnCheckedChangeListener { _, checked ->
-                if (checked) selected += packageName else selected -= packageName
-                splitTunnelDraftPackages = selected
-                settings.save(mode, selected.toHashSet())
-                updateSelection(checked, animate = true)
-            }
-        }
-        row = LinearLayout(this).apply {
-            id = View.generateViewId()
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), 0, dp(8), 0)
-            isClickable = true
-            isFocusable = true
-            tag = appLabel
-            contentDescription = packageName
-            setOnClickListener { checkbox.toggle() }
-            addView(ImageView(this@MainActivity).apply {
-                setImageDrawable(app.loadIcon(packageManager))
-                scaleType = ImageView.ScaleType.CENTER_INSIDE
-            }, LinearLayout.LayoutParams(dp(40), dp(40)))
-            val labels = LinearLayout(this@MainActivity).apply { 
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(14), 0, 0, 0)
-            }
-            labels.addView(label(appLabel, 16f, INK, TypefaceStyle.MEDIUM))
-            labels.addView(label(packageName, 11f, MUTED).apply { 
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                setSingleLine(true)
-            })
-            addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(checkbox, LinearLayout.LayoutParams(dp(48), dp(48)))
-        }
-        updateSelection(checkbox.isChecked, animate = false)
-        return row
-    }
-
-    private fun createSplitModeOption(
-        mode: SplitTunnelSettings.Mode,
-        selected: SplitTunnelSettings.Mode,
-        onSelect: (SplitTunnelSettings.Mode) -> Unit,
-    ): SelectionOption {
-        val title = label(mode.label, 16f, INK, TypefaceStyle.MEDIUM)
-        val indicator = label("Selected", 12f, primary, TypefaceStyle.MEDIUM)
-        val row = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(18), 0, dp(18), 0)
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { onSelect(mode) }
-            addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(indicator)
-        }
-        return SelectionOption(row, title, indicator, 18).also { setSelectionState(it, mode == selected, animate = false) }
-    }
-
-    private fun setSelectionState(option: SelectionOption, selected: Boolean, animate: Boolean) {
-        option.row.background = roundedBackground(
-            if (selected) primaryContainer else SURFACE_VARIANT,
-            option.radius,
-            if (selected) primary else SURFACE_VARIANT,
-        )
-        option.title.typeface = android.graphics.Typeface.create(
-            if (selected) "sans-serif-medium" else "sans",
-            android.graphics.Typeface.NORMAL,
-        )
-        option.indicator.animate().cancel()
-        if (selected) {
-            option.indicator.visibility = View.VISIBLE
-            option.indicator.alpha = if (animate) 0f else 1f
-            if (animate) option.indicator.animate().alpha(1f).setDuration(160).start()
-        } else if (animate) {
-            option.indicator.animate().alpha(0f).setDuration(120).withEndAction {
-                option.indicator.visibility = View.INVISIBLE
-            }.start()
-        } else {
-            option.indicator.alpha = 0f
-            option.indicator.visibility = View.INVISIBLE
-        }
-    }
-
-    private fun closeSplitTunnelScreen() {
-        persistSplitTunnelDraft()
-        splitTunnelPage?.let { animatePageClose(it) { splitTunnelPage = null } }
-        splitTunnelSummaryButton?.text = "${splitTunnelSummary()} ›"
-    }
-
-    private fun closeSplitTunnelAppsScreen() {
-        persistSplitTunnelDraft()
-        splitTunnelAppsPage?.let { animatePageClose(it) { splitTunnelAppsPage = null } }
-        splitTunnelSummaryButton?.text = "${splitTunnelSummary()} ›"
-    }
-
-    private fun persistSplitTunnelDraft() {
-        val mode = splitTunnelDraftMode ?: return
-        val packages = splitTunnelDraftPackages ?: return
-        SplitTunnelSettings(this).save(mode, packages.toHashSet())
-    }
-
-    private fun loadUserApps(onLoaded: (List<ApplicationInfo>) -> Unit) {
-        Thread {
-            val apps = installedUserApps()
-            cachedUserApps = apps
-            runOnUiThread { onLoaded(apps) }
-        }.start()
-    }
-
-    @Suppress("DEPRECATION")
-    private fun installedUserApps(): List<ApplicationInfo> = packageManager.queryIntentActivities(
-        Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER),
-        0,
-    )
-        .asSequence()
-        .map { it.activityInfo.applicationInfo }
-        .filter { it.packageName != packageName }
-        .distinctBy { it.packageName }
-        .sortedBy { packageManager.getApplicationLabel(it).toString().lowercase() }
-        .toList()
-
     override fun onBackPressed() {
         if (!handleBack()) super.onBackPressed()
     }
 
-    private fun handleBack(): Boolean {
-        if (pageStack.pop()) return true
-        when {
-            splitTunnelAppsPage != null -> closeSplitTunnelAppsScreen()
-            splitTunnelPage != null -> closeSplitTunnelScreen()
-            themePage != null -> closeThemeScreen()
-            widgetTransportPage != null -> closeWidgetTransportScreen()
-            widgetControlPage != null -> closeWidgetControlScreen()
-            trafficMonitorPage != null -> closeTrafficMonitorScreen()
-            zeroTrustPage != null -> closeZeroTrustScreen()
-            tunnelControlsPage != null -> closeTunnelControlsScreen()
-            showingLogs -> closeLogsScreen()
-            showingScanner -> closeScannerScreen()
-            showingMode -> closeModeScreen()
-            showingSettings -> closeSettingsScreen()
-            else -> return false
-        }
-        return true
-    }
+    private fun handleBack(): Boolean = pageStack.pop()
 
     private fun updateConnectionMode(protocol: Protocol) {
         if (selectedProtocol == protocol) return
@@ -2976,6 +2026,12 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun View.highlightOnFocus(radius: Int, fill: Int, stroke: Int) {
+        onFocusChangeListener = View.OnFocusChangeListener { view, focused ->
+            view.background = roundedBackground(fill, radius, if (focused) primary else stroke, if (focused) 2 else 1)
+        }
+    }
+
     private fun label(
         text: String = "",
         textSize: Float,
@@ -3014,30 +2070,6 @@ class MainActivity : Activity() {
     private fun appVersion(): String =
         packageManager.getPackageInfo(packageName, 0).versionName ?: "Unknown"
 
-    private fun createSettingsButton(
-        text: String,
-        icon: Int? = null,
-        backgroundOverride: Int? = null,
-        textColorOverride: Int? = null,
-        tintIcon: Boolean = true,
-        onClick: () -> Unit,
-    ): TextView = label(text, 15f, textColorOverride ?: INK, TypefaceStyle.MEDIUM).apply {
-        gravity = Gravity.CENTER
-        setPadding(dp(18), 0, dp(18), 0)
-        background = roundedBackground(backgroundOverride ?: SURFACE_VARIANT, 16, backgroundOverride ?: SURFACE_VARIANT)
-        isClickable = true
-        isFocusable = true
-        contentDescription = text
-        highlightOnFocus(16, backgroundOverride ?: SURFACE_VARIANT, backgroundOverride ?: SURFACE_VARIANT)
-        icon?.let {
-            setCompoundDrawablesRelativeWithIntrinsicBounds(it, 0, 0, 0)
-            compoundDrawablePadding = dp(12)
-            if (tintIcon) compoundDrawablesRelative[0]?.setTint(textColorOverride ?: primary)
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        setOnClickListener { onClick() }
-    }
-
     private fun openLink(url: String) {
         runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
     }
@@ -3073,7 +2105,7 @@ class MainActivity : Activity() {
     private fun scanSummary(): String = listOfNotNull(
         defaultScan().label,
         defaultScanMode().label,
-        defaultMasqueTransport().label.takeIf { selectedProtocol == Protocol.MASQUE },
+        defaultMasqueTransport().label.takeIf { selectedProtocol.usesMasque },
     ).joinToString(", ")
 
     private fun preferences() = getSharedPreferences(SETTINGS, MODE_PRIVATE)
@@ -3168,132 +2200,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun openThemeScreen() {
-        themePage?.let(pageHost::removeView)
-        val page = FrameLayout(this).apply {
-            background = haloPageBackground(palette)
-            isClickable = true
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(16), dp(24), dp(24))
-        }
-        content.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(createHeaderBackButton { closeThemeScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(10) })
-            addView(pageTitle("Theme"))
-        })
-        content.addView(label("Halo is the default. Dynamic follows the phone's light or dark theme. Your choice stays until you change it.", 14f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = dp(54); topMargin = dp(-8); bottomMargin = dp(20) })
-        val current = AppAppearance.current(this)
-        AppAppearance.Theme.entries.forEachIndexed { index, theme ->
-            val selected = theme == current
-            content.addView(LinearLayout(this).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(dp(18), 0, dp(18), 0)
-                background = roundedBackground(
-                    if (selected) primaryContainer else SURFACE_VARIANT,
-                    18,
-                    if (selected) primary else SURFACE_VARIANT,
-                )
-                isClickable = true
-                isFocusable = true
-                highlightOnFocus(18, if (selected) primaryContainer else SURFACE_VARIANT, if (selected) primary else DIVIDER)
-                setOnClickListener {
-                    if (theme != current) {
-                        AppAppearance.save(this@MainActivity, theme)
-                        AetherWidget.refreshAll(this@MainActivity)
-                        recreate()
-                    } else {
-                        closeThemeScreen()
-                    }
-                }
-                val texts = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-                texts.addView(label(theme.label, 16f, INK, TypefaceStyle.MEDIUM))
-                texts.addView(label(theme.description, 13f, MUTED), LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).apply { topMargin = dp(2) })
-                addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                if (selected) addView(label("Current", 12f, primary, TypefaceStyle.MEDIUM))
-            }, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(76),
-            ).apply { topMargin = if (index == 0) 0 else dp(10) })
-        }
-        page.addView(content, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-        page.setOnApplyWindowInsetsListener { _, insets ->
-            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
-            insets
-        }
-        themePage = page
-        pageHost.addView(page)
-        page.requestApplyInsets()
-        animatePageOpen(page)
-    }
-
-    private fun closeThemeScreen() {
-        themePage?.let { animatePageClose(it) { themePage = null } }
-    }
-
-    private fun View.highlightOnFocus(radius: Int, fill: Int, stroke: Int) {
-        onFocusChangeListener = View.OnFocusChangeListener { view, focused ->
-            view.background = roundedBackground(fill, radius, if (focused) primary else stroke, if (focused) 2 else 1)
-        }
-    }
-
-    private fun createToggleRow(title: String, subtitle: String, checked: Boolean, onToggle: (Boolean) -> Unit): LinearLayout {
-        val texts = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(label(title, 16f, INK, TypefaceStyle.MEDIUM))
-            addView(label(subtitle, 13f, MUTED), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(2) })
-        }
-        var isOn = checked
-        val thumbInset = dp(3)
-        val track = LinearLayout(this).apply {
-            val trackWidth = dp(48)
-            val trackHeight = dp(28)
-            layoutParams = LinearLayout.LayoutParams(trackWidth, trackHeight)
-            background = roundedBackground(if (isOn) primary else SURFACE_VARIANT, 14, if (isOn) primary else DIVIDER)
-            gravity = Gravity.CENTER_VERTICAL
-            isClickable = true
-            isFocusable = true
-            val thumbSize = dp(22)
-            val thumb = View(this@MainActivity).apply {
-                layoutParams = LinearLayout.LayoutParams(thumbSize, thumbSize)
-                background = roundedBackground(Color.WHITE, 11, Color.WHITE)
-                translationX = if (isOn) (trackWidth - thumbSize - thumbInset).toFloat() else thumbInset.toFloat()
-            }
-            addView(thumb)
-            setOnClickListener {
-                isOn = !isOn
-                onToggle(isOn)
-                val targetX = if (isOn) (trackWidth - thumbSize - thumbInset).toFloat() else thumbInset.toFloat()
-                thumb.animate()
-                    .translationX(targetX)
-                    .setDuration(160)
-                    .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f))
-                    .start()
-                background = roundedBackground(if (isOn) primary else SURFACE_VARIANT, 14, if (isOn) primary else DIVIDER)
-            }
-        }
-        return LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(18), 0, dp(18), 0)
-            background = roundedBackground(SURFACE_VARIANT, 18, DIVIDER)
-            addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(track)
-        }
-    }
 
     private fun logLevel(): LogLevel = preferences()
         .getString(LOG_LEVEL, LogLevel.INFO.coreName)
@@ -3340,64 +2246,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun addCorePortField(
-        content: LinearLayout,
-        heading: String,
-        currentPort: Int,
-        hint: String,
-        fieldDescription: String,
-        onApply: (EditText) -> Unit,
-    ) {
-        content.addView(sectionLabel(sentenceCase(heading)), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(24) })
-        val portField = EditText(this).apply {
-            setText(currentPort.toString())
-            setTextColor(INK)
-            setHintTextColor(MUTED)
-            textSize = 16f
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setSingleLine(true)
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(18), 0, dp(12), 0)
-            background = roundedBackground(SURFACE_VARIANT, 16, SURFACE_VARIANT)
-            contentDescription = fieldDescription
-        }
-        content.addView(LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(portField, LinearLayout.LayoutParams(0, dp(56), 1f))
-            addView(createSettingsButton("Apply", backgroundOverride = primary, textColorOverride = primaryContainer) {
-                onApply(portField)
-            }, LinearLayout.LayoutParams(
-                dp(96),
-                dp(56),
-            ).apply { leftMargin = dp(10) })
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(8) })
-        content.addView(label(hint, 12f, MUTED), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = dp(6) })
-    }
-
-    private fun applyListenPort(field: EditText, key: String, otherPort: Int, otherName: String) {
-        val port = field.text.toString().toIntOrNull()
-        if (port == null || port !in 1..65535) {
-            field.error = "Enter a port from 1 to 65535"
-            return
-        }
-        if (port == otherPort) {
-            field.error = "Use a different port from $otherName"
-            return
-        }
-        getSharedPreferences(SETTINGS, MODE_PRIVATE).edit().putInt(key, port).apply()
-        field.error = null
-        field.clearFocus()
-    }
-
     private enum class Protocol(
         val label: String,
         val coreName: String,
@@ -3406,7 +2254,13 @@ class MainActivity : Activity() {
     ) {
         MASQUE("MASQUE", "masque", "HTTP/3 tunnel"),
         WIREGUARD("WireGuard", "wireguard", "WireGuard tunnel"),
-        WARP_IN_WARP("WARP-on-WARP", "gool", "Double-layer tunnel"),
+        WARP_IN_WARP("WARP-on-WARP (WireGuard)", "gool", "Two nested WireGuard tunnels"),
+        WARP_IN_WARP_MASQUE("WARP-on-WARP (MASQUE)", "gool-masque", "WireGuard carried inside a MASQUE tunnel"),
+        MASQUE_IN_MASQUE("MASQUE-on-MASQUE", "mim", "Two MASQUE hops, for a different exit address"),
+        ;
+
+        /** Whether the MASQUE gateway scan and transport settings apply. */
+        val usesMasque: Boolean get() = this != WIREGUARD && this != WARP_IN_WARP
     }
 
     private enum class ConnectionType(val label: String, val description: String) {
@@ -3457,6 +2311,8 @@ class MainActivity : Activity() {
     private enum class ObfuscationProfile(val label: String, val coreName: String, val description: String) {
         OFF("Off", "off", "No traffic-shape padding"),
         LIGHT("Light", "light", "Lower overhead on mild filtering"),
+        FIREWALL("Firewall", "firewall", "Tuned for networks that inspect and reset connections"),
+        GFW("GFW", "gfw", "Strongest shaping against national firewalls"),
         BALANCED("Balanced", "balanced", "Recommended filtering resistance"),
         AGGRESSIVE("Aggressive", "aggressive", "Highest resistance; slower setup"),
     }
@@ -3491,13 +2347,6 @@ class MainActivity : Activity() {
         APP("App"),
         CORE("Core"),
     }
-
-    private data class SelectionOption(
-        val row: LinearLayout,
-        val title: TextView,
-        val indicator: TextView,
-        val radius: Int,
-    )
 
     private enum class TypefaceStyle { REGULAR, MEDIUM }
 
@@ -3552,6 +2401,14 @@ class MainActivity : Activity() {
         const val ZERO_TRUST_CLIENT_SECRET = "zero_trust_client_secret"
         const val ZERO_TRUST_TOKEN = "zero_trust_token"
         const val ZERO_TRUST_GATEWAY = "zero_trust_gateway"
+        const val EXIT_LOCATION = "exit_location"
+        const val ECH = "ech"
+        const val QUIC_V2 = "quic_v2"
+        const val QUICK_RECONNECT = "quick_reconnect"
+        const val DISABLE_GREASE = "disable_grease"
+        const val FRAGMENT_SIZE = "fragment_size"
+        const val FRAGMENT_DELAY = "fragment_delay"
+        const val WG_KEEPALIVE = "wg_keepalive"
         const val DEFAULT_SOCKS_PORT = "default_socks_port"
         const val DEFAULT_SOCKS_PORT_VALUE = 1819
         const val DEFAULT_HTTP_PROXY_PORT = "default_http_proxy_port"

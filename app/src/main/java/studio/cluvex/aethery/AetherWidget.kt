@@ -238,7 +238,7 @@ object AetherWidget {
             views.setOnClickPendingIntent(R.id.h3, action(context, kind, widgetId, ACTION_SET_H3))
             views.setOnClickPendingIntent(R.id.h2, action(context, kind, widgetId, ACTION_SET_H2))
             views.setOnClickPendingIntent(R.id.fallback, action(context, kind, widgetId, ACTION_TOGGLE_FALLBACK))
-            val masque = if (protocol.coreName == "masque") View.VISIBLE else View.GONE
+            val masque = if (protocol.coreName in setOf("masque", "gool-masque", "mim")) View.VISIBLE else View.GONE
             views.setViewVisibility(R.id.masque_heading, masque)
             views.setViewVisibility(R.id.h3, masque)
             views.setViewVisibility(R.id.h2, masque)
@@ -313,7 +313,9 @@ object AetherWidget {
         val next = when (current) {
             Protocol.MASQUE -> Protocol.WIREGUARD
             Protocol.WIREGUARD -> Protocol.WARP_IN_WARP
-            Protocol.WARP_IN_WARP -> Protocol.MASQUE
+            Protocol.WARP_IN_WARP -> Protocol.WARP_IN_WARP_MASQUE
+            Protocol.WARP_IN_WARP_MASQUE -> Protocol.MASQUE_IN_MASQUE
+            Protocol.MASQUE_IN_MASQUE -> Protocol.MASQUE
         }
         prefs.edit().putString(DEFAULT_PROTOCOL, next.coreName).commit()
         if (runCatching { NativeCore.isRunning() }.getOrDefault(false)) {
@@ -381,7 +383,9 @@ object AetherWidget {
     enum class Protocol(val label: String, val coreName: String) {
         MASQUE("MASQUE", "masque"),
         WIREGUARD("WireGuard", "wireguard"),
-        WARP_IN_WARP("WARP-on-WARP", "gool"),
+        WARP_IN_WARP("WARP-on-WARP (WireGuard)", "gool"),
+        WARP_IN_WARP_MASQUE("WARP-on-WARP (MASQUE)", "gool-masque"),
+        MASQUE_IN_MASQUE("MASQUE-on-MASQUE", "mim"),
     }
 
     enum class State { DISCONNECTED, CONNECTING, CONNECTED }

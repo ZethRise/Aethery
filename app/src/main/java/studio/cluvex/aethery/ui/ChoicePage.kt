@@ -13,7 +13,7 @@ import studio.cluvex.aethery.AppAppearance
 import kotlin.math.roundToInt
 
 /** A round check mark that fills and pops with a spring when it becomes selected. */
-private class CheckMark(context: Context, private val palette: AppAppearance.Palette) : View(context) {
+internal class CheckMark(context: Context, private val palette: AppAppearance.Palette) : View(context) {
     private val density = resources.displayMetrics.density
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val path = Path()
@@ -88,51 +88,21 @@ fun <T> buildChoicePage(
     val density = context.resources.displayMetrics.density
     fun dp(value: Int) = (value * density).roundToInt()
     val scaffold = buildScaffold(context, palette, title, subtitle, onBack)
-    val marks = ArrayList<Pair<T, CheckMark>>()
+    val kit = HaloKit(context, palette)
+    val cards = ArrayList<Pair<T, HaloKit.OptionCard>>()
     var chosen = false
 
     options.forEachIndexed { index, item ->
-        val mark = CheckMark(context, palette).apply { setChecked(item == selected, animate = false) }
-        marks.add(item to mark)
-        val row = LinearLayout(context).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(18), dp(14), dp(16), dp(14))
-            background = glassBackground(palette, 18, density)
-            isClickable = true
-            isFocusable = true
-            contentDescription = label(item)
-            addView(LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(TextView(context).apply {
-                    text = label(item)
-                    textSize = 16f
-                    setTextColor(palette.ink)
-                    typeface = HaloType.body(context, medium = true)
-                })
-                addView(TextView(context).apply {
-                    text = description(item)
-                    textSize = 13f
-                    setTextColor(palette.muted)
-                    typeface = HaloType.body(context, medium = false)
-                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                    topMargin = dp(2)
-                })
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(mark, LinearLayout.LayoutParams(dp(26), dp(26)).apply { leftMargin = dp(12) })
-            setOnClickListener {
-                if (chosen) return@setOnClickListener
-                chosen = true
-                Haptics.tick(this)
-                onSelected(item)
-                marks.forEach { (value, check) -> check.setChecked(value == item, animate = true) }
-                postDelayed(onBack, 220)
-            }
+        val card = kit.optionCard(label(item), description(item), item == selected) {
+            if (chosen) return@optionCard
+            chosen = true
+            onSelected(item)
+            cards.forEach { (value, other) -> other.setSelected(value == item) }
+            scaffold.page.postDelayed(onBack, 220)
         }
-        scaffold.content.addView(row, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { if (index > 0) topMargin = dp(10) })
+        cards.add(item to card)
+        scaffold.content.addView(card.view, kit.matchWidth(if (index > 0) 10 else 0))
     }
+    kit.stagger(scaffold.content)
     return scaffold.page
 }

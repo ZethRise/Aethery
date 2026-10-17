@@ -24,6 +24,7 @@ fun buildScaffold(
     subtitle: String?,
     onBack: () -> Unit,
     bottomBar: View? = null,
+    scrollable: Boolean = true,
 ): Scaffold {
     val density = context.resources.displayMetrics.density
     fun dp(value: Int) = (value * density).roundToInt()
@@ -57,12 +58,16 @@ fun buildScaffold(
             bottomMargin = dp(20)
         })
     }
-    page.addView(ScrollView(context).apply {
-        isFillViewport = true
-        isVerticalScrollBarEnabled = false
-        overScrollMode = View.OVER_SCROLL_NEVER
-        addView(content, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-    }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    if (scrollable) {
+        page.addView(ScrollView(context).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(content, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    } else {
+        page.addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    }
     if (bottomBar != null) {
         bottomBar.setBackgroundColor(HaloColors.withAlpha(palette.skyBottom, 0.94f))
         page.addView(bottomBar, FrameLayout.LayoutParams(
