@@ -2034,11 +2034,11 @@ class MainActivity : Activity() {
     }
 
     private fun showConnecting(detail: String? = null) {
-        showConnectionProgress("Connecting", detail ?: "Starting ${selectedProtocol.label} tunnel")
+        showConnectionProgress("Connecting", detail ?: "Starting ${methodName()}")
     }
 
     private fun showStarting() {
-        showConnectionProgress("Starting", "Preparing ${selectedProtocol.label} tunnel")
+        showConnectionProgress("Starting", "Preparing ${methodName()}")
     }
 
     private fun showScanning() {
@@ -2065,7 +2065,7 @@ class MainActivity : Activity() {
         connectionControl.state = visualState
         connectionTitle.setTextColor(connected)
         connectionTitle.text = "Protected"
-        connectionDetail.text = if (restored) "${selectedProtocol.label} tunnel recovered" else "${selectedProtocol.label} tunnel is active"
+        connectionDetail.text = if (restored) "${methodName()} recovered" else "${methodName()} is active"
         if (!restored) {
             latencyGraph.setLabel("Tap to ping")
         }
@@ -2234,6 +2234,12 @@ class MainActivity : Activity() {
             .getString(CONNECTION_TYPE, ConnectionType.VPN.name)
             ?.let { name -> ConnectionType.entries.firstOrNull { it.name == name } }
             ?: ConnectionType.VPN
+
+    /** What carries the traffic, for the status line: Tor or Psiphon when one is alone, else the method. */
+    private fun methodName(): String = when {
+        carrier().alone -> carrier().label.removeSuffix(" alone")
+        else -> "${selectedProtocol.label} tunnel"
+    }
 
     private fun carrier(): Carrier = Carrier.fromName(preferences().getString(CARRIER, null))
 
