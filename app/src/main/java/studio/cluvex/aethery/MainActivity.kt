@@ -18,6 +18,7 @@ import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.widget.ImageView.ScaleType
+import studio.cluvex.aethery.ui.CountryCode
 import studio.cluvex.aethery.ui.EditorField
 import studio.cluvex.aethery.ui.HaloColors
 import studio.cluvex.aethery.ui.HaloKit
@@ -656,7 +657,9 @@ class MainActivity : Activity() {
                     } }.toMap()
                     val ip = values["ip"] ?: body.takeIf { it.matches(IP_ADDRESS) }.orEmpty()
                     check(ip.isNotBlank()) { "IP unavailable" }
-                    return ip to values["loc"].orEmpty()
+                    // Cloudflare calls a Tor exit "T1", which has no flag; a geolocation service is asked instead.
+                    val country = CountryCode.of(values["loc"]) ?: lookupCountry(ip)
+                    return ip to country.orEmpty()
                 } finally {
                     connection.disconnect()
                 }
@@ -666,6 +669,28 @@ class MainActivity : Activity() {
         }
         assignedVpnIp.takeIf { it.isNotBlank() && !IpAddresses.isInternal(it) }?.let { return it to "" }
         throw failure ?: IllegalStateException("IP unavailable")
+    }
+
+    /** The country of [ip] from a geolocation service, asked the way the rest of the app asks: through the tunnel. */
+    private fun lookupCountry(ip: String): String? {
+        for (url in listOf("https://api.country.is/$ip", "https://ipwho.is/$ip", "https://ipapi.co/$ip/country/")) {
+            try {
+                val connection = openTunnelConnection(url)
+                try {
+                    connection.connectTimeout = IP_TIMEOUT_MS
+                    connection.readTimeout = IP_TIMEOUT_MS
+                    connection.requestMethod = "GET"
+                    if (connection.responseCode !in 200..299) continue
+                    val body = connection.inputStream.bufferedReader().use { it.readText().take(2048) }
+                    CountryCode.fromBody(body)?.let { return it }
+                } finally {
+                    connection.disconnect()
+                }
+            } catch (_: Throwable) {
+                // The next service.
+            }
+        }
+        return null
     }
 
     private fun startIpRefreshAnimation() {
