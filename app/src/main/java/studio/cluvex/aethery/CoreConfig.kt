@@ -65,6 +65,7 @@ object CoreConfig {
             putOpt("fragment_size", text("fragment_size").ifBlank { null })
             putOpt("fragment_delay", text("fragment_delay").ifBlank { null })
             text("wg_keepalive").toIntOrNull()?.takeIf { it > 0 }?.let { put("keepalive", it) }
+            HandshakeOptions.options({ text(it) }, { prefs.getBoolean(it, false) }).forEach { (key, value) -> put(key, value) }
             val carrier = Carrier.fromName(text("carrier", "direct"))
             // Tor's and Psiphon's second proxies must not sit on the HTTP CONNECT port (1820).
             carrier.tor?.let {

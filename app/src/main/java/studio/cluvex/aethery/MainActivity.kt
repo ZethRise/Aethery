@@ -1055,6 +1055,12 @@ class MainActivity : Activity() {
         page.block("Carrier", listOf(carrierRow.view, torCountry.view, torBridges.view, psiphonRegion.view), top = 4,
             note = "Tor and Psiphon can take a minute to start. The alone modes work in proxy mode only.")
 
+        val apiAddress = textPrefRow("api_address", "API address", "Where the calls that register a key go: an IP or a name, with a port if it is not 443. Blank lets Aethery choose.", "162.159.137.105", ADDRESS_PATTERN, "Automatic")
+        val apiSni = textPrefRow("api_sni", "API server name", "The name those calls send in the handshake. Cloudflare refuses a call whose server name and host differ. Blank follows the host.", "api.cloudflareclient.com", NAME_PATTERN, "Automatic")
+        val apiHost = textPrefRow("api_host", "API host", "The HTTP host of those calls. Blank lets Aethery try the usual names in turn.", "api.cloudflareclient.com", NAME_PATTERN, "Automatic")
+        page.block("Registration", listOf(apiAddress.view, apiSni.view, apiHost.view),
+            note = "For a network that blocks Cloudflare's registration API. Only used when Aethery makes a new identity.")
+
         val obfuscation = valueRow("Obfuscation", { obfuscationProfile().label }) { chooseObfuscation(it) }
         val advanced = valueRow("Advanced obfuscation", { advancedObfuscationSummary() }) { editAdvancedObfuscation(it) }
         page.block("Connection shaping", listOf(obfuscation.view, advanced.view))
@@ -1078,7 +1084,12 @@ class MainActivity : Activity() {
         val grease = kit.switchRow("Leave out GREASE", "Drop the random padding values browsers add to a handshake", preferences().getBoolean(DISABLE_GREASE, false)) {
             preferences().edit().putBoolean(DISABLE_GREASE, it).apply()
         }
-        page.block("Handshake", listOf(tls.view, ech.view, grease.view))
+        val masqueSni = textPrefRow("masque_sni", "MASQUE server name", "The name MASQUE handshakes put in their ClientHello. Blank sends www.cloudflare.com.", "www.cloudflare.com", NAME_PATTERN, "Default")
+        val verify = kit.switchRow("Verify gateway certificate", "Hold the MASQUE gateway to the certificates Aethery carries", preferences().getBoolean("tls_verify", false)) {
+            preferences().edit().putBoolean("tls_verify", it).apply()
+        }
+        val advancedTls = kit.row("Advanced TLS", "Cipher suites, key shares, extensions and padding") { openTlsAdvancedScreen() }
+        page.block("Handshake", listOf(tls.view, ech.view, masqueSni.view, verify.view, grease.view, advancedTls.view))
 
         val fallback = kit.switchRow("HTTP/3 to HTTP/2 fallback", "Fall back when QUIC is blocked", h3H2Fallback()) {
             preferences().edit().putBoolean(H3_H2_FALLBACK, it).apply()
@@ -1160,6 +1171,85 @@ class MainActivity : Activity() {
             },
             onSaved = onChanged,
         ) { values -> preferences().edit().putString(key, values[0].lowercase()).apply() }
+    }
+
+    private fun textPrefRow(
+        key: String,
+        title: String,
+        hint: String,
+        example: String,
+        pattern: Regex?,
+        blankLabel: String,
+    ): HaloKit.Row = valueRow(title, { preferences().getString(key, "").orEmpty().ifBlank { blankLabel } }) { onChanged ->
+        val field = settingsField(preferences().getString(key, "").orEmpty(), example)
+        showTextSettingsSheet(
+            title, hint,
+            listOf("Value" to field),
+            validator = { values ->
+                if (values[0].isBlank() || pattern == null || pattern.matches(values[0])) null else 0 to "That does not look right"
+            },
+            onSaved = onChanged,
+        ) { values -> preferences().edit().putString(key, values[0]).apply() }
+    }
+
+    private fun choicePrefRow(
+        key: String,
+        title: String,
+        subtitle: String,
+        options: List<Triple<String, String, String>>,
+    ): HaloKit.Row = valueRow(title, { options.firstOrNull { it.first == (preferences().getString(key, "") ?: "") }?.second ?: options.first().second }) { onChanged ->
+        showChoiceSheet(
+            title = title,
+            subtitle = subtitle,
+            options = options,
+            selected = options.firstOrNull { it.first == (preferences().getString(key, "") ?: "") } ?: options.first(),
+            label = { it.second },
+            description = { it.third },
+        ) { chosen ->
+            preferences().edit().putString(key, chosen.first).apply()
+            onChanged()
+        }
+    }
+
+    private fun switchPref(key: String, title: String, subtitle: String): HaloKit.Row =
+        kit.switchRow(title, subtitle, preferences().getBoolean(key, false)) {
+            preferences().edit().putBoolean(key, it).apply()
+        }
+
+    private fun openTlsAdvancedScreen() {
+        val page = newPage("Advanced TLS", "Shape the handshake to look like a client your network lets through. Applied on your next connection.")
+        val list = Regex("[A-Za-z0-9_.:+-]+")
+        val ciphers = textPrefRow("tls_ciphers", "TLS 1.2 cipher suites", "BoringSSL names separated by colons. Blank uses Chrome's.", "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256", list, "Default")
+        val ciphers13 = textPrefRow("tls13_ciphers", "TLS 1.3 cipher suites", "Standard names separated by colons, in order. Blank uses Chrome's order.", "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256", list, "Default")
+        val groups = textPrefRow("tls_groups", "Key exchange groups", "In order, separated by colons. Replaces the TLS fingerprint choice when set.", "P-256:X25519:P-384", list, "Default")
+        val shares = textPrefRow("tls_key_shares", "Key shares", "The groups that get a key share, each one of the groups above.", "P-256:X25519", list, "Default")
+        val sigalgs = textPrefRow("tls_sigalgs", "Signature algorithms", "BoringSSL names separated by colons.", "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256", list, "Default")
+        page.block("Lists", listOf(ciphers.view, ciphers13.view, groups.view, shares.view, sigalgs.view), top = 4)
+
+        val compression = choicePrefRow("tls_cert_compression", "Certificate compression", "Which compressed certificates the handshake accepts", listOf(
+            Triple("", "None", "Offer no certificate compression"),
+            Triple("brotli", "Brotli", "As Chrome offers it"),
+            Triple("zlib", "Zlib", "The older scheme"),
+            Triple("zstd", "Zstd", "A newer, faster scheme"),
+        ))
+        val alps = choicePrefRow("tls_alps", "ALPS", "Application settings in the handshake, for HTTP/2 and HTTP/3", listOf(
+            Triple("", "None", "Do not offer ALPS"),
+            Triple("new", "New", "The codepoint Chrome sends now"),
+            Triple("old", "Old", "The codepoint Chrome 120 sent"),
+        ))
+        val padding = textPrefRow("tls_server_padding", "Server padding", "Bytes of padding asked of the server, 0 to 65535. Chrome asks 6000.", "6000", Regex("\\d{1,5}"), "None")
+        val anchors = textPrefRow("tls_trust_anchors", "Trust anchor IDs", "Dotted IDs separated by colons, in order.", "11129.9.1:11129.9.4", list, "None")
+        page.block("Extensions", listOf(compression.view, alps.view, padding.view, anchors.view))
+
+        page.block("Fingerprint switches", listOf(
+            switchPref("enable_grease_sigalgs", "GREASE signature algorithms", "Put a random value first among the signature algorithms, as Chrome does").view,
+            switchPref("enable_ech_grease", "GREASE encrypted hello", "Send a decoy ECH extension when no real key is offered").view,
+            switchPref("disable_ocsp_stapling", "Leave out OCSP", "Drop the certificate status request Chrome sends").view,
+            switchPref("disable_sct", "Leave out SCT", "Drop the certificate timestamp request Chrome sends").view,
+            switchPref("disable_session_ticket", "Leave out session tickets", "Drop the session ticket extension Chrome sends").view,
+            switchPref("disable_extension_permutation", "Keep one extension order", "Chrome reorders extensions on every handshake; this stops that").view,
+        ))
+        showPage(page)
     }
 
     private fun exitLocationSummary(): String =
@@ -2487,6 +2577,8 @@ class MainActivity : Activity() {
         const val ZERO_TRUST_TOKEN = "zero_trust_token"
         const val ZERO_TRUST_GATEWAY = "zero_trust_gateway"
         const val CARRIER = "carrier"
+        val NAME_PATTERN = Regex("[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?")
+        val ADDRESS_PATTERN = Regex("[A-Za-z0-9.:\\[\\]-]+")
         const val TOR_COUNTRY = "tor_country"
         const val TOR_BRIDGES = "tor_bridges"
         const val PSIPHON_REGION = "psiphon_region"
