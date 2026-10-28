@@ -22,6 +22,9 @@ pub const MASQUE_CIDRS_V4: &[&str] = &[
     "162.159.204.0/24",
     "162.159.197.0/24",
     "162.159.198.0/24",
+    // Where Cloudflare serves MASQUE to WARP+, as 162.159.198.0/24 to WARP and
+    // 162.159.197.0/24 to Zero Trust.
+    "162.159.199.0/24",
     "172.65.251.0/24",
     "188.114.96.0/24",
     "188.114.97.0/24",
@@ -40,6 +43,313 @@ pub const MASQUE_SEEDS: &[&str] = &[
     "162.159.198.2",
     "162.159.198.1",
     "162.159.193.1",
+    // The MASQUE gateways of WARP+ and of Zero Trust, as 162.159.198.2 is WARP's.
+    "162.159.199.2",
+    "162.159.197.2",
+];
+
+/// The addresses the IPv4 scan tries without a team, each on every MASQUE port: those of
+/// 162.159.198.0/24 and then those of 162.159.199.0/24 that completed a TCP handshake on port
+/// 443, 75 and 222 of their 256, each range fastest first as measured. With a team, the scan
+/// tries `MASQUE_SEEDS` and sweeps the ranges instead.
+pub const MASQUE_GATEWAYS_V4: &[&str] = &[
+    "162.159.198.183",
+    "162.159.198.206",
+    "162.159.198.226",
+    "162.159.198.125",
+    "162.159.198.72",
+    "162.159.198.89",
+    "162.159.198.198",
+    "162.159.198.131",
+    "162.159.198.245",
+    "162.159.198.114",
+    "162.159.198.31",
+    "162.159.198.60",
+    "162.159.198.4",
+    "162.159.198.65",
+    "162.159.198.33",
+    "162.159.198.86",
+    "162.159.198.244",
+    "162.159.198.123",
+    "162.159.198.233",
+    "162.159.198.69",
+    "162.159.198.255",
+    "162.159.198.176",
+    "162.159.198.186",
+    "162.159.198.63",
+    "162.159.198.37",
+    "162.159.198.169",
+    "162.159.198.147",
+    "162.159.198.120",
+    "162.159.198.135",
+    "162.159.198.54",
+    "162.159.198.234",
+    "162.159.198.109",
+    "162.159.198.175",
+    "162.159.198.231",
+    "162.159.198.219",
+    "162.159.198.216",
+    "162.159.198.64",
+    "162.159.198.250",
+    "162.159.198.184",
+    "162.159.198.74",
+    "162.159.198.241",
+    "162.159.198.213",
+    "162.159.198.232",
+    "162.159.198.75",
+    "162.159.198.77",
+    "162.159.198.172",
+    "162.159.198.145",
+    "162.159.198.36",
+    "162.159.198.124",
+    "162.159.198.80",
+    "162.159.198.192",
+    "162.159.198.82",
+    "162.159.198.137",
+    "162.159.198.141",
+    "162.159.198.48",
+    "162.159.198.71",
+    "162.159.198.227",
+    "162.159.198.207",
+    "162.159.198.49",
+    "162.159.198.178",
+    "162.159.198.197",
+    "162.159.198.203",
+    "162.159.198.204",
+    "162.159.198.205",
+    "162.159.198.195",
+    "162.159.198.230",
+    "162.159.198.202",
+    "162.159.198.53",
+    "162.159.198.79",
+    "162.159.198.58",
+    "162.159.198.35",
+    "162.159.198.239",
+    "162.159.198.116",
+    "162.159.198.127",
+    "162.159.198.240",
+    "162.159.199.87",
+    "162.159.199.117",
+    "162.159.199.48",
+    "162.159.199.217",
+    "162.159.199.65",
+    "162.159.199.198",
+    "162.159.199.47",
+    "162.159.199.103",
+    "162.159.199.133",
+    "162.159.199.151",
+    "162.159.199.195",
+    "162.159.199.73",
+    "162.159.199.156",
+    "162.159.199.247",
+    "162.159.199.127",
+    "162.159.199.158",
+    "162.159.199.208",
+    "162.159.199.82",
+    "162.159.199.213",
+    "162.159.199.70",
+    "162.159.199.243",
+    "162.159.199.204",
+    "162.159.199.154",
+    "162.159.199.240",
+    "162.159.199.236",
+    "162.159.199.126",
+    "162.159.199.186",
+    "162.159.199.188",
+    "162.159.199.187",
+    "162.159.199.124",
+    "162.159.199.43",
+    "162.159.199.102",
+    "162.159.199.60",
+    "162.159.199.219",
+    "162.159.199.163",
+    "162.159.199.193",
+    "162.159.199.135",
+    "162.159.199.110",
+    "162.159.199.94",
+    "162.159.199.136",
+    "162.159.199.233",
+    "162.159.199.77",
+    "162.159.199.241",
+    "162.159.199.223",
+    "162.159.199.120",
+    "162.159.199.38",
+    "162.159.199.75",
+    "162.159.199.57",
+    "162.159.199.118",
+    "162.159.199.50",
+    "162.159.199.76",
+    "162.159.199.58",
+    "162.159.199.145",
+    "162.159.199.81",
+    "162.159.199.54",
+    "162.159.199.234",
+    "162.159.199.157",
+    "162.159.199.121",
+    "162.159.199.246",
+    "162.159.199.182",
+    "162.159.199.1",
+    "162.159.199.251",
+    "162.159.199.35",
+    "162.159.199.179",
+    "162.159.199.147",
+    "162.159.199.137",
+    "162.159.199.49",
+    "162.159.199.138",
+    "162.159.199.116",
+    "162.159.199.172",
+    "162.159.199.42",
+    "162.159.199.160",
+    "162.159.199.88",
+    "162.159.199.212",
+    "162.159.199.174",
+    "162.159.199.79",
+    "162.159.199.105",
+    "162.159.199.130",
+    "162.159.199.252",
+    "162.159.199.238",
+    "162.159.199.248",
+    "162.159.199.125",
+    "162.159.199.62",
+    "162.159.199.34",
+    "162.159.199.239",
+    "162.159.199.84",
+    "162.159.199.104",
+    "162.159.199.196",
+    "162.159.199.72",
+    "162.159.199.97",
+    "162.159.199.74",
+    "162.159.199.229",
+    "162.159.199.159",
+    "162.159.199.192",
+    "162.159.199.201",
+    "162.159.199.44",
+    "162.159.199.222",
+    "162.159.199.142",
+    "162.159.199.78",
+    "162.159.199.235",
+    "162.159.199.168",
+    "162.159.199.162",
+    "162.159.199.39",
+    "162.159.199.209",
+    "162.159.199.111",
+    "162.159.199.139",
+    "162.159.199.113",
+    "162.159.199.215",
+    "162.159.199.245",
+    "162.159.199.86",
+    "162.159.199.46",
+    "162.159.199.180",
+    "162.159.199.66",
+    "162.159.199.173",
+    "162.159.199.53",
+    "162.159.199.216",
+    "162.159.199.237",
+    "162.159.199.114",
+    "162.159.199.109",
+    "162.159.199.214",
+    "162.159.199.190",
+    "162.159.199.106",
+    "162.159.199.100",
+    "162.159.199.92",
+    "162.159.199.96",
+    "162.159.199.61",
+    "162.159.199.108",
+    "162.159.199.64",
+    "162.159.199.101",
+    "162.159.199.140",
+    "162.159.199.123",
+    "162.159.199.112",
+    "162.159.199.199",
+    "162.159.199.225",
+    "162.159.199.83",
+    "162.159.199.69",
+    "162.159.199.90",
+    "162.159.199.153",
+    "162.159.199.115",
+    "162.159.199.149",
+    "162.159.199.36",
+    "162.159.199.224",
+    "162.159.199.155",
+    "162.159.199.37",
+    "162.159.199.52",
+    "162.159.199.63",
+    "162.159.199.164",
+    "162.159.199.253",
+    "162.159.199.141",
+    "162.159.199.242",
+    "162.159.199.89",
+    "162.159.199.67",
+    "162.159.199.185",
+    "162.159.199.98",
+    "162.159.199.167",
+    "162.159.199.0",
+    "162.159.199.176",
+    "162.159.199.189",
+    "162.159.199.218",
+    "162.159.199.211",
+    "162.159.199.221",
+    "162.159.199.220",
+    "162.159.199.231",
+    "162.159.199.230",
+    "162.159.199.206",
+    "162.159.199.175",
+    "162.159.199.184",
+    "162.159.199.203",
+    "162.159.199.255",
+    "162.159.199.171",
+    "162.159.199.45",
+    "162.159.199.228",
+    "162.159.199.177",
+    "162.159.199.165",
+    "162.159.199.122",
+    "162.159.199.99",
+    "162.159.199.183",
+    "162.159.199.161",
+    "162.159.199.144",
+    "162.159.199.119",
+    "162.159.199.128",
+    "162.159.199.146",
+    "162.159.199.148",
+    "162.159.199.68",
+    "162.159.199.56",
+    "162.159.199.95",
+    "162.159.199.55",
+    "162.159.199.197",
+    "162.159.199.41",
+    "162.159.199.194",
+    "162.159.199.226",
+    "162.159.199.134",
+    "162.159.199.249",
+    "162.159.199.232",
+    "162.159.199.227",
+    "162.159.199.191",
+    "162.159.199.150",
+    "162.159.199.170",
+    "162.159.199.202",
+    "162.159.199.169",
+    "162.159.199.207",
+    "162.159.199.166",
+    "162.159.199.250",
+    "162.159.199.210",
+    "162.159.199.181",
+    "162.159.199.132",
+    "162.159.199.129",
+    "162.159.199.107",
+    "162.159.199.71",
+    "162.159.199.152",
+    "162.159.199.91",
+    "162.159.199.131",
+    "162.159.199.205",
+    "162.159.199.85",
+    "162.159.199.59",
+    "162.159.199.51",
+    "162.159.199.143",
+    "162.159.199.244",
+    "162.159.199.254",
+    "162.159.199.178",
+    "162.159.199.200",
+    "162.159.199.93",
 ];
 
 pub const MASQUE_VERIFIED_GATEWAYS: &[&str] = &[
@@ -57,6 +367,8 @@ pub const MASQUE_CIDRS_V6: &[&str] = &[
     "2606:4700:d0::/48",
     "2606:4700:102::/48",
     "2606:4700:d1::/48",
+    // WARP's MASQUE over IPv6, where the WARP client's own gateway is 2606:4700:103::1.
+    "2606:4700:103::/48",
 ];
 
 pub const MASQUE_ZT_CIDRS_V4: &[&str] = &["162.159.197.0/24"];
@@ -96,12 +408,25 @@ pub fn masque_cidrs_v6() -> Vec<&'static str> {
     prioritize(MASQUE_CIDRS_V6, MASQUE_ZT_CIDRS_V6)
 }
 
+/// The IPv6 gateways tried first. The scan's other IPv6 addresses carry an IPv4 address of the
+/// ranges in their last 32 bits, so 2606:4700:103::1, the WARP client's own MASQUE gateway,
+/// is here or nowhere.
 pub const MASQUE_SEEDS_V6: &[&str] = &[
+    "2606:4700:103::1",
     "2606:4700:d0::a29f:c602",
     "2606:4700:d1::a29f:c602",
     "2606:4700:d0::a29f:c601",
     "2606:4700:d0::a29f:c001",
 ];
+
+/// The IPv6 gateway the scan tries first without a team, on every MASQUE port: WARP's own, the
+/// one of `MASQUE_SEEDS_V6` in `MASQUE_WARP_CIDRS_V6`.
+pub const MASQUE_GATEWAYS_V6: &[&str] = &["2606:4700:103::1"];
+
+/// The IPv6 range the scan samples without a team: regular WARP's MASQUE connects on
+/// 2606:4700:103::/48 and on no other range of `MASQUE_CIDRS_V6`. With a team, the scan tries
+/// `MASQUE_SEEDS_V6` and samples every range instead.
+pub const MASQUE_WARP_CIDRS_V6: &[&str] = &["2606:4700:103::/48"];
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeResult {
@@ -264,6 +589,16 @@ pub async fn host_has_ipv6() -> bool {
 }
 
 pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<ProbeResult> {
+    hunt_best_gateway_avoiding(probe, mode, &HashSet::new()).await
+}
+
+/// `hunt_best_gateway`, leaving out the addresses in `avoid` on every port: gateways a run gave
+/// up on for a while.
+pub async fn hunt_best_gateway_avoiding(
+    probe: &MasqueProbe,
+    mode: ScanMode,
+    avoid: &HashSet<IpAddr>,
+) -> Result<ProbeResult> {
     let mut st = mode.strategy();
     st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
     let mut effective_ip = probe.ip;
@@ -290,8 +625,16 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
         ));
     }
     let timeout = st.per_probe_timeout;
-
-    let candidates = build_candidates(&st, &probe.ports, effective_ip);
+    let candidates = leave_out(
+        build_candidates(&st, &probe.ports, effective_ip, zero_trust_mode()),
+        avoid,
+    );
+    if !avoid.is_empty() {
+        log::info!(
+            "[*] leaving {} gateway(s) out of this scan for now",
+            avoid.len()
+        );
+    }
 
     log::info!(
         "[*] scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?}",
@@ -413,6 +756,14 @@ pub async fn verify_cached_gateways(
     None
 }
 
+/// `candidates` without the addresses in `avoid`, whatever their port.
+fn leave_out(candidates: Vec<(IpAddr, u16)>, avoid: &HashSet<IpAddr>) -> Vec<(IpAddr, u16)> {
+    candidates
+        .into_iter()
+        .filter(|(ip, _)| !avoid.contains(ip))
+        .collect()
+}
+
 async fn verify_one(
     probe: &MasqueProbe,
     ip: IpAddr,
@@ -497,16 +848,26 @@ async fn verify_one(
     }
 }
 
-fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
+fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan, team: bool) -> Vec<(IpAddr, u16)> {
     let primary = ports.first().copied().unwrap_or(443);
     let mut out: Vec<(IpAddr, u16)> = Vec::new();
     let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
 
-    let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
-    let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    // Regular WARP's IPv4 scan is its gateways alone; a team's is the seeds, then the ranges.
+    let (v4_seeds, ranges) = if team {
+        (MASQUE_SEEDS, masque_cidrs_v4())
+    } else {
+        (MASQUE_GATEWAYS_V4, Vec::new())
+    };
+    // Over IPv6, regular WARP's is its gateway, then its one range; a team's, the seeds, then
+    // every range.
+    let (v6_seeds, ranges6) = if team {
+        (MASQUE_SEEDS_V6, masque_cidrs_v6())
+    } else {
+        (MASQUE_GATEWAYS_V6, MASQUE_WARP_CIDRS_V6.to_vec())
+    };
+    let seeds: Vec<Ipv4Addr> = v4_seeds.iter().filter_map(|s| s.parse().ok()).collect();
+    let seeds6: Vec<Ipv6Addr> = v6_seeds.iter().filter_map(|s| s.parse().ok()).collect();
 
     if ip.want_v4() {
         for a in &seeds {
@@ -514,7 +875,7 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
                 out.push((IpAddr::V4(*a), primary));
             }
         }
-        let cidr_hosts: Vec<Vec<Ipv4Addr>> = masque_cidrs_v4()
+        let cidr_hosts: Vec<Vec<Ipv4Addr>> = ranges
             .iter()
             .map(|c| {
                 if st.full_subnet {
@@ -547,7 +908,7 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         } else {
             st.sample_per_cidr
         };
-        let cidr6: Vec<Vec<Ipv6Addr>> = masque_cidrs_v6()
+        let cidr6: Vec<Vec<Ipv6Addr>> = ranges6
             .iter()
             .map(|c| sample_cidr_v6(c, per, MASQUE_CIDRS_V4))
             .collect();
@@ -685,9 +1046,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_gateway_left_out_is_probed_on_no_port() {
+        let left: IpAddr = "162.159.198.1".parse().unwrap();
+        let other: IpAddr = "162.159.198.2".parse().unwrap();
+        let avoid: HashSet<IpAddr> = [left].into_iter().collect();
+        assert_eq!(
+            leave_out(vec![(left, 443), (other, 443), (left, 4500)], &avoid),
+            vec![(other, 443)]
+        );
+        assert_eq!(
+            leave_out(vec![(left, 443)], &HashSet::new()),
+            vec![(left, 443)]
+        );
+    }
+
+    #[test]
     fn the_documented_zero_trust_masque_ingress_range_is_scanned() {
         assert!(MASQUE_CIDRS_V4.contains(&"162.159.197.0/24"));
         assert!(MASQUE_CIDRS_V6.contains(&"2606:4700:102::/48"));
+    }
+
+    #[test]
+    fn with_a_team_the_masque_gateways_of_warp_and_warp_plus_are_scanned() {
+        // WARP's MASQUE over IPv4 and IPv6, and WARP+'s, as the WARP client's own log of 2024
+        // and Xray's notes have them: 162.159.198.0/24 with 2606:4700:103::1, and
+        // 162.159.199.0/24, beside Zero Trust's 162.159.197.0/24.
+        assert!(MASQUE_CIDRS_V4.contains(&"162.159.198.0/24"));
+        assert!(MASQUE_CIDRS_V4.contains(&"162.159.199.0/24"));
+        assert!(MASQUE_CIDRS_V6.contains(&"2606:4700:103::/48"));
+        let st = ScanMode::Thorough.strategy();
+        let v4 = build_candidates(&st, MASQUE_PORTS, IpScan::V4, true);
+        for host in 1..=254u8 {
+            let ip = IpAddr::V4(Ipv4Addr::new(162, 159, 199, host));
+            assert!(v4.contains(&(ip, 443)), "{ip}");
+        }
+        // The gateways of WARP+ and Zero Trust on every port, as WARP's.
+        for gateway in ["162.159.199.2", "162.159.197.2", "162.159.198.2"] {
+            let ip: IpAddr = gateway.parse().expect("an address");
+            for &port in MASQUE_PORTS {
+                assert!(v4.contains(&(ip, port)), "{ip}:{port}");
+            }
+        }
+        // 2606:4700:103::1 first among the IPv6 ones, and on every port; the others of its range
+        // carry an IPv4 address of the ranges in their last 32 bits, which ::1 cannot be.
+        let v6 = build_candidates(&st, MASQUE_PORTS, IpScan::V6, true);
+        let gateway: IpAddr = "2606:4700:103::1".parse().expect("an address");
+        assert_eq!(v6.first(), Some(&(gateway, 443)));
+        for &port in MASQUE_PORTS {
+            assert!(v6.contains(&(gateway, port)), "{port}");
+        }
+        assert!(v6.iter().any(|(ip, _)| match ip {
+            IpAddr::V6(address) =>
+                address.segments()[..3] == [0x2606, 0x4700, 0x103] && *ip != gateway,
+            IpAddr::V4(_) => false,
+        }));
+    }
+
+    #[test]
+    fn without_a_team_the_ipv4_scan_tries_the_masque_gateways_alone_on_every_port() {
+        // In every mode: the gateways on the first port, in their order, then each of them on the
+        // other ports, and no other IPv4 address.
+        let gateways: Vec<IpAddr> = MASQUE_GATEWAYS_V4
+            .iter()
+            .map(|gateway| gateway.parse().expect("an address"))
+            .collect();
+        let (first, others) = MASQUE_PORTS.split_first().expect("a port");
+        let mut expected: Vec<(IpAddr, u16)> = gateways.iter().map(|ip| (*ip, *first)).collect();
+        for ip in &gateways {
+            for &port in others {
+                expected.push((*ip, port));
+            }
+        }
+        for mode in [
+            ScanMode::Turbo,
+            ScanMode::Balanced,
+            ScanMode::Thorough,
+            ScanMode::Verified,
+            ScanMode::Ironclad,
+        ] {
+            let v4 = build_candidates(&mode.strategy(), MASQUE_PORTS, IpScan::V4, false);
+            assert_eq!(v4, expected, "{}", mode.label());
+        }
+    }
+
+    #[test]
+    fn the_masque_gateways_are_distinct_addresses_of_162_159_198_and_199() {
+        let mut seen = HashSet::new();
+        for gateway in MASQUE_GATEWAYS_V4 {
+            let address: Ipv4Addr = gateway.parse().expect("an address");
+            assert!(
+                matches!(address.octets(), [162, 159, 198 | 199, _]),
+                "{gateway}"
+            );
+            assert!(seen.insert(address), "{gateway} is listed twice");
+        }
+    }
+
+    #[test]
+    fn without_a_team_the_ipv6_scan_tries_warps_range_alone() {
+        // 2606:4700:103::1 first and on every port, then addresses of 2606:4700:103::/48 alone,
+        // on the first port.
+        let (first, _) = MASQUE_PORTS.split_first().expect("a port");
+        let gateway: IpAddr = "2606:4700:103::1".parse().expect("an address");
+        let st = ScanMode::Thorough.strategy();
+        let v6 = build_candidates(&st, MASQUE_PORTS, IpScan::V6, false);
+        assert_eq!(v6.first(), Some(&(gateway, *first)));
+        for &port in MASQUE_PORTS {
+            assert!(v6.contains(&(gateway, port)), "{port}");
+        }
+        assert!(
+            v6.len() > MASQUE_PORTS.len(),
+            "the range is sampled as well"
+        );
+        for (ip, port) in &v6 {
+            assert!(
+                matches!(ip, IpAddr::V6(a) if a.segments()[..3] == [0x2606, 0x4700, 0x103]),
+                "{ip}"
+            );
+            assert!(*ip == gateway || port == first, "{ip}:{port}");
+        }
     }
 
     #[test]
@@ -766,7 +1243,8 @@ mod tests {
         rand::rng().fill(&mut scid[..]);
         let scid = quiche::ConnectionId::from_ref(&scid);
 
-        let sni = crate::consts::CONNECT_SNI;
+        // The name the core's MASQUE handshakes send.
+        let sni = quic::default_sni();
         let mut conn = quiche::connect(Some(sni), &scid, local, peer, &mut config).ok()?;
 
         let mut out = [0u8; 1350];
