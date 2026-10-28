@@ -15,7 +15,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-6c5ce7?style=for-the-badge" alt="AGPL-3.0"></a>
 </p>
 
-> **v1.0.0** — Aethery is an Android app around the [Aether core](https://github.com/CluvexStudio/Aether). It is not a replacement or fork of Aether's networking engine.
+> **v2.0.0** — Aethery is an Android app around the [Aether core](https://github.com/CluvexStudio/Aether). It is not a replacement or fork of Aether's networking engine.
 
 ## What Aethery does
 
@@ -109,10 +109,10 @@ app/build/outputs/apk/debug/app-armeabi-v7a-debug.apk
 
 The [Android release workflow](.gitea/workflows/android-release.yml) runs manually and builds signed release APKs for `arm64-v8a` and `armeabi-v7a`. It uploads direct `.apk` files to a **draft** Gitea Release. See the [release guide](docs/release.md).
 
-To prepare v1.0.0:
+To prepare v2.0.0:
 
 ```text
-Open Gitea Actions, select Build Android APKs, choose Run workflow, and enter v1.0.0 as the release tag.
+Open Gitea Actions, select Build Android APKs, choose Run workflow, and enter v2.0.0 as the release tag.
 ```
 
 Review the draft assets and release note in Gitea, then publish the release when ready.
