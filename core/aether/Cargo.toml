@@ -45,6 +45,9 @@ ipnet = "2"
 parking_lot = "0.12"
 socket2 = { version = "0.6.4", features = ["all"] }
 h2 = "0.4.15"
+# The userspace TCP/IP stack behind the VPN mode of Tor and Psiphon alone: it terminates the
+# connections of the VPN interface so each can be sent through their proxy.
+ipstack = "1.0"
 http = "1"
 bytes = "1"
 tokio-boring = "5.3"
@@ -70,3 +73,6 @@ lto = "fat"
 codegen-units = 1
 panic = "unwind"
 strip = true
+
+[dev-dependencies]
+etherparse = "0.20"

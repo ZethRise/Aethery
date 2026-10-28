@@ -10,7 +10,6 @@ class CarrierTest {
     @Test fun directAsksForNothing() {
         assertNull(Carrier.DIRECT.tor)
         assertNull(Carrier.DIRECT.psiphon)
-        assertFalse(Carrier.DIRECT.proxyOnly)
     }
 
     @Test fun eachNameMapsToItsCoreMode() {
@@ -24,11 +23,12 @@ class CarrierTest {
         assertNull(Carrier.PSIPHON.tor)
     }
 
-    @Test fun onlyTheAloneModesNeedProxyMode() {
-        assertTrue(Carrier.TOR_ALONE.proxyOnly)
-        assertTrue(Carrier.PSIPHON_ALONE.proxyOnly)
-        assertFalse(Carrier.TOR.proxyOnly)
-        assertFalse(Carrier.PSIPHON_CHAIN.proxyOnly)
+    @Test fun onlyTheAloneModesReplaceTheTunnel() {
+        assertTrue(Carrier.TOR_ALONE.alone)
+        assertTrue(Carrier.PSIPHON_ALONE.alone)
+        assertFalse(Carrier.TOR.alone)
+        assertFalse(Carrier.PSIPHON_CHAIN.alone)
+        assertFalse(Carrier.DIRECT.alone)
     }
 
     @Test fun savedNamesRoundTripAndUnknownOnesAreDirect() {

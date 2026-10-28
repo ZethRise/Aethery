@@ -539,7 +539,7 @@ unsafe fn aether_start_json_inner(json: *const c_char, tun_fd: Option<i32>) -> i
             }
         };
 
-        runtime.block_on(async {
+        let code = runtime.block_on(async {
             tokio::select! {
                 result = crate::start(options) => match result {
                     Ok(()) => 0,
@@ -550,7 +550,11 @@ unsafe fn aether_start_json_inner(json: *const c_char, tun_fd: Option<i32>) -> i
                 },
                 _ = wait_for_stop() => 0,
             }
-        })
+        });
+        // The VPN interface's connection handlers end themselves in the live runtime; the runtime
+        // is let go only once they have, or the stack's streams would hang its shutdown.
+        runtime.block_on(crate::tun2socks::settle());
+        code
     }));
 
     match result {

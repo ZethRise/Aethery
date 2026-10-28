@@ -697,7 +697,8 @@ class MainActivity : Activity() {
     }
 
     private fun openTunnelConnection(url: String): HttpURLConnection =
-        (if (connectionType() == ConnectionType.PROXY && NativeCore.isRunning()) {
+        // With Tor or Psiphon alone the app is off the VPN interface, so its own checks use their proxy.
+        (if ((connectionType() == ConnectionType.PROXY || carrier().alone) && NativeCore.isRunning()) {
             URL(url).openConnection(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort())))
         } else {
             URL(url).openConnection()
@@ -941,8 +942,6 @@ class MainActivity : Activity() {
             description = { it.description },
         ) { type ->
             preferences().edit().putString(CONNECTION_TYPE, type.name).apply()
-            // Tor or Psiphon alone has no VPN, so asking for one puts the plain tunnel back.
-            if (type == ConnectionType.VPN && carrier().proxyOnly) preferences().edit().putString(CARRIER, Carrier.DIRECT.storedName).apply()
             if (type == ConnectionType.VPN && selectedProtocol.proxyOnly) updateConnectionMode(Protocol.MASQUE)
             connectionTypeValue.text = routeSummary()
             onChanged(type)
@@ -1053,7 +1052,7 @@ class MainActivity : Activity() {
         val torBridges = valueRow("Tor bridges", { torBridgesSummary() }) { chooseTorBridges(it) }
         val psiphonRegion = valueRow("Psiphon region", { preferences().getString(PSIPHON_REGION, "").orEmpty().ifBlank { "Any" } }) { editCarrierText(PSIPHON_REGION, "Psiphon region", "Two-letter code, like de. Blank lets Psiphon choose.", "de", it) }
         page.block("Carrier", listOf(carrierRow.view, torCountry.view, torBridges.view, psiphonRegion.view), top = 4,
-            note = "Tor and Psiphon can take a minute to start. The alone modes work in proxy mode only.")
+            note = "Tor and Psiphon can take a minute to start. The alone modes carry TCP and DNS only: UDP, such as calls and QUIC, cannot leave.")
 
         val apiAddress = textPrefRow("api_address", "API address", "Where the calls that register a key go: an IP or a name, with a port if it is not 443. Blank lets Aethery choose.", "162.159.137.105", ADDRESS_PATTERN, "Automatic")
         val apiSni = textPrefRow("api_sni", "API server name", "The name those calls send in the handshake. Cloudflare refuses a call whose server name and host differ. Blank follows the host.", "api.cloudflareclient.com", NAME_PATTERN, "Automatic")
@@ -1133,11 +1132,7 @@ class MainActivity : Activity() {
             label = { it.label },
             description = { it.description },
         ) { chosen ->
-            preferences().edit().apply {
-                putString(CARRIER, chosen.storedName)
-                // Tor or Psiphon alone has no VPN; the widgets and tile read this setting too.
-                if (chosen.proxyOnly) putString(CONNECTION_TYPE, ConnectionType.PROXY.name)
-            }.apply()
+            preferences().edit().putString(CARRIER, chosen.storedName).apply()
             connectionTypeValue.text = routeSummary()
             onChanged()
         }
@@ -2235,7 +2230,7 @@ class MainActivity : Activity() {
 
 
     private fun connectionType(): ConnectionType =
-        if (carrier().proxyOnly || selectedProtocol.proxyOnly) ConnectionType.PROXY else preferences()
+        if (selectedProtocol.proxyOnly) ConnectionType.PROXY else preferences()
             .getString(CONNECTION_TYPE, ConnectionType.VPN.name)
             ?.let { name -> ConnectionType.entries.firstOrNull { it.name == name } }
             ?: ConnectionType.VPN
@@ -2247,7 +2242,6 @@ class MainActivity : Activity() {
         val carrier = carrier()
         return when {
             carrier == Carrier.DIRECT -> connectionType().label
-            carrier.proxyOnly -> carrier.label
             else -> "${connectionType().label}, ${carrier.label.replaceFirstChar { it.lowercase() }}"
         }
     }

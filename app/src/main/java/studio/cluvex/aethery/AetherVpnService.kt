@@ -320,7 +320,7 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         .applyDns(config, addresses)
         .applyGatewayProxy(config, addresses)
         .applyLanAccess(addresses)
-        .applySplitTunneling()
+        .applySplitTunneling(aloneProxy = isAloneProxy(config))
 
     private fun promoteVpnRoutes() {
         if (routesPromoted || !vpnModeActive.get()) return
@@ -542,13 +542,25 @@ class AetherVpnService : VpnService(), NativeCore.CoreCallback {
         return builder.build()
     }
 
-    private fun Builder.applySplitTunneling(): Builder {
+    /**
+     * Tor or Psiphon alone: the core's own proxy is the only way out, and Tor's and Psiphon's
+     * connections to their networks are this app's. They have to stay off the VPN interface, or
+     * they would be sent back into the proxy that makes them.
+     */
+    private fun isAloneProxy(config: String): Boolean {
+        val json = JSONObject(config)
+        return json.optString("tor") == "only" || json.optString("psiphon") == "only"
+    }
+
+    private fun Builder.applySplitTunneling(aloneProxy: Boolean): Builder {
         val settings = SplitTunnelSettings(this@AetherVpnService)
         val mode = settings.mode()
         val packages = settings.packages()
 
+        // An "only these apps" list never holds this app unless it is added; the others leave it out.
+        if (aloneProxy && mode != SplitTunnelSettings.Mode.INCLUDE) addDisallowedApplication(packageName)
         if (mode == SplitTunnelSettings.Mode.ALL) return this
-        if (mode == SplitTunnelSettings.Mode.INCLUDE) {
+        if (mode == SplitTunnelSettings.Mode.INCLUDE && !aloneProxy) {
             addAllowedApplication(packageName)
         }
         if (packages.isEmpty()) {

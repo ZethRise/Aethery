@@ -226,7 +226,7 @@ pub async fn bind_twin(kind: &str, listen: SocketAddr) -> Option<TcpListener> {
     }
 }
 
-fn proxy_credentials() -> Option<(String, String)> {
+pub(crate) fn proxy_credentials() -> Option<(String, String)> {
     let user = std::env::var("AETHER_PROXY_USER").ok()?.trim().to_string();
     let pass = std::env::var("AETHER_PROXY_PASS").ok()?.trim().to_string();
     if user.is_empty() || pass.is_empty() {

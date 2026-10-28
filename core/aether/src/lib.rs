@@ -35,6 +35,7 @@ pub mod wireguard;
 pub mod zerotrust;
 pub mod platform;
 mod tun;
+mod tun2socks;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -4339,14 +4340,19 @@ pub async fn start(options: StartOptions) -> Result<()> {
     let (core_end, core_ended) = tokio::sync::mpsc::unbounded_channel::<AetherError>();
     let listeners = Listeners::bind(options.listen, core_end.clone()).await?;
 
-    // Tor or Psiphon alone is the whole tunnel: a proxy and nothing under it.
+    // Tor or Psiphon alone is the whole tunnel: a proxy and nothing under it. With a VPN interface
+    // the proxy is also what the interface's connections are sent through.
     if tor::mode() == tor::Mode::Only {
         let state = tor::state_dir(&options.config_path);
-        return tor::run_only(listeners.into_socks(), options.listen, state).await;
+        let proxy = socks::dialable(listeners.socks.local_addr().unwrap_or(options.listen));
+        let alone = tor::run_only(listeners.into_socks(), options.listen, state);
+        return alone_with_vpn(alone, options.tun_fd, proxy).await;
     }
     if psiphon::mode() == psiphon::Mode::Only {
         let state = psiphon::state_dir(&options.config_path);
-        return psiphon::run_only(listeners.into_socks(), options.listen, state).await;
+        let proxy = socks::dialable(listeners.socks.local_addr().unwrap_or(options.listen));
+        let alone = psiphon::run_only(listeners.into_socks(), options.listen, state);
+        return alone_with_vpn(alone, options.tun_fd, proxy).await;
     }
     if tor::mode() == tor::Mode::Reverse && psiphon::mode() == psiphon::Mode::Reverse {
         return Err(AetherError::Other(
@@ -4432,9 +4438,47 @@ pub async fn start(options: StartOptions) -> Result<()> {
     until_core_end(session, core_ended).await
 }
 
+/// The addresses of the VPN interface when Tor or Psiphon is alone: no identity is registered for
+/// it, so these are private addresses of its own.
+const ALONE_IPV4: &str = "10.98.0.2";
+const ALONE_IPV6: &str = "fd98:0:0:1::2";
+
+/// Runs Tor or Psiphon alone (`alone`, a proxy on `proxy`) and, when there is a VPN interface,
+/// sends the interface's connections through that proxy, until either ends.
+async fn alone_with_vpn(
+    alone: impl std::future::Future<Output = Result<()>>,
+    tun_fd: Option<i32>,
+    proxy: SocketAddr,
+) -> Result<()> {
+    let Some(fd) = tun_fd else {
+        return alone.await;
+    };
+    let upstream = tun2socks::Upstream {
+        addr: proxy,
+        login: socks::proxy_credentials(),
+    };
+    // The same MTU as the interface the app sets up.
+    let carrying = tun2socks::run(fd, upstream, 1280);
+    tokio::pin!(alone);
+    tokio::pin!(carrying);
+    tokio::select! {
+        result = &mut alone => result,
+        result = &mut carrying => result,
+    }
+}
+
 pub async fn prepare(options: &StartOptions) -> Result<TunnelAddresses> {
     apply_runtime_options(options);
     initialize();
+
+    if tor::mode() == tor::Mode::Only || psiphon::mode() == psiphon::Mode::Only {
+        return Ok(TunnelAddresses {
+            ipv4: ALONE_IPV4.to_string(),
+            ipv6: ALONE_IPV6.to_string(),
+            gateway_proxy: String::new(),
+            organization: String::new(),
+        });
+    }
 
     // Everything that has to reach the Cloudflare API is done here, before the tunnel exists:
     // on a network that blocks it the only way in can be another VPN, which the tunnel replaces.
