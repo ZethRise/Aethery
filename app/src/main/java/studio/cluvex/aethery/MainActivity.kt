@@ -1616,23 +1616,21 @@ class MainActivity : Activity() {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(18), dp(16), dp(18), dp(16))
         background = glassBackground(palette, 20, resources.displayMetrics.density)
-        addView(LinearLayout(this@MainActivity).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(ImageView(this@MainActivity).apply {
-                setImageBitmap(AetherWidget.connectMark(
-                    dp(64),
-                    if (NativeCore.isReady()) AetherWidget.State.CONNECTED else AetherWidget.State.DISCONNECTED,
-                    palette,
-                ))
-                contentDescription = title
-            }, LinearLayout.LayoutParams(dp(64), dp(64)))
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(kit.text(size, 13f, MUTED, medium = true))
-                addView(kit.text(title, 17f, INK, medium = true), kit.matchWidth(2))
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(14) })
+        addView(kit.text(size, 13f, MUTED, medium = true))
+        addView(kit.text(title, 17f, INK, medium = true), kit.matchWidth(2))
+        addView(kit.text(detail, 13f, MUTED).apply { setLineSpacing(0f, 1.15f) }, kit.matchWidth(8))
+        // The widget as it will look, live, so a change of theme or state shows here too.
+        val (widthDp, heightDp) = AetherWidget.sizeDp(kind)
+        val preview = FrameLayout(this@MainActivity)
+        runCatching {
+            preview.addView(AetherWidget.preview(this@MainActivity, kind).apply(this@MainActivity, preview))
+        }
+        // The preview is only to look at; its buttons would otherwise act on the real connection.
+        preview.addView(View(this@MainActivity).apply { isClickable = true; isFocusable = false })
+        addView(preview, LinearLayout.LayoutParams(dp(widthDp), dp(heightDp)).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = dp(14)
         })
-        addView(kit.text(detail, 13f, MUTED).apply { setLineSpacing(0f, 1.15f) }, kit.matchWidth(12))
         addView(kit.button("Add to home screen") { AetherWidget.pin(this@MainActivity, kind) }, kit.matchWidth(14))
     }
 

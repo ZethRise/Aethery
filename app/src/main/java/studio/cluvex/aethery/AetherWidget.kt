@@ -1,5 +1,6 @@
 package studio.cluvex.aethery
 
+import android.app.AppOpsManager
 import android.app.PendingIntent
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
@@ -8,15 +9,21 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RadialGradient
 import android.graphics.RectF
+import android.graphics.Shader
 import android.net.VpnService
 import android.os.Build
+import android.os.Process
 import android.view.View
 import android.widget.RemoteViews
 import android.widget.Toast
 import java.net.HttpURLConnection
 import java.net.URL
+import studio.cluvex.aethery.ui.HaloColors
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -162,7 +169,40 @@ object AetherWidget {
         }.start()
     }
 
+    /**
+     * Xiaomi's launcher drops a request to pin a widget, without a word, unless the app holds its
+     * "Home screen shortcuts" permission (app-op 10017). Reading the permission is not public, so
+     * the answer is "unknown, go ahead" when it cannot be read.
+     */
+    private fun homeShortcutsBlocked(context: Context): Boolean {
+        val maker = Build.MANUFACTURER.lowercase()
+        if (maker != "xiaomi" && maker != "redmi" && maker != "poco") return false
+        return runCatching {
+            val ops = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val check = AppOpsManager::class.java.getMethod(
+                "checkOpNoThrow", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, String::class.java,
+            )
+            (check.invoke(ops, 10017, Process.myUid(), context.packageName) as Int) != AppOpsManager.MODE_ALLOWED
+        }.getOrDefault(false)
+    }
+
+    private fun openShortcutPermission(context: Context) {
+        val editor = Intent("miui.intent.action.APP_PERM_EDITOR")
+            .setClassName("com.miui.securitycenter", "com.miui.permcenter.permissions.PermissionsEditorActivity")
+            .putExtra("extra_pkgname", context.packageName)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val details = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            .setData(android.net.Uri.fromParts("package", context.packageName, null))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { context.startActivity(editor) }.onFailure { runCatching { context.startActivity(details) } }
+    }
+
     fun pin(context: Context, kind: Kind) {
+        if (homeShortcutsBlocked(context)) {
+            Toast.makeText(context, R.string.widget_allow_shortcuts, Toast.LENGTH_LONG).show()
+            openShortcutPermission(context)
+            return
+        }
         val manager = AppWidgetManager.getInstance(context)
         val name = ComponentName(context, kind.provider)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && manager.isRequestPinAppWidgetSupported) {
@@ -194,16 +234,19 @@ object AetherWidget {
         val transport = transport(context)
         val fallback = fallback(context)
         val density = context.resources.displayMetrics.density
-        val mark = connectMark((72 * density).roundToInt(), state, palette)
+        // The 1×1 widget is the orb alone, so it fills more of its square.
+        val mark = connectMark((72 * density).roundToInt(), state, palette, if (kind == Kind.CONNECT) 0.40f else 0.34f)
         val views = RemoteViews(context.packageName, kind.layout)
+        views.setImageViewBitmap(R.id.sky, skyBitmap(context, kind, widgetId, state, palette))
         views.setImageViewBitmap(R.id.connect, mark)
         views.setOnClickPendingIntent(R.id.connect, action(context, kind, widgetId, ACTION_TOGGLE))
 
         if (kind != Kind.CONNECT) {
             views.setTextViewText(R.id.method, protocol.label)
             views.setTextColor(R.id.method, palette.ink)
-            views.setTextViewText(R.id.status, statusLabel(state, protocol))
-            views.setTextColor(R.id.status, if (state == State.CONNECTED) palette.connected else palette.muted)
+            views.setTextViewText(R.id.status, statusLabel(state))
+            views.setTextColor(R.id.status, if (state == State.CONNECTED) palette.connected else palette.ink)
+            views.setTextColor(R.id.method, palette.ink)
             views.setOnClickPendingIntent(R.id.method, action(context, kind, widgetId, ACTION_CYCLE_METHOD))
         }
         if (kind == Kind.CONSOLE) {
@@ -374,10 +417,10 @@ object AetherWidget {
         }
     }
 
-    private fun statusLabel(state: State, protocol: Protocol): String = when (state) {
-        State.CONNECTED -> "Connected"
+    private fun statusLabel(state: State): String = when (state) {
+        State.CONNECTED -> "Protected"
         State.CONNECTING -> "Connecting"
-        State.DISCONNECTED -> protocol.label
+        State.DISCONNECTED -> "Disconnected"
     }
 
     enum class Protocol(val label: String, val coreName: String) {
@@ -390,33 +433,115 @@ object AetherWidget {
 
     enum class State { DISCONNECTED, CONNECTING, CONNECTED }
 
-    fun connectMark(size: Int, state: State, palette: AppAppearance.Palette): Bitmap {
-        val bitmap = Bitmap.createBitmap(size.coerceAtLeast(48), size.coerceAtLeast(48), Bitmap.Config.ARGB_8888)
+    /** The live widget, for the Widgets page to show as it will look on the home screen. */
+    fun preview(context: Context, kind: Kind): RemoteViews = views(context, kind, 0)
+
+    /** The size a widget of [kind] has on the home screen, in dp: what the preview is laid out at. */
+    fun sizeDp(kind: Kind): Pair<Int, Int> = when (kind) {
+        Kind.CONNECT -> 74 to 74
+        Kind.METHOD -> 160 to 160
+        Kind.CONSOLE -> 230 to 330
+    }
+
+    /**
+     * The widget's sky: the app's own, dusk below and midnight above, warmed toward dawn while
+     * connected, with a few stars and a hairline edge. Drawn at the widget's own size so the corners
+     * stay round.
+     */
+    private fun skyBitmap(context: Context, kind: Kind, widgetId: Int, state: State, palette: AppAppearance.Palette): Bitmap {
+        val density = context.resources.displayMetrics.density
+        var (widthDp, heightDp) = sizeDp(kind)
+        if (widgetId != 0) {
+            val options = AppWidgetManager.getInstance(context).getAppWidgetOptions(widgetId)
+            options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH, 0).takeIf { it > 0 }?.let { widthDp = it }
+            options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT, 0).takeIf { it > 0 }?.let { heightDp = it }
+        }
+        val width = (widthDp * density).roundToInt().coerceIn(48, 900)
+        val height = (heightDp * density).roundToInt().coerceIn(48, 900)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        val cx = bitmap.width / 2f
-        val cy = bitmap.height / 2f
-        val radius = min(cx, cy) * 0.78f
-        val (container, accent) = when (state) {
-            State.DISCONNECTED, State.CONNECTING -> palette.primaryContainer to palette.primary
-            State.CONNECTED -> palette.connectedContainer to palette.connected
+        val radius = 24f * density
+        val shape = RectF(0f, 0f, width.toFloat(), height.toFloat())
+        val clip = Path().apply { addRoundRect(shape, radius, radius, Path.Direction.CW) }
+        canvas.clipPath(clip)
+
+        val warm = if (state == State.CONNECTED) 0.30f else 0f
+        paint.shader = LinearGradient(
+            0f, 0f, 0f, height.toFloat(),
+            palette.skyTop, HaloColors.mix(palette.skyBottom, palette.dawn, warm),
+            Shader.TileMode.CLAMP,
+        )
+        canvas.drawRect(shape, paint)
+        paint.shader = null
+
+        val random = java.util.Random(kind.ordinal * 31L + 7L)
+        val stars = ((widthDp * heightDp) / 2500).coerceIn(4, 40)
+        repeat(stars) {
+            paint.color = HaloColors.withAlpha(palette.ink, 0.25f + random.nextFloat() * 0.4f)
+            canvas.drawCircle(
+                random.nextFloat() * width, random.nextFloat() * height,
+                (0.5f + random.nextFloat() * 0.8f) * density, paint,
+            )
         }
-        paint.style = Paint.Style.FILL
-        paint.color = (if (state == State.CONNECTED) 0x33000000 else 0x22000000) or (accent and 0x00FFFFFF)
-        canvas.drawCircle(cx, cy, radius + bitmap.width * 0.04f, paint)
-        paint.color = container
-        canvas.drawCircle(cx, cy, radius, paint)
+
         paint.style = Paint.Style.STROKE
-        paint.strokeWidth = bitmap.width * 0.028f
-        paint.color = accent
+        paint.strokeWidth = density
+        paint.color = HaloColors.withAlpha(palette.ink, 0.10f)
+        canvas.drawRoundRect(RectF(density / 2, density / 2, width - density / 2, height - density / 2), radius, radius, paint)
+        return bitmap
+    }
+
+    /**
+     * The connect orb, drawn as the app's: a glass sphere with a highlight and a soft glow, cold
+     * periwinkle while idle and warm dawn while connected, with the power glyph in linen.
+     */
+    fun connectMark(size: Int, state: State, palette: AppAppearance.Palette, fill: Float = 0.34f): Bitmap {
+        val side = size.coerceAtLeast(48)
+        val bitmap = Bitmap.createBitmap(side, side, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val cx = side / 2f
+        val cy = side / 2f
+        val radius = side * fill
+        val connected = state == State.CONNECTED
+        val accent = if (connected) palette.dawn else palette.primary
+        val linen = 0xFFF2EEFF.toInt()
+
+        paint.shader = RadialGradient(
+            cx, cy, radius * 1.45f,
+            intArrayOf(HaloColors.withAlpha(accent, if (connected) 0.55f else 0.30f), HaloColors.withAlpha(accent, 0f)),
+            floatArrayOf(0.55f, 1f), Shader.TileMode.CLAMP,
+        )
+        canvas.drawCircle(cx, cy, radius * 1.45f, paint)
+
+        val light = HaloColors.mix(accent, 0xFFFFFFFF.toInt(), 0.6f)
+        val middle = HaloColors.mix(accent, palette.canvas, if (connected) 0.25f else 0.45f)
+        val dark = HaloColors.mix(accent, palette.canvas, if (connected) 0.60f else 0.78f)
+        paint.shader = RadialGradient(
+            cx - radius * 0.35f, cy - radius * 0.4f, radius * 1.7f,
+            intArrayOf(light, middle, dark), floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP,
+        )
         canvas.drawCircle(cx, cy, radius, paint)
-        if (state == State.CONNECTED) {
-            paint.strokeWidth = bitmap.width * 0.022f
-            canvas.drawCircle(cx, cy, radius + bitmap.width * 0.035f, paint)
+        paint.shader = null
+
+        paint.style = Paint.Style.FILL
+        paint.color = HaloColors.withAlpha(0xFFFFFFFF.toInt(), 0.38f)
+        canvas.drawCircle(cx - radius * 0.38f, cy - radius * 0.42f, radius * 0.15f, paint)
+
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = side * 0.012f
+        paint.color = HaloColors.withAlpha(accent, 0.55f)
+        canvas.drawCircle(cx, cy, radius, paint)
+        if (state == State.CONNECTING) {
+            paint.color = HaloColors.withAlpha(accent, 0.40f)
+            canvas.drawCircle(cx, cy, radius * 1.2f, paint)
         }
+
         val icon = radius * 0.34f
-        paint.strokeWidth = bitmap.width * 0.038f
+        paint.strokeWidth = side * 0.034f
         paint.strokeCap = Paint.Cap.ROUND
+        paint.color = HaloColors.withAlpha(linen, 0.92f)
         canvas.drawArc(RectF(cx - icon, cy - icon, cx + icon, cy + icon), 330f, 240f, false, paint)
         canvas.drawLine(cx, cy - icon * 1.1f, cx, cy - icon * 0.22f, paint)
         return bitmap

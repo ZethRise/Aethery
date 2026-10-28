@@ -3,8 +3,14 @@
     android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@drawable/widget_panel"
-    android:padding="6dp">
+    android:background="@drawable/widget_panel">
+
+    <ImageView
+        android:id="@+id/sky"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:importantForAccessibility="no"
+        android:scaleType="fitXY" />
 
     <ImageView
         android:id="@+id/connect"
@@ -12,5 +18,6 @@
         android:layout_height="match_parent"
         android:layout_gravity="center"
         android:contentDescription="@string/widget_connect"
+        android:padding="3dp"
         android:scaleType="fitCenter" />
 </FrameLayout>

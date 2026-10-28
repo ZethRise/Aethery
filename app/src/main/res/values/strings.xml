@@ -32,5 +32,6 @@
     <string name="widget_method_description">2×2 connect control and method</string>
     <string name="widget_console_description">3×4 connect control, method, speed, and HTTP/3 / HTTP/2</string>
     <string name="widget_pin_unsupported">Long-press the home screen, choose Widgets, then Aethery</string>
+    <string name="widget_allow_shortcuts">Allow “Home screen shortcuts” for Aethery, then add the widget again</string>
     <string name="widget_pinned">Choose a home screen to place the widget</string>
 </resources>
