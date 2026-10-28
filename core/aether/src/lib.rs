@@ -3912,6 +3912,26 @@ pub struct StartOptions {
     pub psiphon_bin: Option<String>,
     pub psiphon_region: Option<String>,
     pub psiphon_bind: Option<String>,
+    pub masque_sni: Option<String>,
+    pub tls_ciphers: Option<String>,
+    pub tls13_ciphers: Option<String>,
+    pub tls_groups: Option<String>,
+    pub tls_key_shares: Option<String>,
+    pub tls_sigalgs: Option<String>,
+    pub tls_cert_compression: Option<String>,
+    pub tls_alps: Option<String>,
+    pub tls_trust_anchors: Option<String>,
+    pub tls_server_padding: Option<String>,
+    pub api_address: Option<String>,
+    pub api_sni: Option<String>,
+    pub api_host: Option<String>,
+    pub enable_grease_sigalgs: bool,
+    pub enable_ech_grease: bool,
+    pub disable_ocsp_stapling: bool,
+    pub disable_sct: bool,
+    pub disable_session_ticket: bool,
+    pub disable_extension_permutation: bool,
+    pub tls_verify: Option<bool>,
 }
 
 impl StartOptions {
@@ -3969,6 +3989,26 @@ impl StartOptions {
             psiphon_bin: None,
             psiphon_region: None,
             psiphon_bind: None,
+            masque_sni: None,
+            tls_ciphers: None,
+            tls13_ciphers: None,
+            tls_groups: None,
+            tls_key_shares: None,
+            tls_sigalgs: None,
+            tls_cert_compression: None,
+            tls_alps: None,
+            tls_trust_anchors: None,
+            tls_server_padding: None,
+            api_address: None,
+            api_sni: None,
+            api_host: None,
+            enable_grease_sigalgs: false,
+            enable_ech_grease: false,
+            disable_ocsp_stapling: false,
+            disable_sct: false,
+            disable_session_ticket: false,
+            disable_extension_permutation: false,
+            tls_verify: None,
         }
     }
 
@@ -4001,6 +4041,25 @@ impl StartOptions {
             ("AETHER_PSIPHON_BIN", self.psiphon_bin.clone()),
             ("AETHER_PSIPHON_REGION", self.psiphon_region.clone()),
             ("AETHER_PSIPHON_BIND", self.psiphon_bind.clone()),
+            ("AETHER_MASQUE_SNI", self.masque_sni.clone()),
+            ("AETHER_TLS_CIPHERS", self.tls_ciphers.clone()),
+            ("AETHER_TLS13_CIPHERS", self.tls13_ciphers.clone()),
+            ("AETHER_TLS_KEY_SHARES", self.tls_key_shares.clone()),
+            ("AETHER_TLS_SIGALGS", self.tls_sigalgs.clone()),
+            ("AETHER_TLS_CERT_COMPRESSION", self.tls_cert_compression.clone()),
+            ("AETHER_TLS_ALPS", self.tls_alps.clone()),
+            ("AETHER_TLS_TRUST_ANCHORS", self.tls_trust_anchors.clone()),
+            ("AETHER_TLS_SERVER_PADDING", self.tls_server_padding.clone()),
+            ("AETHER_API_ADDRESS", self.api_address.clone()),
+            ("AETHER_API_SNI", self.api_sni.clone()),
+            ("AETHER_API_HOST", self.api_host.clone()),
+            ("AETHER_ENABLE_GREASE_SIGALGS", self.enable_grease_sigalgs.then(|| "1".to_string())),
+            ("AETHER_ENABLE_ECH_GREASE", self.enable_ech_grease.then(|| "1".to_string())),
+            ("AETHER_DISABLE_OCSP_STAPLING", self.disable_ocsp_stapling.then(|| "1".to_string())),
+            ("AETHER_DISABLE_SCT", self.disable_sct.then(|| "1".to_string())),
+            ("AETHER_DISABLE_SESSION_TICKET", self.disable_session_ticket.then(|| "1".to_string())),
+            ("AETHER_DISABLE_EXTENSION_PERMUTATION", self.disable_extension_permutation.then(|| "1".to_string())),
+            ("AETHER_TLS_VERIFY", flag(self.tls_verify, "1", "0")),
         ]
     }
 
@@ -4111,6 +4170,10 @@ fn apply_runtime_options(options: &StartOptions) {
             std::env::set_var("AETHER_TLS_GROUPS", "X25519:P-256:P-384")
         }
         TlsCurvePreset::Chrome => std::env::remove_var("AETHER_TLS_GROUPS"),
+    }
+    // A list typed by the person replaces what the preset chose.
+    if let Some(groups) = &options.tls_groups {
+        std::env::set_var("AETHER_TLS_GROUPS", groups);
     }
 
     if options.wireguard_data_check {
@@ -4485,6 +4548,32 @@ mod tests {
         let options = super::StartOptions::new(super::Protocol::Masque, "aether.toml");
         let entry = options.transport_env().into_iter().find(|(name, _)| *name == "AETHER_UPSTREAM");
         assert_eq!(entry, Some(("AETHER_UPSTREAM", None)));
+    }
+
+    #[test]
+    fn handshake_and_api_options_set_their_variables() {
+        let mut options = super::StartOptions::new(super::Protocol::Masque, "aether.toml");
+        assert!(options.transport_env().iter().all(|(_, value)| value.is_none()));
+        options.masque_sni = Some("www.cloudflare.com".into());
+        options.tls_verify = Some(true);
+        options.tls_cert_compression = Some("brotli".into());
+        options.tls_alps = Some("new".into());
+        options.enable_ech_grease = true;
+        options.disable_extension_permutation = true;
+        options.api_address = Some("162.159.137.105".into());
+        options.api_sni = Some("api.cloudflareclient.com".into());
+        options.api_host = Some("api.cloudflareclient.com".into());
+        assert_eq!(env_of(&options, "AETHER_MASQUE_SNI").as_deref(), Some("www.cloudflare.com"));
+        assert_eq!(env_of(&options, "AETHER_TLS_VERIFY").as_deref(), Some("1"));
+        assert_eq!(env_of(&options, "AETHER_TLS_CERT_COMPRESSION").as_deref(), Some("brotli"));
+        assert_eq!(env_of(&options, "AETHER_TLS_ALPS").as_deref(), Some("new"));
+        assert_eq!(env_of(&options, "AETHER_ENABLE_ECH_GREASE").as_deref(), Some("1"));
+        assert_eq!(env_of(&options, "AETHER_DISABLE_EXTENSION_PERMUTATION").as_deref(), Some("1"));
+        assert_eq!(env_of(&options, "AETHER_API_ADDRESS").as_deref(), Some("162.159.137.105"));
+        assert_eq!(env_of(&options, "AETHER_API_SNI").as_deref(), Some("api.cloudflareclient.com"));
+        assert_eq!(env_of(&options, "AETHER_API_HOST").as_deref(), Some("api.cloudflareclient.com"));
+        options.tls_verify = Some(false);
+        assert_eq!(env_of(&options, "AETHER_TLS_VERIFY").as_deref(), Some("0"));
     }
 
     #[test]

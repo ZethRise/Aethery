@@ -129,6 +129,26 @@ struct NativeStartOptions {
     psiphon_bin: Option<String>,
     psiphon_region: Option<String>,
     psiphon_bind: Option<String>,
+    masque_sni: Option<String>,
+    tls_ciphers: Option<String>,
+    tls13_ciphers: Option<String>,
+    tls_groups: Option<String>,
+    tls_key_shares: Option<String>,
+    tls_sigalgs: Option<String>,
+    tls_cert_compression: Option<String>,
+    tls_alps: Option<String>,
+    tls_trust_anchors: Option<String>,
+    tls_server_padding: Option<String>,
+    api_address: Option<String>,
+    api_sni: Option<String>,
+    api_host: Option<String>,
+    enable_grease_sigalgs: bool,
+    enable_ech_grease: bool,
+    disable_ocsp_stapling: bool,
+    disable_sct: bool,
+    disable_session_ticket: bool,
+    disable_extension_permutation: bool,
+    tls_verify: Option<bool>,
 }
 
 impl Default for NativeStartOptions {
@@ -185,6 +205,26 @@ impl Default for NativeStartOptions {
             psiphon_bin: None,
             psiphon_region: None,
             psiphon_bind: None,
+            masque_sni: None,
+            tls_ciphers: None,
+            tls13_ciphers: None,
+            tls_groups: None,
+            tls_key_shares: None,
+            tls_sigalgs: None,
+            tls_cert_compression: None,
+            tls_alps: None,
+            tls_trust_anchors: None,
+            tls_server_padding: None,
+            api_address: None,
+            api_sni: None,
+            api_host: None,
+            enable_grease_sigalgs: false,
+            enable_ech_grease: false,
+            disable_ocsp_stapling: false,
+            disable_sct: false,
+            disable_session_ticket: false,
+            disable_extension_permutation: false,
+            tls_verify: None,
         }
     }
 }
@@ -269,6 +309,26 @@ impl TryFrom<NativeStartOptions> for StartOptions {
         options.psiphon_bin = text(value.psiphon_bin);
         options.psiphon_region = text(value.psiphon_region);
         options.psiphon_bind = text(value.psiphon_bind);
+        options.masque_sni = text(value.masque_sni);
+        options.tls_ciphers = text(value.tls_ciphers);
+        options.tls13_ciphers = text(value.tls13_ciphers);
+        options.tls_groups = text(value.tls_groups);
+        options.tls_key_shares = text(value.tls_key_shares);
+        options.tls_sigalgs = text(value.tls_sigalgs);
+        options.tls_cert_compression = text(value.tls_cert_compression);
+        options.tls_alps = text(value.tls_alps);
+        options.tls_trust_anchors = text(value.tls_trust_anchors);
+        options.tls_server_padding = text(value.tls_server_padding);
+        options.api_address = text(value.api_address);
+        options.api_sni = text(value.api_sni);
+        options.api_host = text(value.api_host);
+        options.enable_grease_sigalgs = value.enable_grease_sigalgs;
+        options.enable_ech_grease = value.enable_ech_grease;
+        options.disable_ocsp_stapling = value.disable_ocsp_stapling;
+        options.disable_sct = value.disable_sct;
+        options.disable_session_ticket = value.disable_session_ticket;
+        options.disable_extension_permutation = value.disable_extension_permutation;
+        options.tls_verify = value.tls_verify;
         Ok(options)
     }
 }
@@ -835,6 +895,25 @@ mod tests {
         assert_eq!(options.psiphon_bin.as_deref(), Some("/lib/libpsiphon.so"));
         assert_eq!(options.psiphon_region.as_deref(), Some("DE"));
         assert!(options.psiphon_bind.is_none(), "blank means unset");
+    }
+
+    #[test]
+    fn parses_the_handshake_and_api_options() {
+        let native: NativeStartOptions = serde_json::from_str(
+            r#"{"config_path":"aether.toml","masque_sni":"www.cloudflare.com","tls_verify":true,"tls_groups":"X25519:P-256","tls13_ciphers":" ","tls_alps":"old","tls_server_padding":"6000","enable_grease_sigalgs":true,"disable_sct":true,"api_host":"api.cloudflareclient.com"}"#,
+        )
+        .unwrap();
+        let options = StartOptions::try_from(native).unwrap();
+
+        assert_eq!(options.masque_sni.as_deref(), Some("www.cloudflare.com"));
+        assert_eq!(options.tls_verify, Some(true));
+        assert_eq!(options.tls_groups.as_deref(), Some("X25519:P-256"));
+        assert!(options.tls13_ciphers.is_none(), "blank means unset");
+        assert_eq!(options.tls_alps.as_deref(), Some("old"));
+        assert_eq!(options.tls_server_padding.as_deref(), Some("6000"));
+        assert!(options.enable_grease_sigalgs && options.disable_sct);
+        assert!(!options.enable_ech_grease);
+        assert_eq!(options.api_host.as_deref(), Some("api.cloudflareclient.com"));
     }
 
     #[test]
