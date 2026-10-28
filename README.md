@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/ZethRise/Aethery/stargazers"><img src="https://img.shields.io/github/stars/ZethRise/Aethery?style=for-the-badge&logo=github" alt="GitHub stars"></a>
   <a href="https://github.com/ZethRise/Aethery/releases/latest"><img src="https://img.shields.io/github/downloads/ZethRise/Aethery/latest/total?style=for-the-badge" alt="Latest release downloads"></a>
-  <a href="https://github.com/CluvexStudio/Aether"><img src="https://img.shields.io/badge/core-v2.3.0-101411?style=for-the-badge" alt="Aether core v2.3.0"></a>
+  <a href="https://github.com/CluvexStudio/Aether"><img src="https://img.shields.io/badge/core-v2.4.0-101411?style=for-the-badge" alt="Aether core v2.3.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-6c5ce7?style=for-the-badge" alt="AGPL-3.0"></a>
 </p>
 
