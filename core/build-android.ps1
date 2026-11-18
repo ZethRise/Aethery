@@ -92,8 +92,13 @@ finally {
     Pop-Location
 }
 
-$bsslOut = Get-ChildItem -LiteralPath (Join-Path $target "$targetTriple/release/build").Replace('\', '/') -Directory -Filter 'boring-sys-*' |
-    ForEach-Object { (Join-Path $_.FullName 'out').Replace('\', '/') } |
+$bsslOut = Get-ChildItem -LiteralPath (Join-Path $target "$targetTriple/release/build").Replace('\', '/') -Directory -Filter 'boring-sys*' |
+    ForEach-Object {
+        # Older Cargo: build/boring-sys-<hash>/out. Newer Cargo: build/boring-sys/<hash>/out.
+        $_.FullName
+        Get-ChildItem -LiteralPath $_.FullName -Directory | ForEach-Object { $_.FullName }
+    } |
+    ForEach-Object { (Join-Path $_ 'out').Replace('\', '/') } |
     Where-Object { Test-Path -LiteralPath (Join-Path $_ 'build/libssl.a').Replace('\', '/') } |
     Sort-Object { (Get-Item -LiteralPath (Join-Path $_ 'build/libssl.a').Replace('\', '/')).LastWriteTime } |
     Select-Object -Last 1
